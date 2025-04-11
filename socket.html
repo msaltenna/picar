@@ -35,7 +35,7 @@
       gamma = tmp_gamma;
     }
 
-    document.addEventListener('DOMContentLoaded', () => {
+    function startMotion() {
       socket = io(`${window.location.hostname}:8080`);
       intervalId = setInterval(sendToPi, 50);
       window.addEventListener('deviceorientation', handleOrientation);
@@ -46,6 +46,27 @@
         document.getElementById('connStatus').textContent = 'No';
         alert('Lost connection to Pi!');
       });
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+        const button = document.createElement('button');
+        button.textContent = 'Enable Motion Control';
+        button.style.fontSize = '20px';
+        button.onclick = () => {
+          DeviceMotionEvent.requestPermission().then(response => {
+            if (response === 'granted') {
+              button.remove();
+              startMotion();
+            } else {
+              alert('Permission denied for motion sensors');
+            }
+          }).catch(console.error);
+        };
+        document.body.appendChild(button);
+      } else {
+        startMotion();
+      }
     });
   </script>
 </head>
