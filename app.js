@@ -1,61 +1,89 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="user-scalable=no, initial-scale=1.0, maximum-scale=1.0;">
-  <title>PiCar Controller</title>
-  <script src="/socket.io/socket.io.js"></script>
-  <script>
-    let socket;
-    let beta = 0.14;
-    let gamma = 0.14;
-    let intervalId;
+// Required modules
+const http = require('http');
+const { pigpio } = require('pigpio-client');
+const fs = require('fs');
+const static = require('node-static');
+const url = require('url');
 
-    const maxbeta = 0.175;
-    const minbeta = 0.105;
-    const maxgamma = 0.175;
-    const mingamma = 0.105;
+// Load PWM config from config.json
+const config = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
+const { pwm_min, pwm_max, pwm_neutral } = config;
 
-    function sendToPi() {
-      socket.emit('fromclient', { beta, gamma });
-      document.getElementById('betaVal').textContent = beta.toFixed(3);
-      document.getElementById('gammaVal').textContent = gamma.toFixed(3);
+// Static file server
+const file = new static.Server();
+
+// Create HTTP + WebSocket server
+const app = http.createServer((req, res) => {
+  const parsedUrl = url.parse(req.url, true);
+
+  if (parsedUrl.pathname === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'OK', beta: old_beta, gamma: old_gamma }));
+  } else {
+    file.serve(req, res);
+  }
+});
+
+const io = require('socket.io')(app);
+app.listen(8080);
+console.log('Pi Car web server listening on port 8080 visit http://<ip>:8080/socket.html');
+
+// Connect to pigpiod
+const pi = pigpio({ host: 'localhost' });
+const throttle = pi.gpio(17);
+const steering = pi.gpio(18);
+
+throttle.modeSet('output');
+steering.modeSet('output');
+
+function setServo(pin, pwmValue) {
+  const duty = Math.round((pwmValue - pwm_min) * (255 / (pwm_max - pwm_min)));
+  pin.pwmWrite(Math.min(255, Math.max(0, duty)));
+}
+
+let smoothed_throttle = pwm_neutral;
+let logcount = 0;
+let old_gamma = pwm_neutral;
+let old_beta = pwm_neutral;
+let lastAction = null;
+
+function emergencyStop() {
+  setServo(throttle, pwm_neutral);
+  setServo(steering, pwm_neutral);
+  console.log('###EMERGENCY STOP - signal lost or shutting down');
+}
+
+io.on('connection', (socket) => {
+  socket.on('fromclient', (data) => {
+    logcount++;
+    old_beta = data.beta;
+    old_gamma = data.gamma;
+
+    if (data.gamma > pwm_neutral && data.gamma > smoothed_throttle) {
+      if (smoothed_throttle < pwm_neutral) smoothed_throttle = pwm_neutral;
+      smoothed_throttle += 0.001;
+    } else if (data.gamma < pwm_neutral && data.gamma < smoothed_throttle) {
+      if (smoothed_throttle > pwm_neutral) smoothed_throttle = pwm_neutral;
+      smoothed_throttle -= 0.0003;
+    } else {
+      smoothed_throttle = data.gamma;
     }
 
-    function handleOrientation(event) {
-      let tmp_beta = 0.001167 * event.beta + 0.14;
-      tmp_beta = Math.min(Math.max(tmp_beta, minbeta), maxbeta);
-      beta = tmp_beta;
-
-      let tmp_gamma = event.gamma;
-      if (tmp_gamma > 45) tmp_gamma = -90;
-      else if (tmp_gamma > 0) tmp_gamma = 0;
-      tmp_gamma = 0.00125 * tmp_gamma + 0.175;
-      tmp_gamma = Math.min(Math.max(tmp_gamma, mingamma), maxgamma);
-      gamma = tmp_gamma;
+    if (logcount === 10) {
+      logcount = 0;
+      console.log(`Beta: ${data.beta} Gamma: ${data.gamma} smoothed: ${smoothed_throttle}`);
     }
 
-    document.addEventListener('DOMContentLoaded', () => {
-      socket = io(`${window.location.hostname}:8080`);
-      intervalId = setInterval(sendToPi, 50);
-      window.addEventListener('deviceorientation', handleOrientation);
-      document.getElementById('connStatus').textContent = 'Yes';
-      alert('Ready -- Let’s race!');
+    setServo(throttle, smoothed_throttle);
+    setServo(steering, data.beta);
 
-      socket.on('disconnect', () => {
-        document.getElementById('connStatus').textContent = 'No';
-        alert('Lost connection to Pi!');
-      });
-    });
-  </script>
-</head>
-<body style="background-color: teal; font-family: sans-serif; text-align: center; color: white;">
-  <h1>picar</h1>
-  <p><a href="https://github.com/lawsonkeith/picar" style="color: white;">Project GitHub</a></p>
-  <div id="status">
-    <p>Beta: <span id="betaVal">--</span></p>
-    <p>Gamma: <span id="gammaVal">--</span></p>
-    <p>Connected: <span id="connStatus">No</span></p>
-  </div>
-</body>
-</html>
+    clearInterval(lastAction);
+    lastAction = setInterval(emergencyStop, 2000);
+  });
+});
+
+process.on('SIGINT', function () {
+  emergencyStop();
+  console.log('\nGracefully shutting down from SIGINT (Ctrl-C)');
+  process.exit();
+});
