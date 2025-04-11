@@ -66,7 +66,7 @@ console.log('pigpio and Pi Car web server ');
   console.log(`11 pi stuff`);
 
   io.on('connection', (socket) => {
-    console.log(`11 Beta: ${data.beta} Gamma: ${data.gamma} smoothed: ${smoothed_throttle}`);
+    console.log(`11 connect`);
     socket.on('fromclient', (data) => {
       console.log(`22 Beta: ${data.beta} Gamma: ${data.gamma} smoothed: ${smoothed_throttle}`);
       logcount++;
