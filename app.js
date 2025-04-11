@@ -37,8 +37,8 @@ throttle.modeSet('output');
 steering.modeSet('output');
 
 function setServo(pin, pwmValue) {
-  const duty = Math.round((pwmValue - pwm_min) * (255 / (pwm_max - pwm_min)));
-  pin.pwmWrite(Math.min(255, Math.max(0, duty)));
+  const pulse = Math.round(1000 + ((pwmValue - pwm_min) / (pwm_max - pwm_min)) * 1000);
+  pin.servoWrite(pulse);
 }
 
 let smoothed_throttle = pwm_neutral;
