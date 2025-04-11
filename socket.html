@@ -1,114 +1,61 @@
+<!DOCTYPE html>
 <html>
 <head>
-<script src="jquery-2.0.3.min.js" language="javascript"></script>
-<script src="/socket.io/socket.io.js"></script>
-<meta name="viewport" content="user-scalable=no, initial-scale=1.0, maximum-scale=1.0;" />
-<script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="user-scalable=no, initial-scale=1.0, maximum-scale=1.0;">
+  <title>PiCar Controller</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    let socket;
+    let beta = 0.14;
+    let gamma = 0.14;
+    let intervalId;
 
-//------ Define your variables here
-var socket = io.connect(window.location.hostname+':8080');
-var nIntervId;
- 
-//steering min and max pwm cmds
-var maxbeta = .175; //r limit
-var minbeta = .105; //l limit
+    const maxbeta = 0.175;
+    const minbeta = 0.105;
+    const maxgamma = 0.175;
+    const mingamma = 0.105;
 
-//throttle min and max pwm cmds
-var mingamma = .105; //backwards limit
-var maxgamma = .175; //forward limit
+    function sendToPi() {
+      socket.emit('fromclient', { beta, gamma });
+      document.getElementById('betaVal').textContent = beta.toFixed(3);
+      document.getElementById('gammaVal').textContent = gamma.toFixed(3);
+    }
 
-// This function is called when the page 1st loads on your phone
-//
-$(function()
-{
-    //send data to the pi at 20Hz
-    nIntervId = setInterval(SendToPi ,50);
- 
-    window.gyro = 'ready';
-    alert('Ready -- Lets race !');
-  
-});
+    function handleOrientation(event) {
+      let tmp_beta = 0.001167 * event.beta + 0.14;
+      tmp_beta = Math.min(Math.max(tmp_beta, minbeta), maxbeta);
+      beta = tmp_beta;
 
+      let tmp_gamma = event.gamma;
+      if (tmp_gamma > 45) tmp_gamma = -90;
+      else if (tmp_gamma > 0) tmp_gamma = 0;
+      tmp_gamma = 0.00125 * tmp_gamma + 0.175;
+      tmp_gamma = Math.min(Math.max(tmp_gamma, mingamma), maxgamma);
+      gamma = tmp_gamma;
+    }
 
-// This fuction is called @ 20Hz
-//
-function SendToPi()
-{
-    	if (window.gyro == 'ready')  
-   	{ 
-		//dont send another command until last one doone... its only a little pi
-		window.gyro = 'notready';
-		socket.emit('fromclient', { beta: beta, gamma: gamma } );
-		window.gyro = 'ready';
-    	}//END if
+    document.addEventListener('DOMContentLoaded', () => {
+      socket = io(`${window.location.hostname}:8080`);
+      intervalId = setInterval(sendToPi, 50);
+      window.addEventListener('deviceorientation', handleOrientation);
+      document.getElementById('connStatus').textContent = 'Yes';
+      alert('Ready -- Let’s race!');
 
-}//End SendToPI
-
-
-
-// This fuction is called when the phone orientation changes
-//
-window.ondeviceorientation = function(event) 
-{
-    	var tmp_beta, tmp_gamma;
-    
-    	//steer
-    	tmp_beta = .001167 * event.beta + .14;
-    	//iphone beta =  .001167 * event.beta * -1) + .14;
-    	if (tmp_beta >= maxbeta) 
-    	{
-		tmp_beta=maxbeta;
-    	}
-    	if (tmp_beta <= minbeta) 
-    	{
-		tmp_beta=minbeta;
-    	}
-    
-    	beta = tmp_beta; //update global
-
-    	// throttle...
-	// rather than going 0-360 gamma counts in + or - 90 degree quadrants.
-	// this can be a pain as if you go past 90 degrees it can start
-	// going the full opposite dir!
-    	// past -90 (full reverse) it count down from + 90 (which would cause car to go full fwds)
-    	// below 0 (full fwds) it counts up (which would get ignored)
-	// this will just confuse the operator so we'll mask i out so it stays in the 0- (-90) range
-    	tmp_gamma = event.gamma;
-    	if(tmp_gamma > 45)
-	{
-		tmp_gamma = -90; // gone past full reverse
-	}
-	else if (tmp_gamma > 0)	
-	{
-		tmp_gamma = 0;	//gone past full fwds
-	}
-	
-    	tmp_gamma = .00125 * tmp_gamma + .175;
-    	//iphone gamma = -0.00125 * Math.round(event.gamma) + .175;
-
-    	if (tmp_gamma >= maxgamma) 
-    	{
-		tmp_gamma=maxgamma;
-    	}
-    	if (tmp_gamma <= mingamma) 
-    	{
-		tmp_gamma=mingamma;
-    	}
-
-    	gamma = tmp_gamma; //update global
-  
-    
-}//END ondviceorientation
-
-
-
-</script>
-<body bgcolor="teal"> 
-</head><body>
-
- <div id=info><font size=7><pre></pre>picar</pre></font></div>
- <div id=info><font size=3><pre></pre>https://github.com/lawsonkeith/picar</pre></font></div>
- 
- </body>
- </head>
+      socket.on('disconnect', () => {
+        document.getElementById('connStatus').textContent = 'No';
+        alert('Lost connection to Pi!');
+      });
+    });
+  </script>
+</head>
+<body style="background-color: teal; font-family: sans-serif; text-align: center; color: white;">
+  <h1>picar</h1>
+  <p><a href="https://github.com/lawsonkeith/picar" style="color: white;">Project GitHub</a></p>
+  <div id="status">
+    <p>Beta: <span id="betaVal">--</span></p>
+    <p>Gamma: <span id="gammaVal">--</span></p>
+    <p>Connected: <span id="connStatus">No</span></p>
+  </div>
+</body>
 </html>
