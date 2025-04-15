@@ -1,25 +1,24 @@
-// Required modules
-const http = require('http');
-const { pigpio } = require('pigpio-client');
-const fs = require('fs');
 const static = require('node-static');
+const fs = require('fs');
+const https = require('https');
+const socketIo = require('socket.io');
 const url = require('url');
 
-// Load PWM config from config.json
-const config = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
-const { pwm_min, pwm_max, pwm_neutral } = config;
-
-// Static file server
 const file = new static.Server();
+let old_gamma = 0.14;
+let old_beta = 0.14;
 
-// Declare beta/gamma globally so /status can access them
-let old_gamma = pwm_neutral;
-let old_beta = pwm_neutral;
+const pwm_min = 0.105;
+const pwm_max = 0.175;
+const pwm_neutral = 0.14;
 
-// Create HTTP + WebSocket server
-const app = http.createServer((req, res) => {
+const options = {
+  key: fs.readFileSync('./certs/key.pem'),
+  cert: fs.readFileSync('./certs/cert.pem'),
+};
+
+const server = https.createServer(options, (req, res) => {
   const parsedUrl = url.parse(req.url, true);
-
   if (parsedUrl.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'OK', beta: old_beta, gamma: old_gamma }));
@@ -28,11 +27,12 @@ const app = http.createServer((req, res) => {
   }
 });
 
-const io = require('socket.io')(app);
-app.listen(8080);
-console.log('Pi Car web server listening on port 8080 visit http://<ip>:8080/socket.html');
+const io = socketIo(server);
+server.listen(8443, '0.0.0.0');
 
+const { pigpio } = require('pigpio-client');
 const pi = pigpio();
+
 const throttle = pi.gpio(17);
 const steering = pi.gpio(18);
 throttle.modeSet('output');
@@ -40,7 +40,6 @@ steering.modeSet('output');
 
 function setServo(gpio, pwmValue) {
   const pulse = Math.round(1000 + ((pwmValue - pwm_min) / (pwm_max - pwm_min)) * 1000);
-  console.log(`gpio:pulse is ${pulse}`);
   gpio.setServoPulsewidth(pulse, err => {
     if (err) console.error(`Failed to set servo pulse: ${err.message}`);
   });
@@ -57,10 +56,8 @@ let logcount = 0;
 let lastAction = null;
 
 io.on('connection', (socket) => {
-  console.log(`hello connect`);
+  console.log('hello connect');
   socket.on('fromclient', (data) => {
-    console.log(`init socket `);
-
     logcount++;
     old_beta = data.beta;
     old_gamma = data.gamma;
@@ -89,7 +86,7 @@ io.on('connection', (socket) => {
 });
 
 process.on('SIGINT', function () {
-    emergencyStop();
-    console.log('\nGracefully shutting down from SIGINT (Ctrl-C)');
-    process.exit();
-  });
+  emergencyStop();
+  console.log('\nGracefully shutting down from SIGINT (Ctrl-C)');
+  process.exit();
+});
