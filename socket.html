@@ -36,7 +36,7 @@
     }
 
     function startMotion() {
-      socket = io(`${window.location.hostname}:8080`);
+      socket = io();
       intervalId = setInterval(sendToPi, 50);
       window.addEventListener('deviceorientation', handleOrientation);
       document.getElementById('connStatus').textContent = 'Yes';
@@ -68,6 +68,13 @@
         startMotion();
       }
     });
+    socket.on('connect', () => {
+      alert('WebSocket connected!');
+    });
+    socket.on('disconnect', () => {
+      alert('WebSocket disconnected');
+    });
+
   </script>
 </head>
 <body style="background-color: teal; font-family: sans-serif; text-align: center; color: white;">
