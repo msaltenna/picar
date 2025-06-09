@@ -29,6 +29,7 @@ const server = https.createServer(options, (req, res) => {
 
 const io = socketIo(server);
 server.listen(8443, '0.0.0.0');
+console.log('Pi Car web server listening on port 8443 — visit https://<ip>:8443/socket.html');
 
 const { pigpio } = require('pigpio-client');
 const pi = pigpio();
