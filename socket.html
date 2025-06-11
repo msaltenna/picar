@@ -59,6 +59,44 @@
       cursor: pointer;
       z-index: 1000;
     }
+
+    #menuBtn {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      z-index: 1000;
+      background: rgba(0, 0, 0, 0.7);
+      border: none;
+      color: white;
+      padding: 8px 12px;
+      font-size: 14px;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+
+    #commandMenu {
+      position: fixed;
+      top: 50px;
+      right: 10px;
+      background: rgba(0, 0, 0, 0.8);
+      border-radius: 5px;
+      padding: 10px;
+      display: none;
+      z-index: 1000;
+    }
+
+    #commandMenu button {
+      display: block;
+      width: 100%;
+      margin: 5px 0;
+      padding: 6px 10px;
+      background: #333;
+      color: white;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 14px;
+    }
   </style>
   <script src="/socket.io/socket.io.js"></script>
 </head>
@@ -67,20 +105,109 @@
   <div id="status">Status: Connecting...</div>
   <div id="feedback">Throttle: --<br>Steering: --</div>
   <button id="enableBtn">Enable Controls</button>
+  <button id="menuBtn">☰</button>
+  <div id="commandMenu">
+    <button id="stopBtn" onclick="toggleStop()">Stop (Neutral)</button>
+    <button onclick="disconnectStream()">Disconnect Stream</button>
+    <button onclick="toggleControls()">Toggle Controls</button>
+  </div>
 
   <script>
     const hostname = window.location.hostname;
-
-    // MJPEG video using <img>
     const video = document.getElementById('live');
     video.src = `https://${hostname}:8081/stream.mjpg`;
 
-    // WebSocket connection
     const socket = io(`https://${hostname}:8443`, { secure: true });
 
     const statusDiv = document.getElementById('status');
     const feedbackDiv = document.getElementById('feedback');
     const enableBtn = document.getElementById('enableBtn');
+    const menuBtn = document.getElementById('menuBtn');
+    const commandMenu = document.getElementById('commandMenu');
+    const stopBtn = document.getElementById('stopBtn');
+
+    let usingOrientation = false;
+    let stopped = false;
+
+    menuBtn.addEventListener('click', () => {
+      commandMenu.style.display = commandMenu.style.display === 'block' ? 'none' : 'block';
+    });
+
+    window.addEventListener('load', () => {
+      if (window.DeviceOrientationEvent) {
+        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+          DeviceOrientationEvent.requestPermission()
+            .then(state => {
+              if (state === 'granted') {
+                window.addEventListener('deviceorientation', handleOrientation, true);
+                usingOrientation = true;
+                enableBtn.style.display = 'none';
+                statusDiv.textContent = 'Status: Orientation control enabled';
+              } else {
+                enableBtn.style.display = 'block';
+                statusDiv.textContent = 'Status: Orientation permission denied';
+              }
+            })
+            .catch(err => {
+              console.warn('Orientation permission error:', err);
+              enableBtn.style.display = 'block';
+            });
+        } else {
+          window.addEventListener('deviceorientation', handleOrientation, true);
+          usingOrientation = true;
+          enableBtn.style.display = 'none';
+          statusDiv.textContent = 'Status: Orientation control enabled';
+        }
+      } else {
+        statusDiv.textContent = 'Status: Orientation not supported';
+        enableBtn.style.display = 'none';
+      }
+    });
+
+    function toggleStop() {
+      if (!stopped) {
+        socket.emit('fromclient', { beta: 0.14, gamma: 0.14 });
+        stopBtn.textContent = 'Start';
+        stopped = true;
+      } else {
+        requestOrientationPermission();
+        stopBtn.textContent = 'Stop (Neutral)';
+        stopped = false;
+      }
+    }
+
+    function disconnectStream() {
+      video.src = '';
+    }
+
+    function toggleControls() {
+      if (usingOrientation) {
+        window.removeEventListener('deviceorientation', handleOrientation, true);
+        usingOrientation = false;
+        enableBtn.style.display = 'block';
+        statusDiv.textContent = 'Status: Manual control only';
+      } else {
+        requestOrientationPermission();
+      }
+    }
+
+    function requestOrientationPermission() {
+      if (window.DeviceOrientationEvent) {
+        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+          DeviceOrientationEvent.requestPermission().then(state => {
+            if (state === 'granted') {
+              window.addEventListener('deviceorientation', handleOrientation, true);
+              usingOrientation = true;
+              enableBtn.style.display = 'none';
+            }
+          });
+        } else {
+          window.addEventListener('deviceorientation', handleOrientation, true);
+          usingOrientation = true;
+          enableBtn.style.display = 'none';
+        }
+      }
+    }
 
     socket.on('connect', () => {
       statusDiv.textContent = 'Status: Connected';
@@ -102,24 +229,7 @@
     });
 
     enableBtn.addEventListener('click', () => {
-      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-        DeviceOrientationEvent.requestPermission()
-          .then(permissionState => {
-            if (permissionState === 'granted') {
-              window.addEventListener('deviceorientation', handleOrientation, true);
-              enableBtn.style.display = 'none';
-            } else {
-              statusDiv.textContent = 'Permission denied for device orientation.';
-            }
-          })
-          .catch(error => {
-            console.error('DeviceOrientation permission error:', error);
-            statusDiv.textContent = 'Device orientation permission error.';
-          });
-      } else {
-        window.addEventListener('deviceorientation', handleOrientation, true);
-        enableBtn.style.display = 'none';
-      }
+      requestOrientationPermission();
     });
   </script>
 </body>
