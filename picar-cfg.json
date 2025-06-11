@@ -1,0 +1,9 @@
+{
+  "pwm_method": "libgpiod",
+  "steering_gpio": 18,
+  "throttle_gpio": 19,
+  "pwm_period_us": 20000,
+  "pwm_min_us": 1000,
+  "pwm_max_us": 2000
+}
+

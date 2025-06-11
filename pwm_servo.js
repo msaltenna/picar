@@ -1,31 +1,30 @@
 // pwm_servo.js
+// Adapter to load the appropriate PWM control backend based on config
+
 const fs = require('fs');
 const path = require('path');
 
-function writeSyncSafe(filePath, value) {
-  try {
-    fs.writeFileSync(filePath, value.toString());
-  } catch (err) {
-    console.error(`Failed to write ${value} to ${filePath}:`, err.message);
-  }
+// Load config
+const configPath = path.join(__dirname, 'picar-cfg.json');
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(configPath));
+} catch (err) {
+  console.error(`Failed to read config file at ${configPath}:`, err);
+  process.exit(1);
 }
 
-function enablePWM(channel) {
-  const basePath = `/sys/class/pwm/pwmchip0`;
-  const pwmPath = path.join(basePath, `pwm${channel}`);
-  if (!fs.existsSync(pwmPath)) {
-    writeSyncSafe(path.join(basePath, 'export'), channel);
-  }
-  return pwmPath;
+let PWMDriver;
+if (config.pwm_method === 'libgpiod') {
+  PWMDriver = require('./pwm_libgpiod_servo');
+} else if (config.pwm_method === 'sysfs') {
+  PWMDriver = require('./pwm_sysfs_servo');
+} else {
+  console.error(`Unsupported pwm_method: '${config.pwm_method}'`);
+  process.exit(1);
 }
 
-function setServoPWM(channel, pwmValue) {
-  const pwmPath = enablePWM(channel);
-  const period = 20000000; // 20ms in ns
-  const pulse = Math.round(1000000 + ((pwmValue - 0.105) / (0.175 - 0.105)) * 1000000);
-  writeSyncSafe(path.join(pwmPath, 'period'), period);
-  writeSyncSafe(path.join(pwmPath, 'duty_cycle'), pulse);
-  writeSyncSafe(path.join(pwmPath, 'enable'), 1);
-}
+const pwm = new PWMDriver(config);
 
-module.exports = { setServoPWM };
+module.exports = pwm;
+
