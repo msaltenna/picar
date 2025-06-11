@@ -2,81 +2,126 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="user-scalable=no, initial-scale=1.0, maximum-scale=1.0;">
-  <title>PiCar Controller</title>
-  <script src="/socket.io/socket.io.js"></script>
-  <script>
-    let socket;
-    let beta = 0.14;
-    let gamma = 0.14;
-    let intervalId;
-
-    const maxbeta = 0.175;
-    const minbeta = 0.105;
-    const maxgamma = 0.175;
-    const mingamma = 0.105;
-
-    function sendToPi() {
-      socket.emit('fromclient', { beta, gamma });
-      document.getElementById('betaVal').textContent = beta.toFixed(3);
-      document.getElementById('gammaVal').textContent = gamma.toFixed(3);
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pi Car Control</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: black;
+      color: white;
     }
+
+    #live {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: cover;
+    }
+
+    #status {
+      position: fixed;
+      bottom: 10px;
+      left: 10px;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 14px;
+    }
+
+    #feedback {
+      position: fixed;
+      bottom: 10px;
+      right: 10px;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+      font-size: 14px;
+      text-align: right;
+    }
+
+    #enableBtn {
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 10px 20px;
+      font-size: 16px;
+      background-color: #444;
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      z-index: 1000;
+    }
+  </style>
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <img id="live" src="" alt="Video stream not available">
+  <div id="status">Status: Connecting...</div>
+  <div id="feedback">Throttle: --<br>Steering: --</div>
+  <button id="enableBtn">Enable Controls</button>
+
+  <script>
+    const hostname = window.location.hostname;
+
+    // MJPEG video using <img>
+    const video = document.getElementById('live');
+    video.src = `https://${hostname}:8081/stream.mjpg`;
+
+    // WebSocket connection
+    const socket = io(`https://${hostname}:8443`, { secure: true });
+
+    const statusDiv = document.getElementById('status');
+    const feedbackDiv = document.getElementById('feedback');
+    const enableBtn = document.getElementById('enableBtn');
+
+    socket.on('connect', () => {
+      statusDiv.textContent = 'Status: Connected';
+    });
+
+    socket.on('disconnect', () => {
+      statusDiv.textContent = 'Status: Disconnected';
+    });
 
     function handleOrientation(event) {
-      let tmp_beta = 0.001167 * event.beta + 0.14;
-      tmp_beta = Math.min(Math.max(tmp_beta, minbeta), maxbeta);
-      beta = tmp_beta;
-
-      let tmp_gamma = event.gamma;
-      if (tmp_gamma > 45) tmp_gamma = -90;
-      else if (tmp_gamma > 0) tmp_gamma = 0;
-      tmp_gamma = 0.00125 * tmp_gamma + 0.175;
-      tmp_gamma = Math.min(Math.max(tmp_gamma, mingamma), maxgamma);
-      gamma = tmp_gamma;
+      const beta = Math.max(0.105, Math.min(0.175, 0.14 + event.beta / 90 * 0.035));
+      const gamma = Math.max(0.105, Math.min(0.175, 0.14 + event.gamma / 90 * 0.035));
+      socket.emit('fromclient', { beta, gamma });
+      feedbackDiv.innerHTML = `Throttle: ${gamma.toFixed(3)}<br>Steering: ${beta.toFixed(3)}`;
     }
 
-    function startMotion() {
-      socket = io({ secure: true });
-      intervalId = setInterval(sendToPi, 50);
-      window.addEventListener('deviceorientation', handleOrientation);
-      document.getElementById('connStatus').textContent = 'Yes';
-      alert('Ready -- Let’s race!');
+    socket.on('statusUpdate', ({ beta, gamma }) => {
+      feedbackDiv.innerHTML = `Throttle: ${gamma.toFixed(3)}<br>Steering: ${beta.toFixed(3)}`;
+    });
 
-      socket.on('disconnect', () => {
-        document.getElementById('connStatus').textContent = 'No';
-        alert('Lost connection to Pi!');
-      });
-    }
-
-    document.addEventListener('DOMContentLoaded', () => {
-      if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
-        const button = document.createElement('button');
-        button.textContent = 'Enable Motion Control';
-        button.style.fontSize = '20px';
-        button.onclick = () => {
-          DeviceMotionEvent.requestPermission().then(response => {
-            if (response === 'granted') {
-              button.remove();
-              startMotion();
+    enableBtn.addEventListener('click', () => {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission()
+          .then(permissionState => {
+            if (permissionState === 'granted') {
+              window.addEventListener('deviceorientation', handleOrientation, true);
+              enableBtn.style.display = 'none';
             } else {
-              alert('Permission denied for motion sensors');
+              statusDiv.textContent = 'Permission denied for device orientation.';
             }
-          }).catch(console.error);
-        };
-        document.body.appendChild(button);
+          })
+          .catch(error => {
+            console.error('DeviceOrientation permission error:', error);
+            statusDiv.textContent = 'Device orientation permission error.';
+          });
       } else {
-        startMotion();
+        window.addEventListener('deviceorientation', handleOrientation, true);
+        enableBtn.style.display = 'none';
       }
     });
   </script>
-</head>
-<body style="background-color: teal; font-family: sans-serif; text-align: center; color: white;">
-  <h1>picar</h1>
-  <p><a href="https://github.com/lawsonkeith/picar" style="color: white;">Project GitHub</a></p>
-  <div id="status">
-    <p>Beta: <span id="betaVal">--</span></p>
-    <p>Gamma: <span id="gammaVal">--</span></p>
-    <p>Connected: <span id="connStatus">No</span></p>
-  </div>
 </body>
 </html>
+

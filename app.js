@@ -1,23 +1,20 @@
-const static = require('node-static');
+// app.js
 const fs = require('fs');
 const https = require('https');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
 const url = require('url');
+const static = require('node-static');
+const { spawn } = require('child_process');
+const { setServoPWM } = require('./pwm_servo');
 
 const file = new static.Server();
-let old_gamma = 0.14;
-let old_beta = 0.14;
-
-const pwm_min = 0.105;
-const pwm_max = 0.175;
-const pwm_neutral = 0.14;
-
 const options = {
   key: fs.readFileSync('./certs/key.pem'),
   cert: fs.readFileSync('./certs/cert.pem'),
 };
 
-const server = https.createServer(options, (req, res) => {
+// Web UI + Socket Server (port 8443)
+const appServer = https.createServer(options, (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   if (parsedUrl.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -27,37 +24,19 @@ const server = https.createServer(options, (req, res) => {
   }
 });
 
-const io = socketIo(server);
-server.listen(8443, '0.0.0.0');
-console.log('Pi Car web server listening on port 8443 — visit https://<ip>:8443/socket.html');
+const io = new Server(appServer);
+appServer.listen(8443, '0.0.0.0');
+console.log('Pi Car web server listening on https://<ip>:8443/socket.html');
 
-const { pigpio } = require('pigpio-client');
-const pi = pigpio();
-
-const throttle = pi.gpio(17);
-const steering = pi.gpio(18);
-throttle.modeSet('output');
-steering.modeSet('output');
-
-function setServo(gpio, pwmValue) {
-  const pulse = Math.round(1000 + ((pwmValue - pwm_min) / (pwm_max - pwm_min)) * 1000);
-  gpio.setServoPulsewidth(pulse, err => {
-    if (err) console.error(`Failed to set servo pulse: ${err.message}`);
-  });
-}
-
-function emergencyStop() {
-  setServo(throttle, pwm_neutral);
-  setServo(steering, pwm_neutral);
-  console.log('###EMERGENCY STOP - signal lost or shutting down');
-}
-
+let old_beta = 0.14;
+let old_gamma = 0.14;
+const pwm_neutral = 0.14;
 let smoothed_throttle = pwm_neutral;
 let logcount = 0;
 let lastAction = null;
 
 io.on('connection', (socket) => {
-  console.log('hello connect');
+  console.log('Socket connected');
   socket.on('fromclient', (data) => {
     logcount++;
     old_beta = data.beta;
@@ -73,21 +52,69 @@ io.on('connection', (socket) => {
       smoothed_throttle = data.gamma;
     }
 
-    if (logcount === 10) {
-      logcount = 0;
-      console.log(`Beta: ${data.beta} Gamma: ${data.gamma} smoothed: ${smoothed_throttle}`);
-    }
+    if (logcount === 10) logcount = 0;
 
-    setServo(throttle, smoothed_throttle);
-    setServo(steering, data.beta);
+    setServoPWM(0, smoothed_throttle); // PWM0 for throttle
+    setServoPWM(1, data.beta);         // PWM1 for steering
 
     clearInterval(lastAction);
-    lastAction = setInterval(emergencyStop, 2000);
+    lastAction = setInterval(() => {
+      setServoPWM(0, pwm_neutral);
+      setServoPWM(1, pwm_neutral);
+      console.log('### EMERGENCY STOP');
+    }, 2000);
   });
 });
 
 process.on('SIGINT', function () {
-  emergencyStop();
-  console.log('\nGracefully shutting down from SIGINT (Ctrl-C)');
+  setServoPWM(0, pwm_neutral);
+  setServoPWM(1, pwm_neutral);
+  console.log('\nGracefully shutting down from SIGINT');
   process.exit();
 });
+
+// MJPEG Stream Server (port 8081)
+const streamServer = https.createServer(options, (req, res) => {
+  if (req.url === '/stream.mjpg') {
+    res.writeHead(200, {
+      'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
+      'Cache-Control': 'no-cache',
+      'Connection': 'close',
+      'Pragma': 'no-cache',
+    });
+
+    const ffmpeg = spawn('ffmpeg', [
+      '-f', 'v4l2',
+      '-framerate', '15',
+      '-video_size', '640x480',
+      '-i', '/dev/video0',
+      '-fflags', 'nobuffer',
+      '-f', 'mjpeg',
+      'pipe:1'
+    ]);
+
+    ffmpeg.stdout.on('data', (chunk) => {
+      //console.log(`Sent frame of ${chunk.length} bytes`);
+      res.write(`--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
+      res.write(chunk);
+      res.write('\r\n');
+    });
+
+    //ffmpeg.stderr.on('data', data => {
+    //  console.error(`[ffmpeg] ${data}`);
+    //});
+
+    //ffmpeg.stdout.pipe(res);
+
+    req.on('close', () => {
+      ffmpeg.kill('SIGTERM');
+    });
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+
+streamServer.listen(8081, '0.0.0.0');
+console.log('MJPEG stream available at https://<ip>:8081/stream.mjpg');
+
