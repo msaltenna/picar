@@ -1,7 +1,7 @@
 // test_pwm.js
 const fs = require('fs');
 const path = require('path');
-const { PWMDriver } = require('./pwm_servo');
+const PWMDriver = require('./pwm_servo');
 
 // Load config
 const configPath = path.join(__dirname, 'picar-cfg.json');
@@ -13,7 +13,7 @@ try {
   process.exit(1);
 }
 
-const pwm = new PWMDriver(config);
+const pwm = PWMDriver(config);
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 

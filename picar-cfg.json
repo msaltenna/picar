@@ -1,5 +1,6 @@
 {
-  "pwm_method": "libgpiod",
+  "comment_pwm_method": "libgpiod",
+  "pwm_method": "sysfs",
   "steering_gpio": 18,
   "throttle_gpio": 19,
   "pwm_period_us": 20000,

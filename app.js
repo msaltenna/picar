@@ -16,8 +16,8 @@ try {
   process.exit(1);
 }
 
-const { PWMDriver } = require('./pwm_servo');
-const pwm = new PWMDriver(config);
+const PWMDriver = require('./pwm_servo');
+const pwm = PWMDriver(config);
 
 const file = new static.Server();
 const options = {

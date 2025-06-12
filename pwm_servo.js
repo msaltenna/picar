@@ -1,18 +1,13 @@
 // pwm_servo.js
-const fs = require('fs');
-const path = require('path');
 
-let PWMDriver;
-if (config.pwm_method === 'libgpiod') {
-  PWMDriver = require('./pwm_libgpiod_servo');
-} else if (config.pwm_method === 'sysfs') {
-  PWMDriver = require('./pwm_sysfs_servo');
-} else {
-  console.error(`Unsupported pwm_method: '${config.pwm_method}'`);
-  process.exit(1);
-}
-
-module.exports = {
-  PWMDriver
+module.exports = function PWMDriver(config) {
+  if (config.pwm_method === 'sysfs') {
+    const PWMServoSysFS = require('./pwm_sysfs_servo');
+    return new PWMServoSysFS(config);
+  } else if (config.pwm_method === 'libgpiod') {
+    const PWMServoGPIOD = require('./pwm_libgpiod_servo');
+    return new PWMServoGPIOD(config);
+  } else {
+    throw new Error(`Unsupported PWM driver: ${config.pwm_driver}`);
+  }
 };
-

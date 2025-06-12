@@ -1,75 +1,65 @@
 // pwm_sysfs_servo.js
-// PWM control using legacy sysfs interface
 
 const fs = require('fs');
 const path = require('path');
 
-class PWMServoSYSFS {
-  constructor(config) {
-    this.steeringPin = config.steering_gpio;
-    this.throttlePin = config.throttle_gpio;
-    this.period = config.pwm_period_us * 1000; // convert to ns
-    this.min = config.pwm_min_us * 1000;
-    this.max = config.pwm_max_us * 1000;
+const THROTTLE = 0;
+const STEERING = 1;
 
-    this.paths = {
-      [this.steeringPin]: `/sys/class/pwm/pwmchip0/pwm0`,
-      [this.throttlePin]: `/sys/class/pwm/pwmchip0/pwm1`,
+class PWMServoSysFS {
+  constructor(config) {
+    this.period_us = config.pwm_period_us;
+    this.min_us = config.pwm_min_us;
+    this.max_us = config.pwm_max_us;
+    this.chip = config.pwm_chip || 'pwmchip0';
+    this.chipDir = path.join('/sys/class/pwm', this.chip);
+
+    this.pins = {
+      [THROTTLE]: config.throttle_pwm_channel,
+      [STEERING]: config.steering_pwm_channel
     };
 
-    this.initPWM(this.steeringPin);
-    this.initPWM(this.throttlePin);
-  }
+    this.channelMap = {
+      throttle: THROTTLE,
+      steering: STEERING
+    };
 
-  initPWM(pin) {
-    const base = this.paths[pin];
-    try {
-      if (!fs.existsSync(base)) {
-        fs.writeFileSync(`/sys/class/pwm/pwmchip0/export`, pin === this.steeringPin ? '0' : '1');
+    for (const id in this.pins) {
+      const pwmDir = path.join(this.chipDir, `pwm${id}`);
+      if (!fs.existsSync(pwmDir)) {
+        try {
+          fs.writeFileSync(path.join(this.chipDir, 'export'), String(id));
+        } catch (e) {
+          console.warn(`Could not export PWM channel ${id}: ${pwmDir}: ${e.message}`);
+        }
       }
-      fs.writeFileSync(path.join(base, 'period'), this.period.toString());
-      fs.writeFileSync(path.join(base, 'enable'), '1');
-    } catch (err) {
-      console.error(`Failed to initialize PWM on pin ${pin}:`, err.message);
     }
   }
 
   scale(value) {
-    const clamped = Math.max(-1, Math.min(1, value));
-    const mid = (this.min + this.max) / 2;
-    const range = (this.max - this.min) / 2;
-    return Math.round(mid + clamped * range);
-  }
-
-  writeDutyCycle(pin, value) {
-    const base = this.paths[pin];
-    try {
-      fs.writeFileSync(path.join(base, 'duty_cycle'), value.toString());
-    } catch (err) {
-      console.error(`Failed to write duty cycle for pin ${pin}:`, err.message);
-    }
-  }
-
-  setSteering(value) {
-    const pulse = this.scale(value);
-    this.writeDutyCycle(this.steeringPin, pulse);
-  }
-
-  setThrottle(value) {
-    const pulse = this.scale(value);
-    this.writeDutyCycle(this.throttlePin, pulse);
+    const midpoint = (this.max_us + this.min_us) / 2;
+    const range = (this.max_us - this.min_us) / 2;
+    return Math.round(midpoint + range * value);
   }
 
   setServoPWM(name, value) {
-    if (name === 'steering') {
-      this.setSteering(value);
-    } else if (name === 'throttle') {
-      this.setThrottle(value);
-    } else {
-      console.warn(`Invalid servo name: ${name}`);
+    const id = this.channelMap[name];
+    const pwmDir = path.join(this.chipDir, `pwm${id}`);
+    const duty_us = this.scale(value);
+
+    try {
+      fs.writeFileSync(path.join(pwmDir, 'period'), String(this.period_us * 1000));
+      fs.writeFileSync(path.join(pwmDir, 'duty_cycle'), String(duty_us * 1000));
+      fs.writeFileSync(path.join(pwmDir, 'enable'), '1');
+      if (id) {
+         console.log(`PWM set: ${name} → ${duty_us}us on ${pwmDir}`);
+      }
+    } catch (e) {
+      console.error(`Failed to set PWM for ${name}: ${e.message}`);
     }
   }
 }
 
-module.exports = PWMServoSYSFS;
+module.exports = PWMServoSysFS;
+
 
