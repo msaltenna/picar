@@ -5,7 +5,19 @@ const { Server } = require('socket.io');
 const url = require('url');
 const static = require('node-static');
 const { spawn } = require('child_process');
-const { setServoPWM } = require('./pwm_servo');
+
+const path = require('path');
+const configPath = path.join(__dirname, 'picar-cfg.json');
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(configPath));
+} catch (err) {
+  console.error(`Failed to read config file at ${configPath}:`, err);
+  process.exit(1);
+}
+
+const { PWMDriver } = require('./pwm_servo');
+const pwm = new PWMDriver(config);
 
 const file = new static.Server();
 const options = {
@@ -30,7 +42,7 @@ console.log('Pi Car web server listening on https://<ip>:8443/socket.html');
 
 let old_beta = 0.14;
 let old_gamma = 0.14;
-const pwm_neutral = 0.14;
+const pwm_neutral = config.pwm_neutral;
 let smoothed_throttle = pwm_neutral;
 let logcount = 0;
 let lastAction = null;
@@ -54,21 +66,21 @@ io.on('connection', (socket) => {
 
     if (logcount === 10) logcount = 0;
 
-    setServoPWM(0, smoothed_throttle); // PWM0 for throttle
-    setServoPWM(1, data.beta);         // PWM1 for steering
+    pwm.setServoPWM('throttle', smoothed_throttle); // PWM0 for throttle
+    pwm.setServoPWM('steering', data.beta);         // PWM1 for steering
 
     clearInterval(lastAction);
     lastAction = setInterval(() => {
-      setServoPWM(0, pwm_neutral);
-      setServoPWM(1, pwm_neutral);
+      pwm.setServoPWM('throttle', pwm_neutral);
+      pwm.setServoPWM('steering', pwm_neutral);
       console.log('### EMERGENCY STOP');
     }, 2000);
   });
 });
 
 process.on('SIGINT', function () {
-  setServoPWM(0, pwm_neutral);
-  setServoPWM(1, pwm_neutral);
+  pwm.setServoPWM('throttle', pwm_neutral);
+  pwm.setServoPWM('steering', pwm_neutral);
   console.log('\nGracefully shutting down from SIGINT');
   process.exit();
 });

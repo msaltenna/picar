@@ -1,18 +1,6 @@
 // pwm_servo.js
-// Adapter to load the appropriate PWM control backend based on config
-
 const fs = require('fs');
 const path = require('path');
-
-// Load config
-const configPath = path.join(__dirname, 'picar-cfg.json');
-let config;
-try {
-  config = JSON.parse(fs.readFileSync(configPath));
-} catch (err) {
-  console.error(`Failed to read config file at ${configPath}:`, err);
-  process.exit(1);
-}
 
 let PWMDriver;
 if (config.pwm_method === 'libgpiod') {
@@ -24,7 +12,7 @@ if (config.pwm_method === 'libgpiod') {
   process.exit(1);
 }
 
-const pwm = new PWMDriver(config);
-
-module.exports = pwm;
+module.exports = {
+  PWMDriver
+};
 

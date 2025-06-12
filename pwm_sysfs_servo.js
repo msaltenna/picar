@@ -60,13 +60,13 @@ class PWMServoSYSFS {
     this.writeDutyCycle(this.throttlePin, pulse);
   }
 
-  setServoPWM(id, value) {
-    if (id === 0) {
+  setServoPWM(name, value) {
+    if (name === 'steering') {
       this.setSteering(value);
-    } else if (id === 1) {
+    } else if (name === 'throttle') {
       this.setThrottle(value);
     } else {
-      console.warn(`Invalid servo id: ${id}`);
+      console.warn(`Invalid servo name: ${name}`);
     }
   }
 }

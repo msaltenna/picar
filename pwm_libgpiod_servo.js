@@ -2,35 +2,42 @@
 // Replacement for sysfs-based PWM using libgpiod (via gpiod CLI)
 
 const { execSync } = require('child_process');
+const STEERING = 0;
+const THROTTLE = 1;
 
 class PWMServoGPIOD {
   constructor(config) {
     this.chip = 'gpiochip0'; // Correct for GPIO18/19 on RPi 5
     this.pins = {
-      steering: config.steering_gpio,
-      throttle: config.throttle_gpio,
+      [STEERING]: config.steering_gpio,
+      [THROTTLE]: config.throttle_gpio,
     };
     this.period_us = config.pwm_period_us;
     this.min_us = config.pwm_min_us;
     this.max_us = config.pwm_max_us;
 
     this.lastPWM = {
-      0: 0,
-      1: 0,
+      STEERING: 0, //steering
+      THROTTLE: 0, //throttle
     };
 
     this.running = {
-      0: false,
-      1: false,
+      STEERING: false, //steering
+      THROTTLE: false, //throttle
     };
 
     this.intervals = {
-      0: null,
-      1: null,
+      STEERING: null, //steering
+      THROTTLE: null, //throttle
     };
 
-    this.enablePWM(this.pins.steering);
-    this.enablePWM(this.pins.throttle);
+    this.channelMap = {
+      steering: STEERING,
+      throttle: THROTTLE
+    };
+
+    this.enablePWM(this.pins.STEERING);
+    this.enablePWM(this.pins.THROTTLE);
   }
 
   enablePWM(pin) {
@@ -62,9 +69,10 @@ class PWMServoGPIOD {
     }, this.period_us / 1000);
   }
 
-  setServoPWM(id, value) {
-    if (!(id in this.pins)) {
-      console.warn(`Invalid servo id: ${id}`);
+  setServoPWM(name, value) {
+    const id = this.channelMap[name];
+    if (id === undefined) {
+      console.warn(`Invalid servo name: ${name}`);
       return;
     }
     this.lastPWM[id] = value;

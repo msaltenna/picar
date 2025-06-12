@@ -1,5 +1,20 @@
 // test_pwm.js
-const pwm = require('./pwm_servo');
+const fs = require('fs');
+const path = require('path');
+const { PWMDriver } = require('./pwm_servo');
+
+// Load config
+const configPath = path.join(__dirname, 'picar-cfg.json');
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(configPath));
+} catch (err) {
+  console.error(`Failed to read config file at ${configPath}:`, err);
+  process.exit(1);
+}
+
+const pwm = new PWMDriver(config);
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function sweep(id, label) {
@@ -23,8 +38,8 @@ async function sweep(id, label) {
 
 async function main() {
   console.log('--- PWM Servo Test ---');
-  await sweep(0, 'Steering');
-  await sweep(1, 'Throttle');
+  await sweep('steering', 'Steering');
+  await sweep('throttle', 'Throttle');
 }
 
 main().catch(console.error);
