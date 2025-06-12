@@ -1,82 +1,71 @@
 // pwm_libgpiod_servo.js
-// Replacement for sysfs-based PWM using libgpiod (via gpiod CLI)
 
 const { execSync } = require('child_process');
-const STEERING = 0;
-const THROTTLE = 1;
+
+const THROTTLE = 0;
+const STEERING = 1;
 
 class PWMServoGPIOD {
   constructor(config) {
-    this.chip = 'gpiochip0'; // Correct for GPIO18/19 on RPi 5
-    this.pins = {
-      [STEERING]: config.steering_gpio,
-      [THROTTLE]: config.throttle_gpio,
-    };
     this.period_us = config.pwm_period_us;
     this.min_us = config.pwm_min_us;
     this.max_us = config.pwm_max_us;
+    this.chip = config.pwm_chip || 'gpiochip0';
+
+    this.pins = {
+      [THROTTLE]: config.throttle_gpio,
+      [STEERING]: config.steering_gpio
+    };
 
     this.lastPWM = {
-      STEERING: 0, //steering
-      THROTTLE: 0, //throttle
+      [THROTTLE]: 0,
+      [STEERING]: 0
     };
 
-    this.running = {
-      STEERING: false, //steering
-      THROTTLE: false, //throttle
-    };
-
-    this.intervals = {
-      STEERING: null, //steering
-      THROTTLE: null, //throttle
-    };
-
+    this.intervals = {};
     this.channelMap = {
-      steering: STEERING,
-      throttle: THROTTLE
+      throttle: THROTTLE,
+      steering: STEERING
     };
-
-    this.enablePWM(this.pins.STEERING);
-    this.enablePWM(this.pins.THROTTLE);
-  }
-
-  enablePWM(pin) {
-    console.log(`Configured pin ${pin} for software PWM using libgpiod.`);
   }
 
   scale(value) {
-    const clamped = Math.max(-1, Math.min(1, value));
-    const mid = (this.min_us + this.max_us) / 2;
+    const midpoint = (this.max_us + this.min_us) / 2;
     const range = (this.max_us - this.min_us) / 2;
-    return Math.round(mid + clamped * range);
-  }
-
-  pulse(pin, pulseWidthUs) {
-    const chip = this.chip;
-    const period = this.period_us;
-    try {
-      execSync(`gpioset -m time -u ${pulseWidthUs} ${chip} ${pin}=1`);
-    } catch (err) {
-      console.error(`Failed to pulse pin ${pin}: ${err.message}`);
-    }
-  }
-
-  startPWM(id, pin) {
-    if (this.running[id]) return;
-    this.running[id] = true;
-    this.intervals[id] = setInterval(() => {
-      this.pulse(pin, this.scale(this.lastPWM[id]));
-    }, this.period_us / 1000);
+    return Math.round(midpoint + range * value);
   }
 
   setServoPWM(name, value) {
     const id = this.channelMap[name];
-    if (id === undefined) {
-      console.warn(`Invalid servo name: ${name}`);
+    if (id === undefined || !(id in this.pins)) {
+      console.warn(`Invalid servo id: ${name}`);
       return;
     }
+
     this.lastPWM[id] = value;
     this.startPWM(id, this.pins[id]);
+  }
+
+  startPWM(id, pin) {
+    if (this.intervals[id]) clearInterval(this.intervals[id]);
+
+    this.intervals[id] = setInterval(() => {
+      const pulseWidthUs = this.scale(this.lastPWM[id]);
+
+      try {
+        execSync(`gpioset ${this.chip} ${pin}=1`);
+      } catch (err) {
+        console.error(`Failed to set pin ${pin} HIGH: ${err.message}`);
+      }
+
+      setTimeout(() => {
+        try {
+          execSync(`gpioset ${this.chip} ${pin}=0`);
+        } catch (err) {
+          console.error(`Failed to set pin ${pin} LOW: ${err.message}`);
+        }
+      }, pulseWidthUs / 1000); // µs → ms
+    }, this.period_us / 1000); // µs → ms
   }
 }
 
