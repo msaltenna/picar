@@ -95,7 +95,6 @@ sudo apt install nodejs npm ffmpeg
 
 ### Get the App
 Clone the project into your working directory:
-
 ```bash
 cd /home/pi
 mkdir picar && cd picar
@@ -136,7 +135,22 @@ dtoverlay=pwm-2chan
 
 Ensure your user has access to `/sys/class/pwm` or run the app as root.
 
-In the future, the system may migrate to `libgpiod` for more robust PWM support.
+Be sure you are a member of the gpio group
+
+```bash
+sudo usermod -aG gpio $USER
+```
+or just add your username to the end of the "gpio" line in /etc/group
+
+```bash
+sudo vi /etc/group # comma separated list of user names
+```
+AND change the group of /dev/gpio
+
+```bash
+sudo chgrp gpio /dev/pigpio
+```
+
 
 ### Network Configuration
 To use your smartphone as a hotspot:

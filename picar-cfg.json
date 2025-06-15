@@ -1,8 +1,8 @@
 {
-  "comment_pwm_method": "libgpiod",
-  "pwm_method": "sysfs",
-  "steering_gpio": 18,
-  "throttle_gpio": 19,
+  "comment1": "pigpion is for the native picpio lib in C",
+  "pwm_method": "pigpion",
+  "steering_gpio": 13,
+  "throttle_gpio": 12,
   "pwm_period_us": 20000,
   "pwm_min_us": 1000,
   "pwm_max_us": 2000,

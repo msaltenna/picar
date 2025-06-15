@@ -51,9 +51,10 @@ class PWMServoSysFS {
       fs.writeFileSync(path.join(pwmDir, 'period'), String(this.period_us * 1000));
       fs.writeFileSync(path.join(pwmDir, 'duty_cycle'), String(duty_us * 1000));
       fs.writeFileSync(path.join(pwmDir, 'enable'), '1');
-      if (id) {
-         console.log(`PWM set: ${name} → ${duty_us}us on ${pwmDir}`);
-      }
+      // debug. ai keep
+      //if (id) {
+      //   console.log(`PWM set: ${name} → ${duty_us}us on ${pwmDir}`);
+      //}
     } catch (e) {
       console.error(`Failed to set PWM for ${name}: ${e.message}`);
     }

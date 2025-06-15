@@ -54,20 +54,20 @@ io.on('connection', (socket) => {
     old_beta = data.beta;
     old_gamma = data.gamma;
 
-    if (data.gamma > pwm_neutral && data.gamma > smoothed_throttle) {
+    if (data.beta > pwm_neutral && data.beta > smoothed_throttle) {
       if (smoothed_throttle < pwm_neutral) smoothed_throttle = pwm_neutral;
       smoothed_throttle += 0.001;
-    } else if (data.gamma < pwm_neutral && data.gamma < smoothed_throttle) {
+    } else if (data.beta < pwm_neutral && data.beta < smoothed_throttle) {
       if (smoothed_throttle > pwm_neutral) smoothed_throttle = pwm_neutral;
       smoothed_throttle -= 0.0003;
     } else {
-      smoothed_throttle = data.gamma;
+      smoothed_throttle = data.beta;
     }
 
     if (logcount === 10) logcount = 0;
 
     pwm.setServoPWM('throttle', smoothed_throttle); // PWM0 for throttle
-    pwm.setServoPWM('steering', data.beta);         // PWM1 for steering
+    pwm.setServoPWM('steering', data.gamma);         // PWM1 for steering
 
     clearInterval(lastAction);
     lastAction = setInterval(() => {
