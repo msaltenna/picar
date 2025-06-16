@@ -39,9 +39,9 @@ class PWMServoPigpio {
     }
 
     const pulseWidth = this.scale(value);
-    //gpio.servoWrite(pulseWidth);
-    if (id)
-      console.log(`PWM (pigpio): ${name} → ${pulseWidth}μs`);
+    gpio.servoWrite(pulseWidth);
+    //if (id)
+    //console.log(`PWM (pigpio): ${name} → ${pulseWidth}μs`);
   }
 }
 

@@ -30,7 +30,7 @@ const appServer = https.createServer(options, (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   if (parsedUrl.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'OK', beta: old_beta, gamma: old_gamma }));
+    res.end(JSON.stringify({ status: 'OK', throttle: old_throttle, steering: old_steering }));
   } else {
     file.serve(req, res);
   }
@@ -40,34 +40,38 @@ const io = new Server(appServer);
 appServer.listen(8443, '0.0.0.0');
 console.log('Pi Car web server listening on https://<ip>:8443/socket.html');
 
-let old_beta = 0.14;
-let old_gamma = 0.14;
+let old_throttle = 0.14;
+let old_steering = 0.14;
 const pwm_neutral = config.pwm_neutral;
 let smoothed_throttle = pwm_neutral;
 let logcount = 0;
 let lastAction = null;
 
+const throttle_ramp_up = 0.000;
+const throttle_ramp_down = 0.000;
+
 io.on('connection', (socket) => {
   console.log('Socket connected');
   socket.on('fromclient', (data) => {
     logcount++;
-    old_beta = data.beta;
-    old_gamma = data.gamma;
+    old_throttle = data.throttle;
+    old_steering = data.steering;
 
-    if (data.beta > pwm_neutral && data.beta > smoothed_throttle) {
-      if (smoothed_throttle < pwm_neutral) smoothed_throttle = pwm_neutral;
-      smoothed_throttle += 0.001;
-    } else if (data.beta < pwm_neutral && data.beta < smoothed_throttle) {
-      if (smoothed_throttle > pwm_neutral) smoothed_throttle = pwm_neutral;
-      smoothed_throttle -= 0.0003;
-    } else {
-      smoothed_throttle = data.beta;
+    if (throttle_ramp_up && (data.throttle > smoothed_throttle)) {
+      smoothed_throttle += throttle_ramp_up;
+      if (smoothed_throttle > data.throttle) smoothed_throttle = data.throttle;
+    } else if (throttle_ramp_down && (data.throttle < smoothed_throttle)) {
+      smoothed_throttle -= throttle_ramp_down;
+      if (smoothed_throttle < data.throttle) smoothed_throttle = data.throttle;
+    }
+    else {
+      smoothed_throttle = data.throttle;
     }
 
     if (logcount === 10) logcount = 0;
 
     pwm.setServoPWM('throttle', smoothed_throttle); // PWM0 for throttle
-    pwm.setServoPWM('steering', data.gamma);         // PWM1 for steering
+    pwm.setServoPWM('steering', data.steering);     // PWM1 for steering
 
     clearInterval(lastAction);
     lastAction = setInterval(() => {
@@ -106,17 +110,10 @@ const streamServer = https.createServer(options, (req, res) => {
     ]);
 
     ffmpeg.stdout.on('data', (chunk) => {
-      //console.log(`Sent frame of ${chunk.length} bytes`);
       res.write(`--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
       res.write(chunk);
       res.write('\r\n');
     });
-
-    //ffmpeg.stderr.on('data', data => {
-    //  console.error(`[ffmpeg] ${data}`);
-    //});
-
-    //ffmpeg.stdout.pipe(res);
 
     req.on('close', () => {
       ffmpeg.kill('SIGTERM');
