@@ -1,6 +1,6 @@
 {
   "rover_id": 1,
-  "fleetManagerUrl": "",
+  "fleetManagerUrl": "http://fleet-manager.local:3000",
   "fleet_heartbeat_interval_s": 5,
   "batteryWarnLevel": 20,
 
