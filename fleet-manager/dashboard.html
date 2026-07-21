@@ -133,7 +133,7 @@
         // Sort: online first, then by id
         list.sort((a, b) => {
           if (a.online !== b.online) return b.online - a.online;
-          return a.id - b.id;
+          return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
         });
 
         grid.innerHTML = list.map(r => {
