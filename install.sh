@@ -97,13 +97,19 @@ fi
 if [[ "$INSTALL_MODE" == "fleet" ]]; then
   say "Installing Fleet Manager..."
   apt-get update -y
-  apt-get install -y nodejs npm
+  # avahi-daemon + python3-dbus power the mDNS alias so rovers can always reach
+  # this host at the fixed name fleet-manager.local, regardless of its IP/subnet.
+  apt-get install -y nodejs npm avahi-daemon python3-dbus
+  systemctl enable --now avahi-daemon
 
   install_unit "${REPO_DIR}/systemd/fleet-manager.service"
+  install_unit "${REPO_DIR}/systemd/avahi-fleet-alias.service"
   systemctl daemon-reload
   systemctl enable --now fleet-manager.service
+  systemctl enable --now avahi-fleet-alias.service
   say "Fleet Manager installed and running on port 3000."
   say "Dashboard: http://$(hostname -I | awk '{print $1}'):3000"
+  say "mDNS alias: rovers should target http://fleet-manager.local:3000"
   say "Done."
   exit 0
 fi

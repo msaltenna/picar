@@ -303,3 +303,51 @@ sudo systemctl start picar
 ```
 
 The web server and stream will now automatically start when the Pi boots.
+
+## Fleet Manager
+
+The Fleet Manager is a standalone dashboard (`fleet-manager/server.js`, port `3000`) that
+tracks multiple rovers. Each rover periodically POSTs a heartbeat (`id`, `ip`, `status`) to
+it, and the dashboard lists every rover with a link to its controller UI.
+
+Install it on any Linux machine (a laptop is fine) with:
+
+```bash
+sudo ./install.sh --fleet
+```
+
+### Stable addressing with mDNS (`fleet-manager.local`)
+
+Rovers reach the Fleet Manager by a **fixed, machine-independent name** rather than an IP:
+
+```json
+"fleetManagerUrl": "http://fleet-manager.local:3000"
+```
+
+This value is set once and never changes. The Fleet Manager host publishes the mDNS name
+`fleet-manager.local` for whichever LAN address it currently has, via the
+`avahi-fleet-alias.service` unit (installed automatically by `--fleet`). Because the alias
+is a per-interface A record that tracks the host's live address:
+
+- **Any computer can be the Fleet Manager** — it claims `fleet-manager.local` just by
+  running the alias service. Nothing on the rovers ever references a specific hostname.
+- **Renumbering the LAN is transparent** — e.g. `192.168.31.x` → `192.168.10.x`, or
+  switching between Wi-Fi and Ethernet. The alias follows the new address; rovers need no
+  changes because the heartbeat client re-resolves the name on every beat.
+- VPN / virtual / loopback interfaces are ignored, so only real LAN addresses are advertised.
+
+> The alias must be an **A record**, not a CNAME: Raspberry Pi OS resolves `.local` names via
+> `mdns4_minimal`, which does not follow CNAMEs. The publisher (`fleet-manager/avahi-fleet-alias.py`)
+> handles this.
+
+Requirements on the Fleet Manager host: `avahi-daemon` running and `python3-dbus` installed
+(both are set up by `install.sh --fleet`). To use a different role name, override
+`FLEET_ALIAS` in the service (e.g. `Environment=FLEET_ALIAS=my-fleet.local`) and set the same
+name in each rover's `fleetManagerUrl`.
+
+Verify from any machine on the LAN:
+
+```bash
+ping fleet-manager.local
+curl http://fleet-manager.local:3000/api/rovers
+```
