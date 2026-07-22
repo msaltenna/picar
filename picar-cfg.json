@@ -1,6 +1,7 @@
 {
   "rover_id": 1,
-  "fleetManagerUrl": "http://fleet-manager.local:3000",
+  "comment_fleetManagerUrl": "'auto' = discover the Fleet Manager on the LAN (OS-agnostic, no IP/hostname needed). Or set an explicit http://host:port. Empty disables.",
+  "fleetManagerUrl": "auto",
   "fleet_heartbeat_interval_s": 5,
   "batteryWarnLevel": 20,
 
