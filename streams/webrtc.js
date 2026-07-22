@@ -42,8 +42,7 @@ webrtcTrackGatherTimeout: 10s
 paths:
   ${camPath}:
     source: rpiCamera
-    sourceOnDemand: true
-    sourceOnDemandCloseAfter: 5s
+    sourceOnDemand: false
     rpiCameraCamID: ${cfg.webrtc_cam_id ?? 0}
     rpiCameraWidth: ${params.width}
     rpiCameraHeight: ${params.height}
