@@ -290,6 +290,28 @@ if [[ "${USE_WEBRTC}" == "yes" ]]; then
   chown -R "${RUN_USER}:${RUN_USER}" "${REPO_DIR}/bin" || true
 fi
 
+# Allow the picar service user to restart mediamtx without root. A video
+# resolution/fps change rewrites mediamtx.yml and runs 'systemctl restart
+# mediamtx'; as a non-root service that is denied by polkit ("Interactive
+# authentication required"), so the change silently never takes effect.
+POLKIT_RULE="/etc/polkit-1/rules.d/49-picar-mediamtx.rules"
+if [[ -d /etc/polkit-1/rules.d ]]; then
+  cat > "${POLKIT_RULE}" <<POLKIT
+// Installed by picar install.sh — lets ${RUN_USER} restart mediamtx on video-param changes.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "mediamtx.service" &&
+        subject.user == "${RUN_USER}") {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+  chmod 0644 "${POLKIT_RULE}"
+  say "Installed polkit rule: ${RUN_USER} may restart mediamtx (${POLKIT_RULE})"
+else
+  say "WARNING: /etc/polkit-1/rules.d missing — add a sudoers NOPASSWD rule so ${RUN_USER} can 'systemctl restart mediamtx', else video-param changes won't apply."
+fi
+
 # systemd install with templating of User=
 say "Installing systemd units..."
 UNIT_SRC_DIR="${REPO_DIR}/systemd"
