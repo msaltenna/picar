@@ -85,6 +85,42 @@ If you opt for this approach the wiring is much simpler; also there's a lot more
 
 ## Software Setup
 
+### Control safety
+
+The controller uses a single-owner safety lease:
+
+- Pressing **Start** requests a new control session. A reconnect never resumes
+  the previous throttle value; the operator must press **Start** again.
+- Releasing or cancelling a touch immediately commands neutral. Hiding/blurring
+  the controller page, losing the Socket.IO connection, or missing the input
+  watchdog deadline commands neutral and disarms.
+- Gear and differential changes stop and disarm the rover first. Press
+  **Start** again after selecting the new drivetrain state.
+- Commands carry a session token, sequence number, and timestamp. Replayed,
+  out-of-order, or stale commands are ignored or trigger a fail-safe stop.
+- MAVProxy arming is blocked until a flight-controller heartbeat and all
+  critical ArduRover parameters have been read back successfully over MAVLink
+  1 or MAVLink 2.
+
+The tracked defaults are:
+
+```json
+{
+  "input_timeout_ms": 1000,
+  "max_command_age_ms": 500,
+  "max_command_future_skew_ms": 100,
+  "max_control_rtt_ms": 1000,
+  "mavproxy_allow_unverified_arm": false
+}
+```
+
+`mavproxy_allow_unverified_arm` is an emergency diagnostic bypass. Do not
+enable it for normal operation.
+
+After installing this software, test each rover with its driven wheels lifted
+and the area clear. Confirm that touch cancellation, browser backgrounding,
+radio loss, and gear changes all produce neutral/disarm before ground testing.
+
 ### Install Node.js and Dependencies
 Node.js and npm are available through the official Raspberry Pi OS Bookworm repository:
 

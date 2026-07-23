@@ -338,6 +338,7 @@
     }
   </style>
   <script src="/socket.io/socket.io.js"></script>
+  <script src="/client-control-safety.js"></script>
 </head>
 <body>
   <img id="live" src="" alt="">
@@ -501,7 +502,7 @@
     const statusCol3     = document.getElementById('statusCol3');
     const configModal    = document.getElementById('configModal');
 
-    let stopped     = true;
+    const controlLease = new ClientControlLease();
     let wakeLock    = null;
     let isConnected = false;
 
@@ -1184,6 +1185,7 @@
     let tlockFrontValue  = 1;
     let tlockRearValue   = -1;
     let controlSendInterval = null;
+    const keysDown = {};
 
     const STEERING_DEADZONE = 0.08;
     const STEERING_EXPO     = 2.0;
@@ -1193,23 +1195,28 @@
       return sign * Math.pow((abs - STEERING_DEADZONE) / (1 - STEERING_DEADZONE), STEERING_EXPO);
     }
 
+    function requireNeutralForDrivetrainChange() {
+      if (!controlLease.stopped) enterSafeStoppedState('drivetrain-change');
+      resetMotionInputs();
+    }
+
     function toggleShift() {
+      requireNeutralForDrivetrainChange();
       const btn = document.getElementById('shiftBtn');
       if (shiftValue > 0) { shiftValue = -1; btn.textContent = 'Gear: HIGH'; btn.classList.add('high'); }
       else                { shiftValue =  1; btn.textContent = 'Gear: LOW';  btn.classList.remove('high'); }
-      sendControlValues();
     }
     function toggleTlockFront() {
+      requireNeutralForDrivetrainChange();
       const btn = document.getElementById('tlockFrontBtn');
       if (tlockFrontValue > 0) { tlockFrontValue = -1; btn.textContent = 'F.Diff: Lock'; btn.classList.add('locked'); }
       else                     { tlockFrontValue =  1; btn.textContent = 'F.Diff: Open'; btn.classList.remove('locked'); }
-      sendControlValues();
     }
     function toggleTlockRear() {
+      requireNeutralForDrivetrainChange();
       const btn = document.getElementById('tlockRearBtn');
       if (tlockRearValue < 0) { tlockRearValue =  1; btn.textContent = 'R.Diff: Lock'; btn.classList.add('locked'); }
       else                    { tlockRearValue = -1; btn.textContent = 'R.Diff: Open'; btn.classList.remove('locked'); }
-      sendControlValues();
     }
 
     function addButtonHandlers(id, toggleFn) {
@@ -1242,22 +1249,26 @@
       return controlMode === 'orientation' ? steeringValue : applyCurve(steeringValue);
     }
 
-    function sendControlValues() {
-      const data = {
+    function sendControlValues({ reliable = false } = {}) {
+      const data = controlLease.envelope({
         throttle:    throttleValue,
         steering:    currentSteeringCommand(),
         shift:       shiftValue,
         tlock_front: tlockFrontValue,
         tlock_rear:  tlockRearValue,
-      };
+      });
+      if (!data) return;
       statUpBytes += JSON.stringify(data).length;
-      socket.volatile.emit('fromclient', data);
+      if (reliable) socket.emit('fromclient', data);
+      else          socket.volatile.emit('fromclient', data);
     }
 
     function startControlSendLoop() {
       if (controlSendInterval) return;
       sendControlValues();
-      controlSendInterval = setInterval(() => { if (!stopped) sendControlValues(); }, 50);
+      controlSendInterval = setInterval(() => {
+        if (!controlLease.stopped) sendControlValues();
+      }, 50);
     }
     function stopControlSendLoop() {
       if (!controlSendInterval) return;
@@ -1273,7 +1284,11 @@
       try { wakeLock = await navigator.wakeLock.request('screen'); } catch (_) {}
     }
     document.addEventListener('visibilitychange', () => {
-      if (wakeLock !== null && document.visibilityState === 'visible') requestWakeLock();
+      if (document.visibilityState === 'hidden') {
+        enterSafeStoppedState('page-hidden');
+      } else if (wakeLock !== null) {
+        requestWakeLock();
+      }
     });
 
     // ── Menu ──────────────────────────────────────────────────────────────────
@@ -1282,23 +1297,98 @@
     });
 
     // ── Stop / Start ──────────────────────────────────────────────────────────
-    function toggleStop() {
-      if (!stopped) {
-        throttleValue = 0; steeringValue = 0;
-        sendControlValues(); stopControlSendLoop();
-        socket.emit('disarm');
-        stopBtn.textContent = 'Start'; stopBtn.style.background = '#333';
-        stopped = true;
-      } else {
-        socket.emit('arm');
-        startControlSendLoop();
-        stopBtn.textContent = 'Stop'; stopBtn.style.background = '#a33';
-        stopped = false;
+    let armPending = false;
+    let resetThrottleJoystick = () => {};
+    let resetSteeringJoystick = () => {};
+
+    function resetMotionInputs() {
+      throttleValue = 0;
+      steeringValue = 0;
+      resetThrottleJoystick();
+      resetSteeringJoystick();
+      if (typeof keysDown !== 'undefined') {
+        for (const key of Object.keys(keysDown)) delete keysDown[key];
       }
+    }
+
+    function showStoppedState(message = null) {
+      stopBtn.textContent = message ? 'Start ⚠' : 'Start';
+      stopBtn.title = message || '';
+      stopBtn.style.background = '#333';
       renderStatusBar();
     }
 
-    function refreshPage() { window.location.reload(); }
+    function enterSafeStoppedState(reason, notifyServer = true) {
+      const token = controlLease.token;
+      resetMotionInputs();
+
+      // Deliver one non-volatile neutral command before disarming. Socket.IO
+      // preserves event order, so the server applies neutral before DISARM.
+      if (notifyServer && isConnected && token) {
+        sendControlValues({ reliable: true });
+        socket.emit('disarm', { controlSession: token });
+      }
+
+      controlLease.stop();
+      stopControlSendLoop();
+      armPending = false;
+      showStoppedState(reason && reason !== 'operator' ? `Stopped: ${reason}` : null);
+    }
+
+    function toggleStop() {
+      if (!controlLease.stopped) {
+        enterSafeStoppedState('operator');
+        return;
+      }
+      if (armPending || !isConnected) {
+        showStoppedState(isConnected ? 'Arm already pending' : 'Cannot arm: disconnected');
+        return;
+      }
+
+      resetMotionInputs();
+      armPending = true;
+      stopBtn.textContent = 'Arming…';
+      const armClientTime = Date.now();
+
+      let settled = false;
+      const armTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        armPending = false;
+        showStoppedState('Arm timed out');
+      }, 3000);
+
+      socket.emit('arm', { clientTime: armClientTime }, result => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(armTimer);
+        armPending = false;
+
+        if (!result || !result.ok) {
+          showStoppedState(`Arm refused: ${result?.error || 'unknown error'}`);
+          return;
+        }
+
+        controlLease.begin(result.controlSession, Date.now());
+        startControlSendLoop();
+        stopBtn.textContent = 'Stop';
+        stopBtn.title = '';
+        stopBtn.style.background = '#a33';
+        renderStatusBar();
+      });
+    }
+
+    window.addEventListener('blur', () => {
+      if (!controlLease.stopped) enterSafeStoppedState('window-blur');
+    });
+    window.addEventListener('pagehide', () => {
+      if (!controlLease.stopped) enterSafeStoppedState('page-hidden');
+    });
+
+    function refreshPage() {
+      enterSafeStoppedState('page-refresh');
+      window.location.reload();
+    }
 
     // ── Orientation controls ──────────────────────────────────────────────────
     function requestOrientationPermission() {
@@ -1317,7 +1407,7 @@
     }
 
     function handleOrientation(event) {
-      if (stopped) return;
+      if (controlLease.stopped) return;
       const betadeg = event.beta, gammadeg = event.gamma;
       throttleValue = Math.max(-1, Math.min(1, (45 - betadeg) / 50));
       steeringValue = applyCurve(Math.max(-1, Math.min(1, gammadeg / 25)));
@@ -1362,35 +1452,50 @@
 
       const endTouch = (e) => {
         for (const t of e.changedTouches) {
-          if (t.identifier === touchId) { active = false; touchId = null; resetThumb(); e.preventDefault(); break; }
+          if (t.identifier === touchId) {
+            active = false;
+            touchId = null;
+            resetThumb();
+            sendControlValues({ reliable: true });
+            e.preventDefault();
+            break;
+          }
         }
       };
       const cancelTouch = (e) => {
         for (const t of e.changedTouches) {
           if (t.identifier === touchId) {
-            active = false; touchId = null;
-            if (axis === 'throttle') console.log('touchcancel throttle — preserved');
-            else { resetThumb(); console.log('touchcancel steering — reset'); }
-            e.preventDefault(); break;
+            active = false;
+            touchId = null;
+            resetThumb();
+            sendControlValues({ reliable: true });
+            console.log(`touchcancel ${axis} — reset to neutral`);
+            e.preventDefault();
+            break;
           }
         }
       };
       zoneEl.addEventListener('touchend',   endTouch,    { passive: false });
       zoneEl.addEventListener('touchcancel', cancelTouch, { passive: false });
+
+      return () => {
+        active = false;
+        touchId = null;
+        resetThumb();
+      };
     }
 
-    setupJoystick(joystickLeftEl,  thumbLeft,  'throttle');
-    setupJoystick(joystickRightEl, thumbRight, 'steering');
+    resetThrottleJoystick = setupJoystick(joystickLeftEl,  thumbLeft,  'throttle');
+    resetSteeringJoystick = setupJoystick(joystickRightEl, thumbRight, 'steering');
 
     // ── Keyboard controls ─────────────────────────────────────────────────────
-    const keysDown = {};
     const KEY_THROTTLE_STEP = 0.05, KEY_STEERING_STEP = 0.15;
     let keyboardInterval = null;
 
     function startKeyboardLoop() {
       if (keyboardInterval) return;
       keyboardInterval = setInterval(() => {
-        if (stopped || controlMode !== 'keyboard') return;
+        if (controlLease.stopped || controlMode !== 'keyboard') return;
         if      (keysDown['KeyW'] || keysDown['ArrowUp'])    throttleValue = Math.min( 1, throttleValue + KEY_THROTTLE_STEP);
         else if (keysDown['KeyS'] || keysDown['ArrowDown'])  throttleValue = Math.max(-1, throttleValue - KEY_THROTTLE_STEP);
         else { if (Math.abs(throttleValue) < KEY_THROTTLE_STEP) throttleValue = 0; else throttleValue -= Math.sign(throttleValue) * KEY_THROTTLE_STEP; }
@@ -1406,17 +1511,31 @@
       if (controlMode !== 'keyboard') return;
       if (e.code === 'Space') {
         e.preventDefault(); throttleValue = 0; steeringValue = 0;
-        sendControlValues(); return;
+        sendControlValues({ reliable: true }); return;
       }
       if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') { e.preventDefault(); toggleShift(); return; }
       if (!keysDown[e.code]) { keysDown[e.code] = true; startKeyboardLoop(); }
       if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
     });
-    document.addEventListener('keyup', (e) => { delete keysDown[e.code]; });
+    document.addEventListener('keyup', (e) => {
+      delete keysDown[e.code];
+      if (['KeyW', 'KeyS', 'ArrowUp', 'ArrowDown'].includes(e.code)) throttleValue = 0;
+      if (['KeyA', 'KeyD', 'ArrowLeft', 'ArrowRight'].includes(e.code)) steeringValue = 0;
+      sendControlValues({ reliable: true });
+    });
 
     // ── Socket status ─────────────────────────────────────────────────────────
-    socket.on('connect',    () => { isConnected = true;  renderStatusBar(); });
-    socket.on('disconnect', () => { isConnected = false; renderStatusBar(); });
+    socket.on('connect', () => {
+      isConnected = true;
+      renderStatusBar();
+    });
+    socket.on('disconnect', () => {
+      isConnected = false;
+      enterSafeStoppedState('connection-lost', false);
+    });
+    socket.on('controlStopped', event => {
+      enterSafeStoppedState(event?.reason || 'server-fail-safe', false);
+    });
 
     // ── Startup ───────────────────────────────────────────────────────────────
     window.addEventListener('load', () => {

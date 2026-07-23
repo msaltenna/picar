@@ -34,6 +34,8 @@ console.log(`Rover ID: ${config.rover_id ?? 1}`);
 
 const PWMDriver = require('./pwm_servo');
 const pwm = PWMDriver(config);
+const ControlSafetyController = require('./control-safety');
+const control = new ControlSafetyController(pwm, config);
 
 require('./fleetmgr-client').start(config);
 
@@ -77,7 +79,7 @@ const appServer = https.createServer(options, (req, res) => {
   const parsed = url.parse(req.url, true);
   if (parsed.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'OK', throttle: old_throttle, steering: old_steering }));
+    res.end(JSON.stringify({ status: 'OK', ...control.getStatus() }));
   } else if (parsed.pathname === '/manifest.json') {
     const roverId = config.rover_id ?? 1;
     const manifest = {
@@ -101,29 +103,28 @@ const appServer = https.createServer(options, (req, res) => {
 });
 
 const io = new Server(appServer);
+control.onFailSafe = ({ reason, socketId }) => {
+  const ownerSocket = io.sockets.sockets.get(socketId);
+  if (ownerSocket) ownerSocket.emit('controlStopped', { reason });
+};
 appServer.listen(8443, '0.0.0.0');
 console.log('Pi Car web server: https://<ip>:8443/socket.html');
 
-const control_neutral  = config.control_neutral  ?? 0;
-const input_timeout_ms = config.input_timeout_ms ?? 500;
-
-let old_throttle      = control_neutral;
-let old_steering      = control_neutral;
-let smoothed_throttle = control_neutral;
-let logcount = 0;
-let lastAction = null;
-
-const throttle_ramp_up   = 0;
-const throttle_ramp_down = 0;
-
 io.on('connection', (socket) => {
-  console.log('Control client connected');
+  console.log(`Control client connected: ${socket.id}`);
 
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
 
-  socket.on('arm',    () => { console.log('ARM');    if (typeof pwm.arm    === 'function') pwm.arm();    });
-  socket.on('disarm', () => { console.log('DISARM'); if (typeof pwm.disarm === 'function') pwm.disarm(); });
+  socket.on('arm', (request, acknowledge) => {
+    const result = control.arm(socket.id, request);
+    if (typeof acknowledge === 'function') acknowledge(result);
+  });
+
+  socket.on('disarm', (request, acknowledge) => {
+    const result = control.disarm(socket.id, request);
+    if (typeof acknowledge === 'function') acknowledge(result);
+  });
 
   socket.on('setVideoParams', (params) => {
     console.log('setVideoParams:', params);
@@ -133,43 +134,26 @@ io.on('connection', (socket) => {
   });
 
   socket.on('fromclient', (data) => {
-    logcount++;
-    const throttleCmd = Number.isFinite(data.throttle)
-      ? Math.max(-1, Math.min(1, data.throttle)) : control_neutral;
-    const steeringCmd = Number.isFinite(data.steering)
-      ? Math.max(-1, Math.min(1, data.steering)) : control_neutral;
+    control.handleCommand(socket.id, data);
+  });
 
-    old_throttle = throttleCmd;
-    old_steering = steeringCmd;
-
-    if (throttle_ramp_up && throttleCmd > smoothed_throttle)
-      smoothed_throttle = Math.min(throttleCmd, smoothed_throttle + throttle_ramp_up);
-    else if (throttle_ramp_down && throttleCmd < smoothed_throttle)
-      smoothed_throttle = Math.max(throttleCmd, smoothed_throttle - throttle_ramp_down);
-    else
-      smoothed_throttle = throttleCmd;
-
-    if (logcount === 10) logcount = 0;
-
-    pwm.setServoPWM('throttle', smoothed_throttle);
-    pwm.setServoPWM('steering', steeringCmd);
-    if (data.shift       !== undefined) pwm.setServoPWM('shift',       data.shift);
-    if (data.tlock_front !== undefined) pwm.setServoPWM('tlock_front', data.tlock_front);
-    if (data.tlock_rear  !== undefined) pwm.setServoPWM('tlock_rear',  data.tlock_rear);
-
-    clearTimeout(lastAction);
-    lastAction = setTimeout(() => {
-      pwm.setServoPWM('throttle', control_neutral);
-      pwm.setServoPWM('steering', control_neutral);
-      console.log(`### EMERGENCY STOP (no input for ${input_timeout_ms} ms)`);
-    }, input_timeout_ms);
+  socket.on('disconnect', () => {
+    console.log(`Control client disconnected: ${socket.id}`);
+    control.disconnect(socket.id);
   });
 });
 
-process.on('SIGINT', () => {
-  pwm.setServoPWM('throttle', control_neutral);
-  pwm.setServoPWM('steering', control_neutral);
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  control.shutdown();
   stream.stop();
-  console.log('\nShutting down');
-  process.exit();
-});
+  console.log(`\nShutting down (${signal})`);
+  // Give the final neutral + DISARM packet a brief chance to flush to
+  // MAVProxy before systemd terminates the process.
+  setTimeout(() => process.exit(), 100);
+}
+
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

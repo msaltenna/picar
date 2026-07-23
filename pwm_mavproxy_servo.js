@@ -1,7 +1,7 @@
 // pwm_mavproxy_servo.js
 // Sends RC_CHANNELS_OVERRIDE to MAVProxy over TCP
-// Node acts as TCP SERVER, MAVProxy connects as client with --out=tcp:127.0.0.1:5760
-// Uses proper MAVLink v1 framing with CRC
+// Node connects as a TCP client to MAVProxy --out=tcpin:127.0.0.1:5760
+// Sends MAVLink v1 commands and parses verified MAVLink v1/v2 responses
 
 const net = require('net');
 
@@ -15,6 +15,7 @@ const PARAM_SET_CRC_EXTRA = 168;
 const MAVLINK_MSG_ID_PARAM_REQUEST_READ = 20;
 const PARAM_REQUEST_READ_CRC_EXTRA = 214;
 const MAVLINK_MSG_ID_PARAM_VALUE = 22;
+const PARAM_VALUE_CRC_EXTRA = 220;
 
 // MAV_CMD values
 const MAV_CMD_COMPONENT_ARM_DISARM = 400;
@@ -34,7 +35,7 @@ const DEFAULT_PARAM_OVERLAY = {
   SERVO3_FUNCTION: 70, // Throttle on RC3
   SERVO4_FUNCTION: 1,  // RC passthrough: front diff on RC4
   SERVO5_FUNCTION: 1,  // RC passthrough: rear diff on RC5
-  FRAME_CLASS: 2,      // Rover (must be set or steering/throttle outputs are wrong)
+  FRAME_CLASS: 1,      // Rover (2 is Boat)
   RC_OVERRIDE_TIME: 0.2, // release stale overrides quickly if packets stop
   AHRS_GPS_USE: 0,     // no GPS installed
   GPS1_TYPE: 0         // no GPS installed
@@ -49,7 +50,7 @@ const EXPECTED_CRITICAL_PARAMS = {
   SERVO3_FUNCTION: 70,
   SERVO4_FUNCTION: 1,
   SERVO5_FUNCTION: 1,
-  FRAME_CLASS: 2,
+  FRAME_CLASS: 1,
   RC_OVERRIDE_TIME: 0.2
 };
 
@@ -78,9 +79,17 @@ class PWMMavproxy {
 
     this.paramOverlay = config.mavproxy_param_overlay || DEFAULT_PARAM_OVERLAY;
     this.applyParamOverlayOnConnect = config.mavproxy_apply_param_overlay !== false;
+    this.allowUnverifiedArm = config.mavproxy_allow_unverified_arm === true;
+    this.armDelayMs = config.mavproxy_arm_delay_ms ?? 500;
 
     this.seq = 0;
     this.client = null;   // the connected MAVProxy client socket
+    this.controlEnabled = false;
+    this.pixhawkHeartbeatSeen = false;
+    this.paramOverlayApplied = false;
+    this.verifiedCriticalParams = new Set();
+    this.paramVerificationFailures = new Map();
+    this.armTimeout = null;
 
     this.channels = new Uint16Array(8);
     // Initialize ALL channels to neutral so ArduPilot doesn't ignore them
@@ -97,6 +106,10 @@ class PWMMavproxy {
       tlock_front: 3, // RC channel 4 (0-indexed)
       tlock_rear: 4   // RC channel 5 (0-indexed)
     };
+    this.channelNeutral = {
+      steering: this.channels[0],
+      throttle: this.channels[2],
+    };
 
     this.rate_hz = config.mavproxy_rate_hz || 20;
     this.interval = null;
@@ -109,7 +122,7 @@ class PWMMavproxy {
       `(neutral=${this.legacyInputScale ? this.pwm_neutral : 0})`
     );
 
-    this.startServer();
+    if (config.mavproxy_autostart !== false) this.startServer();
   }
 
   startServer() {
@@ -123,6 +136,9 @@ class PWMMavproxy {
       this.client = socket;
       this.pixhawkHeartbeatSeen = false;
       this.paramOverlayApplied = false;
+      // A process/MAVProxy restart must never inherit an armed controller.
+      // Command neutral and DISARM before beginning the normal send loop.
+      this.disarm();
       this.startHeartbeat();
       this.startLoop();
     });
@@ -140,6 +156,17 @@ class PWMMavproxy {
 
     socket.on('close', () => {
       console.log('MAVProxy: connection closed, retrying in 2s…');
+      this.controlEnabled = false;
+      this.pixhawkHeartbeatSeen = false;
+      this.paramOverlayApplied = false;
+      this.verifiedCriticalParams.clear();
+      this.paramVerificationFailures.clear();
+      this.neutralizeMotion();
+      this.rxBuf = Buffer.alloc(0);
+      if (this.armTimeout) {
+        clearTimeout(this.armTimeout);
+        this.armTimeout = null;
+      }
       this.client = null;
       if (this.interval) { clearInterval(this.interval); this.interval = null; }
       if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = null; }
@@ -157,12 +184,19 @@ class PWMMavproxy {
     }
   }
 
-  scale(value) {
+  scale(value, name = null) {
     const midpoint = (this.max_us + this.min_us) / 2;
     const outputHalfRange = (this.max_us - this.min_us) / 2;
 
     if (!this.legacyInputScale) {
       const normalized = this.clamp(value, -1, 1);
+      if (name && Object.prototype.hasOwnProperty.call(this.channelNeutral, name)) {
+        const neutral = this.channelNeutral[name];
+        const range = normalized >= 0
+          ? this.max_us - neutral
+          : neutral - this.min_us;
+        return Math.round(neutral + normalized * range);
+      }
       return Math.round(midpoint + outputHalfRange * normalized);
     }
 
@@ -179,8 +213,25 @@ class PWMMavproxy {
 
   setServoPWM(name, value) {
     const ch = this.channelMap[name];
-    if (ch === undefined) return;
-    this.channels[ch] = this.clamp(this.scale(value), this.min_us, this.max_us);
+    if (ch === undefined || !Number.isFinite(value)) return false;
+
+    const isMotionChannel = name === 'throttle' || name === 'steering';
+    const isNeutralInput = this.legacyInputScale
+      ? Math.abs(value - this.pwm_neutral) < 1e-9
+      : Math.abs(value) < 1e-9;
+
+    if (isMotionChannel && !this.controlEnabled && !isNeutralInput) return false;
+
+    const scaled = isMotionChannel && isNeutralInput
+      ? this.channelNeutral[name]
+      : this.scale(value, name);
+    this.channels[ch] = this.clamp(scaled, this.min_us, this.max_us);
+    return true;
+  }
+
+  neutralizeMotion() {
+    this.channels[this.channelMap.throttle] = this.channelNeutral.throttle;
+    this.channels[this.channelMap.steering] = this.channelNeutral.steering;
   }
 
   clamp(v, lo, hi) {
@@ -310,6 +361,8 @@ class PWMMavproxy {
     const entries = Object.entries(this.paramOverlay || {});
     if (entries.length === 0) return;
 
+    this.verifiedCriticalParams.clear();
+    this.paramVerificationFailures.clear();
     console.log('MAVProxy: Applying minimal Pixhawk param overlay...');
 
     entries.forEach(([name, value], index) => {
@@ -359,31 +412,74 @@ class PWMMavproxy {
     return buf;
   }
 
-  // Lightweight MAVLink v1 byte-stream parser. We only care about HEARTBEAT
-  // (to know the FC is alive) and PARAM_VALUE (to verify our overlay stuck).
+  // Lightweight MAVLink v1/v2 byte-stream parser. We only care about
+  // HEARTBEAT (to know the FC is alive) and PARAM_VALUE (to verify safety
+  // parameters). MAVProxy commonly forwards MAVLink 2 frames (0xFD), so
+  // accepting only v1 would silently disable all verification.
   parseIncoming(data) {
     this.rxBuf = this.rxBuf ? Buffer.concat([this.rxBuf, data]) : Buffer.from(data);
     while (this.rxBuf.length >= 8) {
-      if (this.rxBuf[0] !== 0xFE) {
+      const magic = this.rxBuf[0];
+      if (magic !== 0xFE && magic !== 0xFD) {
         // Resync: drop one byte
         this.rxBuf = this.rxBuf.subarray(1);
         continue;
       }
+
       const payloadLen = this.rxBuf[1];
-      const frameLen = 6 + payloadLen + 2;
+      const isV2 = magic === 0xFD;
+      const headerLen = isV2 ? 10 : 6;
+      if (this.rxBuf.length < headerLen + 2) return;
+
+      const signatureLen = isV2 && (this.rxBuf[2] & 0x01) ? 13 : 0;
+      const frameLen = headerLen + payloadLen + 2 + signatureLen;
       if (this.rxBuf.length < frameLen) return; // wait for more
-      const msgId = this.rxBuf[5];
-      const payload = this.rxBuf.subarray(6, 6 + payloadLen);
-      this.handleMessage(msgId, payload);
+
+      const msgId = isV2
+        ? this.rxBuf[7] | (this.rxBuf[8] << 8) | (this.rxBuf[9] << 16)
+        : this.rxBuf[5];
+      const sysId = isV2 ? this.rxBuf[5] : this.rxBuf[3];
+      const componentId = isV2 ? this.rxBuf[6] : this.rxBuf[4];
+      const payload = this.rxBuf.subarray(headerLen, headerLen + payloadLen);
+
+      const crcExtra = msgId === 0
+        ? HEARTBEAT_CRC_EXTRA
+        : (msgId === MAVLINK_MSG_ID_PARAM_VALUE ? PARAM_VALUE_CRC_EXTRA : null);
+      if (crcExtra !== null) {
+        const crcInputLength = headerLen - 1 + payloadLen;
+        let expectedCrc = PWMMavproxy.crc16(
+          this.rxBuf.subarray(1, headerLen + payloadLen),
+          crcInputLength,
+        );
+        expectedCrc = PWMMavproxy.crcAccumulate(crcExtra, expectedCrc);
+        const receivedCrc = this.rxBuf.readUInt16LE(headerLen + payloadLen);
+        if (receivedCrc !== expectedCrc) {
+          console.error(
+            `MAVProxy: dropping MAVLink ${isV2 ? 2 : 1} message ${msgId} with invalid CRC`
+          );
+          this.rxBuf = this.rxBuf.subarray(frameLen);
+          continue;
+        }
+      }
+
+      this.handleMessage(msgId, payload, { sysId, componentId, mavlinkVersion: isV2 ? 2 : 1 });
       this.rxBuf = this.rxBuf.subarray(frameLen);
     }
   }
 
-  handleMessage(msgId, payload) {
+  handleMessage(msgId, payload, metadata = {}) {
+    if (metadata.sysId !== undefined && metadata.sysId !== this.target_system) return;
+
     if (msgId === 0) {
       // HEARTBEAT
+      // Ignore GCS/MAVProxy heartbeats; only an autopilot heartbeat proves the
+      // flight controller is available. HEARTBEAT.autopilot is payload byte 5.
+      if (payload.length < 9 || payload[5] === 8) return;
       if (!this.pixhawkHeartbeatSeen) {
-        console.log('MAVProxy: Received first Pixhawk heartbeat');
+        console.log(
+          `MAVProxy: Received first Pixhawk heartbeat ` +
+          `(sys=${metadata.sysId ?? '?'} MAVLink ${metadata.mavlinkVersion ?? '?'})`
+        );
         this.pixhawkHeartbeatSeen = true;
         if (this.applyParamOverlayOnConnect && !this.paramOverlayApplied) {
           this.applyParamOverlay();
@@ -412,17 +508,42 @@ class PWMMavproxy {
         }
 
         if (!matches) {
+          this.verifiedCriticalParams.delete(name);
+          this.paramVerificationFailures.set(name, { actual, expected });
           console.error(
             `MAVProxy: WARNING ${name}=${actual} on flight controller ` +
             `but expected ${expected}. Outputs will be miswired ` +
-            `(e.g. steering will drive throttle). Check FRAME_CLASS=2 (Rover) ` +
+            `(e.g. steering will drive throttle). Check FRAME_CLASS=1 (Rover) ` +
             `and that the firmware is ArduRover, then power-cycle.`
           );
         } else {
+          this.paramVerificationFailures.delete(name);
+          this.verifiedCriticalParams.add(name);
           console.log(`MAVProxy: verified ${name}=${actual}`);
         }
       }
     }
+  }
+
+  getSafetyStatus() {
+    const missingParams = Object.keys(EXPECTED_CRITICAL_PARAMS)
+      .filter(name => !this.verifiedCriticalParams.has(name));
+    return {
+      readyToArm: this.isSafetyReady(),
+      heartbeatSeen: this.pixhawkHeartbeatSeen,
+      controlEnabled: this.controlEnabled,
+      missingParams,
+      mismatchedParams: Object.fromEntries(this.paramVerificationFailures),
+      unverifiedArmOverride: this.allowUnverifiedArm,
+    };
+  }
+
+  isSafetyReady() {
+    if (!this.client || this.client.destroyed || !this.pixhawkHeartbeatSeen) return false;
+    if (this.allowUnverifiedArm) return true;
+    return this.paramVerificationFailures.size === 0
+      && Object.keys(EXPECTED_CRITICAL_PARAMS)
+        .every(name => this.verifiedCriticalParams.has(name));
   }
 
   // Build MAVLink v1 COMMAND_LONG (msg id 76)
@@ -460,24 +581,49 @@ class PWMMavproxy {
 
   // Arm the vehicle and set MANUAL mode
   arm() {
+    if (!this.isSafetyReady()) {
+      const status = this.getSafetyStatus();
+      const detail = status.heartbeatSeen
+        ? `unverified parameters: ${status.missingParams.join(', ') || 'mismatch detected'}`
+        : 'no flight-controller heartbeat';
+      const error = `Refusing to arm: ${detail}`;
+      console.error(`MAVProxy: ${error}`);
+      return { ok: false, error };
+    }
+
     console.log('MAVProxy: Sending ARM + MANUAL mode...');
+    this.neutralizeMotion();
+    this.controlEnabled = false;
     // Set mode to MANUAL (mode number 0 for ArduRover MANUAL)
     // MANUAL mode = 0, but must include proper base mode flag
     this.sendPacket(this.buildCommandLong(MAV_CMD_DO_SET_MODE, 1, 0));
     // Arm: MAV_CMD_COMPONENT_ARM_DISARM param1=1 (arm), param2=21196 (force)
-    setTimeout(() => {
+    if (this.armTimeout) clearTimeout(this.armTimeout);
+    this.armTimeout = setTimeout(() => {
+      this.armTimeout = null;
       this.sendPacket(this.buildCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, 1, 21196));
+      this.controlEnabled = true;
       console.log('MAVProxy: ARM command sent');
-    }, 500);
+    }, this.armDelayMs);
+    return { ok: true };
   }
 
   // Disarm the vehicle
   disarm() {
     console.log('MAVProxy: Sending DISARM...');
+    if (this.armTimeout) {
+      clearTimeout(this.armTimeout);
+      this.armTimeout = null;
+    }
+    this.neutralizeMotion();
+    this.controlEnabled = false;
     // Disarm: param1=0 (disarm), param2=21196 (force)
     this.sendPacket(this.buildCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, 0, 21196));
+    return { ok: true };
   }
 }
 
-module.exports = PWMMavproxy;
+PWMMavproxy.DEFAULT_PARAM_OVERLAY = DEFAULT_PARAM_OVERLAY;
+PWMMavproxy.EXPECTED_CRITICAL_PARAMS = EXPECTED_CRITICAL_PARAMS;
 
+module.exports = PWMMavproxy;
