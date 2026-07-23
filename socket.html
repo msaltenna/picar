@@ -977,6 +977,7 @@
     }
 
     function startStream(cfg) {
+      streamHasStarted = true;
       if (cfg && cfg.codec === 'webrtc') {
         setupWebRTCStream(cfg).catch((err) => {
           console.warn('WebRTC setup failed:', err);
@@ -997,6 +998,7 @@
     let pendingProbeUrl  = null;
     let pendingOpenUrl   = null;
     let certPollTimer    = null;
+    let streamHasStarted = false;
 
     const requestedStream = new URLSearchParams(window.location.search).get('stream');
 
@@ -1028,7 +1030,19 @@
       enableStreamBtn.style.display = 'none';
       fetch(pendingProbeUrl, { mode: 'no-cors' })
         .then(() => { streamCertOk = true; if (pendingStreamCfg) startStream(pendingStreamCfg); })
-        .catch(() => { streamStatusDiv.textContent = 'Tap below to enable the video stream'; enableStreamBtn.style.display = 'inline-block'; });
+        .catch(() => {
+          // An already-trusted stream that briefly went away (e.g. a video-params
+          // change just restarted MediaMTX, which takes a couple seconds to come
+          // back): poll until it's reachable and reconnect automatically, rather
+          // than dropping the user to the manual "enable" button.
+          if (streamHasStarted) {
+            streamStatusDiv.textContent = 'Reconnecting…';
+            pollStreamCert();
+          } else {
+            streamStatusDiv.textContent = 'Tap below to enable the video stream';
+            enableStreamBtn.style.display = 'inline-block';
+          }
+        });
     }
 
     function pollStreamCert() {
@@ -1036,7 +1050,14 @@
       let attempts = 0;
       certPollTimer = setInterval(() => {
         attempts++;
-        if (streamCertOk || !pendingProbeUrl || attempts > 30) { clearInterval(certPollTimer); certPollTimer = null; return; }
+        if (streamCertOk || !pendingProbeUrl || attempts > 30) {
+          clearInterval(certPollTimer); certPollTimer = null;
+          if (!streamCertOk && attempts > 30) {
+            streamStatusDiv.textContent = 'Stream unavailable — tap to retry.';
+            enableStreamBtn.style.display = 'inline-block';
+          }
+          return;
+        }
         fetch(pendingProbeUrl, { mode: 'no-cors' })
           .then(() => { clearInterval(certPollTimer); certPollTimer = null; streamCertOk = true; if (pendingStreamCfg) startStream(pendingStreamCfg); })
           .catch(() => {});
