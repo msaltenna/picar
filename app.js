@@ -16,6 +16,22 @@ try {
   process.exit(1);
 }
 
+// Per-rover overrides live in picar-cfg.local.json (untracked; written by
+// install.sh). Keeping machine-specific values like rover_id out of version
+// control means the tracked picar-cfg.json can be updated / git-pulled without
+// clobbering each rover's identity. Keys here shallow-override the tracked ones.
+const localConfigPath = path.join(__dirname, 'picar-cfg.local.json');
+if (fs.existsSync(localConfigPath)) {
+  try {
+    Object.assign(config, JSON.parse(fs.readFileSync(localConfigPath)));
+    console.log(`Applied local overrides from ${localConfigPath}`);
+  } catch (err) {
+    console.error(`Failed to read local config at ${localConfigPath}:`, err);
+    process.exit(1);
+  }
+}
+console.log(`Rover ID: ${config.rover_id ?? 1}`);
+
 const PWMDriver = require('./pwm_servo');
 const pwm = PWMDriver(config);
 

@@ -303,3 +303,62 @@ sudo systemctl start picar
 ```
 
 The web server and stream will now automatically start when the Pi boots.
+
+## Fleet Manager
+
+The Fleet Manager is a standalone dashboard (`fleet-manager/server.js`, port `3000`) that
+tracks multiple rovers. Each rover periodically POSTs a heartbeat (`id`, `ip`, `status`) to
+it, and the dashboard lists every rover with a link to its controller UI.
+
+Install it on any Linux machine (a laptop is fine) with:
+
+```bash
+sudo ./install.sh --fleet
+```
+
+### How rovers find the Fleet Manager (`fleetManagerUrl`)
+
+Each rover's `picar-cfg.json` has:
+
+```json
+"fleetManagerUrl": "auto"
+```
+
+- **`"auto"` (default, recommended)** — the rover sweeps its own `/24` over plain unicast TCP
+  for a host answering `GET /api/fleet-id`, locks onto it, and heartbeats there, re-discovering
+  automatically if the FM moves or restarts. This is **OS-agnostic**: it works no matter where
+  the FM runs (native Linux, WSL, Windows, Pi, Mac) because it relies only on unicast TCP — the
+  one transport that survives WSL's NAT (mDNS/broadcast do not). No IP, no hostname, no per-rover
+  setup.
+- **`"http://host:port"`** — an explicit fixed address, if you prefer to pin it.
+- **`""`** — disables the heartbeat.
+
+> For auto-discovery the FM and rovers must share a subnet (the sweep is `/24`-scoped), and the
+> FM host must accept inbound TCP on port `3000` (open the firewall; if the FM runs in WSL, use
+> mirrored networking so it sits on the real LAN rather than a `172.x` NAT address).
+
+### Per-rover identity (`picar-cfg.local.json`)
+
+`rover_id` is **not** in the tracked `picar-cfg.json` — it lives in an untracked overlay,
+`picar-cfg.local.json`, so the tracked config can be updated / `git pull`ed without clobbering
+each rover's identity (and no two rovers collide on the dashboard). `install.sh` prompts for an
+integer ID and writes it there; `app.js` shallow-merges the overlay over the tracked config at
+startup (absent ⇒ defaults to `1`). To set it by hand:
+
+```json
+{ "rover_id": 2 }
+```
+
+### Legacy: mDNS alias (`fleet-manager.local`)
+
+Before auto-discovery, rovers reached the FM by a fixed mDNS name published by
+`avahi-fleet-alias.service` (still installed by `--fleet`). This only works when the FM runs on
+a machine natively on the LAN — it fails from WSL, whose mDNS can't advertise across NAT. Prefer
+`"auto"`; use `"fleetManagerUrl": "http://fleet-manager.local:3000"` only if you specifically
+want a fixed name.
+
+Verify the FM is up from any machine on the LAN:
+
+```bash
+curl http://<fleet-manager-ip>:3000/api/rovers
+```

@@ -65,6 +65,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET /api/fleet-id — identity beacon for rover auto-discovery.
+  // Rovers sweep the LAN and use this to positively identify the Fleet Manager
+  // (so they don't mistake some other service on :3000 for it).
+  if (req.method === 'GET' && parsed.pathname === '/api/fleet-id') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({ service: 'picar-fleet-manager', version: 1 }));
+  }
+
   // GET /api/rovers
   if (req.method === 'GET' && parsed.pathname === '/api/rovers') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });

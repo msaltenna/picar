@@ -1,0 +1,18 @@
+[Unit]
+Description=PiCar Fleet Manager mDNS alias (fleet-manager.local)
+After=avahi-daemon.service network-online.target
+Wants=network-online.target
+Requires=avahi-daemon.service
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/picar/fleet-manager/avahi-fleet-alias.py
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=3
+# Advertise a different role name by overriding this, e.g.:
+#   Environment=FLEET_ALIAS=my-fleet.local
+Environment=FLEET_ALIAS=fleet-manager.local
+
+[Install]
+WantedBy=multi-user.target
