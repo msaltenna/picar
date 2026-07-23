@@ -1,5 +1,5 @@
 {
-  "rover_id": 1,
+  "comment_rover_id": "rover_id is per-rover and lives in the untracked picar-cfg.local.json (created by install.sh) so it survives git pulls. Defaults to 1 if that file is absent.",
   "comment_fleetManagerUrl": "'auto' = discover the Fleet Manager on the LAN (OS-agnostic, no IP/hostname needed). Or set an explicit http://host:port. Empty disables.",
   "fleetManagerUrl": "auto",
   "fleet_heartbeat_interval_s": 5,

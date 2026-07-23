@@ -259,6 +259,34 @@ else
   say "WARNING: ${CFG} not found; skipping config update."
 fi
 
+# Per-rover identity — written to an untracked overlay (picar-cfg.local.json)
+# so it survives git pulls and never collides across rovers.
+LOCAL_CFG="${REPO_DIR}/picar-cfg.local.json"
+DEFAULT_ROVER_ID=1
+if [[ -f "${LOCAL_CFG}" ]]; then
+  EXISTING_ID="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('rover_id',''))" "${LOCAL_CFG}" 2>/dev/null || true)"
+  [[ -n "${EXISTING_ID}" ]] && DEFAULT_ROVER_ID="${EXISTING_ID}"
+fi
+while true; do
+  read -r -p "Assign a numeric rover ID (integer, default: ${DEFAULT_ROVER_ID}): " ROVER_ID || true
+  ROVER_ID="${ROVER_ID:-$DEFAULT_ROVER_ID}"
+  [[ "${ROVER_ID}" =~ ^[0-9]+$ ]] && break
+  echo "Please enter a positive integer."
+done
+python3 -c "
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+data = {}
+if p.exists():
+    try: data = json.loads(p.read_text())
+    except Exception: data = {}
+data['rover_id'] = int(sys.argv[2])
+p.write_text(json.dumps(data, indent=2) + '\n')
+print('Wrote rover_id', data['rover_id'], 'to', p)
+" "${LOCAL_CFG}" "${ROVER_ID}"
+chown "${RUN_USER}:${RUN_USER}" "${LOCAL_CFG}" || true
+say "Rover ID set to ${ROVER_ID} (in ${LOCAL_CFG})"
+
 # MAVProxy install
 if [[ "${USE_MAVPROXY}" == "yes" ]]; then
   say "Installing MAVProxy into ${VENV_BASE}/mavproxy ..."

@@ -316,38 +316,49 @@ Install it on any Linux machine (a laptop is fine) with:
 sudo ./install.sh --fleet
 ```
 
-### Stable addressing with mDNS (`fleet-manager.local`)
+### How rovers find the Fleet Manager (`fleetManagerUrl`)
 
-Rovers reach the Fleet Manager by a **fixed, machine-independent name** rather than an IP:
+Each rover's `picar-cfg.json` has:
 
 ```json
-"fleetManagerUrl": "http://fleet-manager.local:3000"
+"fleetManagerUrl": "auto"
 ```
 
-This value is set once and never changes. The Fleet Manager host publishes the mDNS name
-`fleet-manager.local` for whichever LAN address it currently has, via the
-`avahi-fleet-alias.service` unit (installed automatically by `--fleet`). Because the alias
-is a per-interface A record that tracks the host's live address:
+- **`"auto"` (default, recommended)** — the rover sweeps its own `/24` over plain unicast TCP
+  for a host answering `GET /api/fleet-id`, locks onto it, and heartbeats there, re-discovering
+  automatically if the FM moves or restarts. This is **OS-agnostic**: it works no matter where
+  the FM runs (native Linux, WSL, Windows, Pi, Mac) because it relies only on unicast TCP — the
+  one transport that survives WSL's NAT (mDNS/broadcast do not). No IP, no hostname, no per-rover
+  setup.
+- **`"http://host:port"`** — an explicit fixed address, if you prefer to pin it.
+- **`""`** — disables the heartbeat.
 
-- **Any computer can be the Fleet Manager** — it claims `fleet-manager.local` just by
-  running the alias service. Nothing on the rovers ever references a specific hostname.
-- **Renumbering the LAN is transparent** — e.g. `192.168.31.x` → `192.168.10.x`, or
-  switching between Wi-Fi and Ethernet. The alias follows the new address; rovers need no
-  changes because the heartbeat client re-resolves the name on every beat.
-- VPN / virtual / loopback interfaces are ignored, so only real LAN addresses are advertised.
+> For auto-discovery the FM and rovers must share a subnet (the sweep is `/24`-scoped), and the
+> FM host must accept inbound TCP on port `3000` (open the firewall; if the FM runs in WSL, use
+> mirrored networking so it sits on the real LAN rather than a `172.x` NAT address).
 
-> The alias must be an **A record**, not a CNAME: Raspberry Pi OS resolves `.local` names via
-> `mdns4_minimal`, which does not follow CNAMEs. The publisher (`fleet-manager/avahi-fleet-alias.py`)
-> handles this.
+### Per-rover identity (`picar-cfg.local.json`)
 
-Requirements on the Fleet Manager host: `avahi-daemon` running and `python3-dbus` installed
-(both are set up by `install.sh --fleet`). To use a different role name, override
-`FLEET_ALIAS` in the service (e.g. `Environment=FLEET_ALIAS=my-fleet.local`) and set the same
-name in each rover's `fleetManagerUrl`.
+`rover_id` is **not** in the tracked `picar-cfg.json` — it lives in an untracked overlay,
+`picar-cfg.local.json`, so the tracked config can be updated / `git pull`ed without clobbering
+each rover's identity (and no two rovers collide on the dashboard). `install.sh` prompts for an
+integer ID and writes it there; `app.js` shallow-merges the overlay over the tracked config at
+startup (absent ⇒ defaults to `1`). To set it by hand:
 
-Verify from any machine on the LAN:
+```json
+{ "rover_id": 2 }
+```
+
+### Legacy: mDNS alias (`fleet-manager.local`)
+
+Before auto-discovery, rovers reached the FM by a fixed mDNS name published by
+`avahi-fleet-alias.service` (still installed by `--fleet`). This only works when the FM runs on
+a machine natively on the LAN — it fails from WSL, whose mDNS can't advertise across NAT. Prefer
+`"auto"`; use `"fleetManagerUrl": "http://fleet-manager.local:3000"` only if you specifically
+want a fixed name.
+
+Verify the FM is up from any machine on the LAN:
 
 ```bash
-ping fleet-manager.local
-curl http://fleet-manager.local:3000/api/rovers
+curl http://<fleet-manager-ip>:3000/api/rovers
 ```
