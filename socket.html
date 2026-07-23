@@ -410,12 +410,15 @@
           <h3>Status</h3>
           <label><input type="checkbox" id="cfgConnected"> Connected</label>
           <label><input type="checkbox" id="cfgControlMode"> Control mode</label>
+          <label><input type="checkbox" id="cfgKeyboardHint"> Keyboard hint</label>
         </div>
         <div class="config-col">
           <h3>Network</h3>
-          <label><input type="checkbox" id="cfgDown"> ↓ (video)</label>
+          <label><input type="checkbox" id="cfgDown"> ↓ Bitrate (video)</label>
           <label><input type="checkbox" id="cfgUp"> ↑ (control)</label>
           <label><input type="checkbox" id="cfgFps"> FPS</label>
+          <label><input type="checkbox" id="cfgLatency"> Latency</label>
+          <label><input type="checkbox" id="cfgRes"> Resolution</label>
         </div>
         <div class="config-col">
           <h3>Feedback</h3>
@@ -509,11 +512,14 @@
       showDown:        false,
       showUp:          false,
       showFps:         false,
+      showLatency:     false,
+      showRes:         false,
       showThrottle:    false,
       showSteering:    false,
       showBtnGear:     false,
       showBtnFrontDiff:false,
       showBtnRearDiff: false,
+      showKeyboardHint:true,
     };
 
     let uiCfg = { ...CFG_DEFAULTS };
@@ -533,11 +539,14 @@
       cfgDown:         'showDown',
       cfgUp:           'showUp',
       cfgFps:          'showFps',
+      cfgLatency:      'showLatency',
+      cfgRes:          'showRes',
       cfgThrottle:     'showThrottle',
       cfgSteering:     'showSteering',
       cfgBtnGear:      'showBtnGear',
       cfgBtnFrontDiff: 'showBtnFrontDiff',
       cfgBtnRearDiff:  'showBtnRearDiff',
+      cfgKeyboardHint: 'showKeyboardHint',
     };
 
     function openConfig() {
@@ -557,6 +566,7 @@
       saveConfig();
       configModal.classList.remove('open');
       applyButtonVisibility();
+      applyKeyboardHintVisibility();
       renderStatusBar();
     }
 
@@ -566,8 +576,13 @@
       document.getElementById('tlockRearBtn').style.display  = uiCfg.showBtnRearDiff  ? '' : 'none';
     }
 
+    function applyKeyboardHintVisibility() {
+      keyboardHint.style.display =
+        (controlMode === 'keyboard' && uiCfg.showKeyboardHint) ? 'block' : 'none';
+    }
+
     // ── Status bar ────────────────────────────────────────────────────────────
-    let liveStats = { downKbps: null, upKbps: null, fps: null };
+    let liveStats = { downKbps: null, upKbps: null, fps: null, latencyMs: null, resW: null, resH: null };
 
     function renderStatusBar() {
       // Column 1: connection + control mode
@@ -578,9 +593,11 @@
 
       // Column 2: network + fps
       const c2 = [];
-      if (uiCfg.showDown) c2.push(`↓ ${liveStats.downKbps !== null ? liveStats.downKbps + ' kbps' : '--'}`);
-      if (uiCfg.showUp)   c2.push(`↑ ${liveStats.upKbps   !== null ? liveStats.upKbps   + ' kbps' : '--'}`);
-      if (uiCfg.showFps)  c2.push(`FPS: ${liveStats.fps !== null ? liveStats.fps : '--'}`);
+      if (uiCfg.showDown)    c2.push(`↓ ${liveStats.downKbps !== null ? liveStats.downKbps + ' kbps' : '--'}`);
+      if (uiCfg.showUp)      c2.push(`↑ ${liveStats.upKbps   !== null ? liveStats.upKbps   + ' kbps' : '--'}`);
+      if (uiCfg.showFps)     c2.push(`FPS: ${liveStats.fps !== null ? liveStats.fps : '--'}`);
+      if (uiCfg.showLatency) c2.push(`RTT: ${liveStats.latencyMs !== null ? liveStats.latencyMs + ' ms' : '--'}`);
+      if (uiCfg.showRes)     c2.push(`Res: ${liveStats.resW ? liveStats.resW + '×' + liveStats.resH : '--'}`);
       statusCol2.innerHTML = c2.join('<br>');
 
       // Column 3: feedback
@@ -600,8 +617,11 @@
       if (activeStreamStats) {
         try {
           const s = await activeStreamStats();
-          liveStats.downKbps = s.downKbps;
-          liveStats.fps      = s.fps;
+          liveStats.downKbps  = s.downKbps;
+          liveStats.fps       = s.fps;
+          liveStats.latencyMs = s.latencyMs ?? null;
+          liveStats.resW      = s.resW ?? null;
+          liveStats.resH      = s.resH ?? null;
         } catch (_) {}
       }
       liveStats.upKbps = Math.round(statUpBytes * 8 / 1000);
@@ -708,9 +728,9 @@
       let lastFrames = 0;
       let statsInit  = false;
       activeStreamStats = async () => {
-        if (!webrtcPc) return { downKbps: null, fps: null };
+        if (!webrtcPc) return { downKbps: null, fps: null, latencyMs: null, resW: null, resH: null };
         const stats = await webrtcPc.getStats();
-        let downKbps = null, fps = null;
+        let downKbps = null, fps = null, latencyMs = null, resW = null, resH = null;
         stats.forEach(r => {
           if (r.type === 'inbound-rtp' && r.kind === 'video') {
             if (statsInit) {
@@ -720,9 +740,17 @@
             lastBytes  = r.bytesReceived;
             lastFrames = r.framesDecoded;
             statsInit  = true;
+            if (r.frameWidth)  resW = r.frameWidth;
+            if (r.frameHeight) resH = r.frameHeight;
+          }
+          // RTT from the active ICE candidate pair — derived from STUN/RTCP the
+          // connection already exchanges, so it costs no extra bandwidth.
+          if (r.type === 'candidate-pair' && r.state === 'succeeded' &&
+              r.currentRoundTripTime != null) {
+            latencyMs = Math.round(r.currentRoundTripTime * 1000);
           }
         });
-        return { downKbps, fps };
+        return { downKbps, fps, latencyMs, resW, resH };
       };
     }
 
@@ -949,6 +977,7 @@
     }
 
     function startStream(cfg) {
+      streamHasStarted = true;
       if (cfg && cfg.codec === 'webrtc') {
         setupWebRTCStream(cfg).catch((err) => {
           console.warn('WebRTC setup failed:', err);
@@ -969,6 +998,7 @@
     let pendingProbeUrl  = null;
     let pendingOpenUrl   = null;
     let certPollTimer    = null;
+    let streamHasStarted = false;
 
     const requestedStream = new URLSearchParams(window.location.search).get('stream');
 
@@ -1000,7 +1030,19 @@
       enableStreamBtn.style.display = 'none';
       fetch(pendingProbeUrl, { mode: 'no-cors' })
         .then(() => { streamCertOk = true; if (pendingStreamCfg) startStream(pendingStreamCfg); })
-        .catch(() => { streamStatusDiv.textContent = 'Tap below to enable the video stream'; enableStreamBtn.style.display = 'inline-block'; });
+        .catch(() => {
+          // An already-trusted stream that briefly went away (e.g. a video-params
+          // change just restarted MediaMTX, which takes a couple seconds to come
+          // back): poll until it's reachable and reconnect automatically, rather
+          // than dropping the user to the manual "enable" button.
+          if (streamHasStarted) {
+            streamStatusDiv.textContent = 'Reconnecting…';
+            pollStreamCert();
+          } else {
+            streamStatusDiv.textContent = 'Tap below to enable the video stream';
+            enableStreamBtn.style.display = 'inline-block';
+          }
+        });
     }
 
     function pollStreamCert() {
@@ -1008,7 +1050,14 @@
       let attempts = 0;
       certPollTimer = setInterval(() => {
         attempts++;
-        if (streamCertOk || !pendingProbeUrl || attempts > 30) { clearInterval(certPollTimer); certPollTimer = null; return; }
+        if (streamCertOk || !pendingProbeUrl || attempts > 30) {
+          clearInterval(certPollTimer); certPollTimer = null;
+          if (!streamCertOk && attempts > 30) {
+            streamStatusDiv.textContent = 'Stream unavailable — tap to retry.';
+            enableStreamBtn.style.display = 'inline-block';
+          }
+          return;
+        }
         fetch(pendingProbeUrl, { mode: 'no-cors' })
           .then(() => { clearInterval(certPollTimer); certPollTimer = null; streamCertOk = true; if (pendingStreamCfg) startStream(pendingStreamCfg); })
           .catch(() => {});
@@ -1178,7 +1227,7 @@
       controlModeBtn.textContent = `Control: ${mode.charAt(0).toUpperCase() + mode.slice(1)}`;
       joystickLeftEl.style.display  = mode === 'joystick' ? 'block' : 'none';
       joystickRightEl.style.display = mode === 'joystick' ? 'block' : 'none';
-      keyboardHint.style.display    = mode === 'keyboard'  ? 'block' : 'none';
+      applyKeyboardHintVisibility();
       enableBtn.style.display       = 'none';
       if (mode === 'orientation') requestOrientationPermission();
       renderStatusBar();
