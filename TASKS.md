@@ -6,35 +6,50 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ## In progress
 
-- **[P3] Establish the agent directive and skill pipeline** — `CLAUDE.md`, `HANDOFF.md`,
-  `TASKS.md`, `AGENTS.md`, `.claude/skills/*`, `.claude/agents/*`.
-  Branch `chore/agent-directive-and-skills`. Awaiting Second Opinion review and on-rover
-  validation of the deploy/validate loop itself.
+- **[P0] Root-cause the gear/throttle defect** — investigation across the shift path; see the
+  P0 entry below. Blocked on rover1/rover2 access for validation.
+- **[P1] Scope the four operator priorities set on 2026-07-30** — gear/throttle bug, latent
+  frame dropping, radio/power telemetry, gamepad support. All four are detailed below.
 
 ## Backlog
 
 ### P0 — safety and security
 
-- **Push, validate, and merge the safety branch `agent/fix-control-failsafe`** — commit
-  `6220780` (13 files, +1226/−110) carries the entire control-safety layer: the single-owner
-  lease, per-command token + sequence + timestamp integrity checking, the NTP-midpoint
-  clock-skew check, the input watchdog, fail-safe stops on every disconnect/hide/timeout
-  path, arm-gating on verified flight-controller params, and 24 host tests. **None of it is
-  on `main`**, where
-  `app.js:125` arms the vehicle from any socket that can reach `:8443`.
-  **The branch has never been pushed — it exists on one workstation and nowhere else, so a
-  disk failure loses it.** Push it first as a backup, then run it through the pipeline:
-  Second Opinion, deploy to rover3, full Embedded Validator pass, merge. Everything else in
-  this file is lower priority than getting this validated and landed.
+- **Gear change engages throttle and it cannot be turned off** — operator-reported, 2026-07-30.
+  On the two rovers fitted with a high/low gearbox, selecting **high gear** engages throttle
+  and it stays engaged, whether the rover was moving or stationary. This is uncommanded,
+  unstoppable motor output — the most severe defect class on this platform, and it outranks
+  everything else in this file. Root cause under investigation across the shift path
+  (`socket.html` `toggleShift` → `app.js` `fromclient` → `pwm_mavproxy_servo.js`
+  `channelMap`/`scale`/`setServoPWM` → RC_CHANNELS_OVERRIDE → ArduRover output mixing, where
+  `FRAME_CLASS=2` (Boat) and `SERVO2_FUNCTION=1` are both suspect).
+  **Validation blocker: `rover3` has no gearbox**, so this fix cannot be validated on the
+  only rover currently reachable. Needs rover1 or rover2 access before it can merge.
+
+- **Drop latent frames so the video stream and C2 stop stalling** — operator-reported.
+  Bound latency in the video path and stop it propagating into the control link. Related
+  known causes already filed here: the `execSync` event-loop block in `streams/webrtc.js`,
+  the O(n²) NAL scanning in `streams/h264.js`, the O(n²) browser MJPEG parser, and the
+  never-backing-off fleet discovery sweep burning ~3 s of every 5 s on a CM4. Needs a
+  bounded, drop-oldest queue discipline rather than more buffering.
+
+- **Shelved: the control-safety layer** — the work described in `HANDOFF.md` now lives only
+  at `origin/archive/control-failsafe-2026-07-30` (`6220780`). Shelved on operator
+  instruction 2026-07-30; `main` remains arm-from-any-socket. Three fixes inside it are
+  prerequisites for other priority work and should be cherry-picked independently of any
+  decision to revive the lease itself: MAVLink v2 (`0xFD`) frame parsing, the
+  autopilot-heartbeat filter (`autopilot != 8` + sysId), and `FRAME_CLASS: 1` (Rover, not
+  Boat).
 
 - **rover3's Pixhawk is configured as a Boat** — `main`'s `DEFAULT_PARAM_OVERLAY`
   (`pwm_mavproxy_servo.js:37`) sets `FRAME_CLASS: 2` behind a comment that says "Rover".
   In ArduPilot Rover, `1` = Rover and `2` = Boat, so every connect re-asserts the wrong
   frame class; confirmed live in rover3's journal (`PARAM_SET FRAME_CLASS=2`). Not a
   regression — the previously-running branch `cdf4ae1` sets `2` as well, so the vehicle has
-  been running this way. `agent/fix-control-failsafe` already corrects it to `1`; merging
-  that branch fixes it, and the Pixhawk then needs a power-cycle to take the new frame
-  class.
+  been running this way. The archived branch already corrects it to `1` — **cherry-pick that
+  one-line fix**, do not revive the whole branch. The Pixhawk then needs a power-cycle to
+  take the new frame class. This is also a live suspect in the gear/throttle defect above,
+  since Boat mixing may route a channel differently than Rover mixing.
 
 - **Fail-safe sends DISARM before neutral on the wire** — `control-safety.js::_failSafe`
   calls `_neutralize()`, but `setServoPWM` only mutates the driver's channel buffer and
@@ -58,12 +73,14 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   can move. *(Reclassified from P3 hygiene — the original priority contradicted this repo's
   own definition of P0/P1, per Codex adversarial review.)*
 
-- **Verify param read-back actually succeeds on rover3 before trusting arm-gating** —
-  `agent/fix-control-failsafe` refuses to arm until every `EXPECTED_CRITICAL_PARAMS` entry
-  is read back over MAVLink. On rover3 today, zero params verify (see the `main` parser
-  defect below), so if that mechanism does not work against this Pixhawk, merging the
-  safety branch leaves a rover that **can never arm**. This must be proven live before the
-  merge, not after. It is the single highest-risk unknown in landing the safety work.
+- **Prove MAVLink read-back works on this Pixhawk at all** — on rover3 today **zero**
+  parameters verify, because `main`'s parser is v1-only (see the P1 parser entry below). Until
+  a v2-capable parser is shown to actually receive `PARAM_VALUE` from this flight controller,
+  two things are unsafe to assume: that the radio/power telemetry work can read anything, and
+  that any future arm-gating would ever open. This is the cheapest high-value experiment
+  available — cherry-pick the archived v2 parser, deploy to rover3, and confirm
+  `verified SERVO1_FUNCTION=26` and friends appear in the journal. Do it before building on
+  MAVLink receive.
 
 - **Video-param change blocks the event loop while armed** — `streams/webrtc.js:98`
   (`setParams` → `execSync('systemctl restart mediamtx')`), reachable from
@@ -110,6 +127,32 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   into a `controllerUrl` link on the dashboard. Any LAN host can spoof or hijack a rover
   entry and point operators at an arbitrary address.
 
+### P1 — new features (operator priorities, 2026-07-30)
+
+- **Radio status and Power status on the UI and the Fleet Manager** — three data sources
+  confirmed by the operator: the **Pixhawk power module** (battery V/A via MAVLink
+  `SYS_STATUS` / `BATTERY_STATUS`), a **SiK telemetry radio** (`RADIO_STATUS` RSSI/noise),
+  and **WiFi link quality** (read from the Pi's wireless interface, not MAVLink).
+  Existing plumbing to reuse rather than reinvent: `fleetmgr-client.js` already defines a
+  status bitmask with `bit 0 = battery trouble` and exports `setStatusBit()`, which nothing
+  calls; `fleet-manager/server.js` `decodeStatus()` already decodes it; `picar-cfg.json`
+  already carries `batteryWarnLevel: 20`; and `socket.html`'s status bar has an established
+  `uiCfg` checkbox pattern to extend.
+  **Hard dependency:** `main`'s MAVLink parser accepts only v1 (`0xFE`) and drops the v2
+  (`0xFD`) frames MAVProxy actually forwards, so *no* MAVLink telemetry can be read until the
+  v2 parser is cherry-picked from the archive branch. Also confirm `BATT_MONITOR` is
+  configured on the flight controller — if it is `0`, the Pixhawk reports no voltage at all
+  and this is a parameter task before it is a code task.
+
+- **Xbox / PlayStation controller support** — a fourth control mode in `socket.html`
+  alongside joystick / keyboard / orientation, via the browser **Gamepad API**; the pad pairs
+  to the operator's device, not the Pi (operator-confirmed). Must follow the existing
+  `activateControlMode` / `deactivateAllControls` structure and the `uiCfg` checkbox pattern.
+  Safety requirements are the hard part: gamepad disconnect mid-drive must fail safe exactly
+  as `touchcancel` / blur / page-hide do; arming must stay a deliberate UI action rather than
+  a pad button; and a trigger held at arm time must not become throttle — apply deadzone and
+  shaping, which orientation mode currently gets wrong.
+
 ### P1 — correctness and robustness
 
 - **`test/on-target/` does not exist** — the validation bar requires a committed, repeatable
@@ -121,7 +164,7 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   the validator.
 
 - **`main`'s MAVLink receive path is dead in practice** — two defects that compound, both
-  observed live on rover3 and both already fixed on `agent/fix-control-failsafe`:
+  observed live on rover3 and both already fixed on the archived branch:
   1. `pwm_mavproxy_servo.js:367` accepts only `0xFE` (MAVLink v1). MAVProxy forwards v2
      (`0xFD`) frames from a modern Pixhawk, so every `PARAM_VALUE` reply is silently
      discarded. rover3's journal shows nine `PARAM_SET` writes followed by **zero**

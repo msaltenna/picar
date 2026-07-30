@@ -14,18 +14,24 @@ software stack. A custom flight controller is **not** in scope, and the vehicle 
 
 > ### The single most important fact right now
 >
-> **The safety layer is not on `main`.** `control-safety.js`, `client-control-safety.js`,
-> the 24-test `test/` suite, the hardened arm-gating in `pwm_mavproxy_servo.js`, and the
-> `max_command_*` config keys exist only on the local branch **`agent/fix-control-failsafe`**
-> (commit `6220780`, 13 files, +1226/−110).
->
-> That branch has **never been pushed** — it exists on one workstation and nowhere else.
-> Losing that machine loses the work.
+> **`main` has no control-safety layer, and the branch that had one has been shelved.**
 >
 > On `main` today, `app.js:125` is `socket.on('arm', () => pwm.arm())`: any socket that
 > reaches `:8443` can arm and drive the vehicle, with no lease, session token, sequence
 > number, staleness check, or watchdog, and `pwm_mavproxy_servo.js` has no `isSafetyReady()`
-> gate on arming. Validating and merging that branch is the platform's top priority.
+> gate on arming. That is the live state of every rover.
+>
+> The safety work — `control-safety.js`, `client-control-safety.js`, the 24-test `test/`
+> suite, hardened arm-gating, MAVLink v2 parsing, the autopilot-heartbeat filter, and the
+> `FRAME_CLASS=1` correction — was **shelved on operator instruction on 2026-07-30** and now
+> exists only as the archived remote branch
+> **`origin/archive/control-failsafe-2026-07-30`** (commit `6220780`, 13 files, +1226/−110).
+> It is *not* local and *not* scheduled. Recover any part of it with
+> `git show origin/archive/control-failsafe-2026-07-30:<file>`.
+>
+> Three fixes buried in that archive are prerequisites for current priority work — the
+> MAVLink v2 parser and heartbeat filter block all telemetry work, and `FRAME_CLASS=1`
+> corrects a live misconfiguration. Cherry-pick them rather than rewriting them.
 
 What works today **on `main`**:
 
@@ -44,10 +50,10 @@ What works today **on `main`**:
   the run user and repo path into the systemd units and installing a unit-scoped polkit
   rule so the non-root service can restart MediaMTX.
 
-What the pending branch adds: the single-owner control lease, token + sequence + timestamp
-*integrity checking* of every command, the NTP-midpoint clock-skew check, the input
-watchdog, fail-safe stops on every disconnect/hide/timeout path, arm-gating on verified
-flight-controller parameters, and the host test suite.
+What the **archived** branch adds, should it ever be revived: the single-owner control lease,
+token + sequence + timestamp *integrity checking* of every command, the NTP-midpoint
+clock-skew check, the input watchdog, fail-safe stops on every disconnect/hide/timeout path,
+arm-gating on verified flight-controller parameters, and the host test suite.
 
 Two things that branch does **not** do, contrary to earlier claims here and in `README.md`:
 
@@ -67,6 +73,28 @@ armed; and the CA and server private keys are committed to the repository. These
 ## Change log
 
 Newest first.
+
+### 2026-07-30 — `chore/priorities-and-branch-archive`
+
+Shelved the control-safety branch and recorded four new operator priorities.
+
+- Archived `agent/fix-control-failsafe` (`6220780`) to
+  **`origin/archive/control-failsafe-2026-07-30`** on operator instruction, verified the
+  content is retrievable from the remote ref, then deleted the local branch. It had never
+  been pushed, so this was the only way to shelve it without destroying it. Three fixes
+  inside it are prerequisites for current work and are flagged for cherry-pick in `TASKS.md`.
+- Recorded the four priorities set by the operator: the gear/throttle safety defect, latent
+  frame dropping for video + C2, radio and power status in the UI and Fleet Manager, and
+  Xbox/PlayStation controller support.
+- Recorded that **the fleet is not homogeneous**: two rovers have a high/low gearbox and
+  rover3 does not, so gear work has no validation path on the only reachable rover.
+- Confirmed with the operator: telemetry sources are the Pixhawk power module, a SiK
+  telemetry radio, and WiFi link quality; the gamepad connects to the operator's browser
+  device, not the Pi.
+- Purged now-false statements about the safety branch being local and unpushed, and removed
+  the completed directive/pipeline task from `TASKS.md` per its own contract.
+
+**Validation:** documentation only — no runtime file touched, no rover state changed.
 
 ### 2026-07-30 — `chore/agent-directive-and-skills`
 
@@ -106,7 +134,7 @@ via `origin`; `git status` clean at that SHA on the rover).
   trip. No arming attempted. **No actuation is possible — the flight battery is
   disconnected.**
 - *Known non-regression.* `npm test` fails on this branch because `package.json` on `main`
-  has `scripts: {}`. Pre-existing; the test script arrives with `agent/fix-control-failsafe`.
+  has `scripts: {}`. Pre-existing; a test script exists only on the archived branch.
 - *`test/on-target/` does not exist yet* — no on-target coverage was required for a
   markdown-only change, but the suite must exist before any runtime change is validated.
   Tracked in `TASKS.md`.
@@ -118,14 +146,14 @@ services active, `/status` responding. This is the current rover3 baseline.
 
 - The audit that seeded `TASKS.md` read the tree, not the rover. Verify the `P0` items
   against live behavior before acting on them.
-- The audit was performed against `agent/fix-control-failsafe` (the true tip of
-  development), while this docs branch is based on `main`. Findings citing
-  `control-safety.js` or `client-control-safety.js` refer to files that only exist on that
-  branch. Line numbers cited for `app.js`, `pwm_mavproxy_servo.js`, `picar-cfg.json`, and
-  `socket.html` are that branch's, not `main`'s.
-- `AGENTS.md` is added by both this branch and `agent/fix-control-failsafe`, so merging the
-  second one will conflict. Keep this version — the pointer at `CLAUDE.md` — and fold in
-  anything from the other that `CLAUDE.md` does not already cover.
+- Part of the original audit was performed against the now-archived safety branch rather
+  than `main`. Findings citing `control-safety.js` or `client-control-safety.js` refer to
+  files that exist **only** on `origin/archive/control-failsafe-2026-07-30` and on no rover.
+  Line numbers cited for `app.js`, `pwm_mavproxy_servo.js`, `picar-cfg.json`, and
+  `socket.html` may be that branch's rather than `main`'s — re-check before acting.
+- The archive branch also carries its own `AGENTS.md`. If it is ever revived or
+  cherry-picked, keep `main`'s version (the pointer at `CLAUDE.md`) and fold in anything the
+  directive does not already cover.
 
 ## Environment
 
@@ -133,6 +161,17 @@ services active, `/status` responding. This is the current rover3 baseline.
 the only rover to deploy to unless told otherwise. It is powered and running; **its flight
 battery is not connected**, so motors and servos cannot physically actuate. Validate the
 command path up to the flight controller and never imply mechanical motion was observed.
+
+**The fleet is NOT homogeneous — this constrains what can be validated where.**
+
+- **Two rovers have a high/low gearbox; `rover3` does not** (operator, 2026-07-30). Any
+  gear/shift work therefore **cannot be validated on rover3 at all** — not partially, not
+  by proxy. It needs access to rover1 or rover2. Treat "validated on rover3" as meaningless
+  for the shift channel.
+- Hardware also differs by SBC generation: rover3 is a Compute Module 4. Do not assume a
+  fix verified on one rover holds on another; check the target's model and config.
+- Practical consequence: a change touching `channelMap.shift`, `shift_default_us`, or the
+  gear UI has no valid validation path today. That is a scheduling blocker, not a detail.
 
 **The repo lives at `/opt/picar` on every rover** — standing convention, and the reason the
 tracked systemd units carry `/opt/picar` paths.
@@ -189,10 +228,12 @@ and also exposed a defect chain worth understanding before trusting any log on `
 - `main` accepts *any* HEARTBEAT as the autopilot's, so the reassuring "Received first
   Pixhawk heartbeat" is most likely MAVProxy's own GCS heartbeat, not the flight controller.
 
-`agent/fix-control-failsafe` fixes all three. The consequence for sequencing: that branch
-*gates arming* on the read-back that currently produces nothing, so its verification path
-must be proven live on this Pixhawk **before** merging — otherwise the merge yields a rover
-that can never arm. That is now the top validation risk in `TASKS.md`.
+The archived branch fixes all three, and its v2 parser plus heartbeat filter should be
+cherry-picked on their own merits — the radio/power telemetry work cannot read a single
+MAVLink field until they are. Note the corollary: because read-back currently verifies
+*nothing* on this Pixhawk, it is unproven that a v2 parser will actually receive
+`PARAM_VALUE` here. Prove that first; it is the cheapest experiment with the highest
+information value, and it gates both the telemetry feature and any future arm-gating.
 
 **Runtime baseline (healthy, post-reconcile).** `picar`, `mavproxy`, `mediamtx` all active;
 `NRestarts=0`; up since 2026-07-30 19:36 BST. Listeners: `:8443` and `:8081` (node),
