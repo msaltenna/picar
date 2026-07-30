@@ -111,8 +111,8 @@ via `origin`; `git status` clean at that SHA on the rover).
   markdown-only change, but the suite must exist before any runtime change is validated.
   Tracked in `TASKS.md`.
 
-Rover left on branch `chore/agent-directive-and-skills` @ `3e6dd99`, clean, all services
-running. **Return it to `main` after this merges.**
+Rover returned to `main` @ `8271d14` after the merge — clean tree, `NRestarts=0`, all three
+services active, `/status` responding. This is the current rover3 baseline.
 
 **Next session must know:**
 
