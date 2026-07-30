@@ -112,6 +112,14 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **`test/on-target/` does not exist** — the validation bar requires a committed, repeatable
+  on-target suite, and there is none, so every validation so far has been ad hoc. Nothing
+  runtime-affecting should be validated until it exists. Bootstrap it with the checks
+  already performed by hand: service active with `NRestarts=0`, expected startup lines,
+  autopilot heartbeat seen, RC_CHANNELS_OVERRIDE streaming neutral, `/status` shape, and
+  HTTP reachability of `socket.html` / `socket.io` / WHEP. Author it via the Optimizer, not
+  the validator.
+
 - **`main`'s MAVLink receive path is dead in practice** — two defects that compound, both
   observed live on rover3 and both already fixed on `agent/fix-control-failsafe`:
   1. `pwm_mavproxy_servo.js:367` accepts only `0xFE` (MAVLink v1). MAVProxy forwards v2

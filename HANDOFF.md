@@ -85,10 +85,34 @@ Also reconciled rover3's `/opt/picar` from the stale divergent branch `fleet-man
 `main` @ `acd3540`, restoring per-rover identity through the untracked
 `picar-cfg.local.json` overlay. Backups kept on the rover. Details under `## Environment`.
 
-**Validation:** pending. This change is itself the first exercise of the pipeline. The
-rover3 reconciliation *was* validated live — clean checkout, clean restart, `NRestarts=0`,
-all services active, identity preserved, MAVProxy link up and streaming neutral at 20 Hz.
-No arming was attempted and **no actuation is possible without the flight battery**.
+**Validation: PASS** — Embedded Validator, rover3, 2026-07-30 19:55 BST.
+**Validated SHA: `3e6dd994711551cd7e64aa70503b5194b39bb142`** (deployed by git bundle, not
+via `origin`; `git status` clean at that SHA on the rover).
+
+- *Scope.* `git diff --name-only main..3e6dd99` is **markdown only** — 13 `.md` files, zero
+  `.js`/`.json`/`.service`/`.sh`/`.html`. The change cannot alter runtime behavior; the
+  validation therefore proves the rover is healthy on the deployed SHA rather than
+  exercising new behavior.
+- *Services.* `picar`/`mavproxy`/`mediamtx` all active, `NRestarts=0` after restart. Startup
+  clean: `Applied local overrides…`, `Rover ID: 3`, MAVProxy driver at 20 Hz, `Stream codec:
+  webrtc`, web server up. No errors.
+- *MAVLink wire.* Post-restart PID 1981: `Received first Pixhawk heartbeat`, then
+  `RC Override: ch1=1500 ch2=2000 ch3=1500 (client=true)` repeating — override stream live
+  and neutral.
+- *Endpoints.* `/status` → `{"status":"OK","throttle":0,"steering":0}`; `socket.html` → 200
+  (56 875 B); `socket.io` polling → 200; WHEP `:8889` → 204.
+- *Not done, deliberately.* No browser drive of the UI and no fail-safe trip: with no
+  runtime file changed there is nothing new to exercise, and `main` has no safety layer to
+  trip. No arming attempted. **No actuation is possible — the flight battery is
+  disconnected.**
+- *Known non-regression.* `npm test` fails on this branch because `package.json` on `main`
+  has `scripts: {}`. Pre-existing; the test script arrives with `agent/fix-control-failsafe`.
+- *`test/on-target/` does not exist yet* — no on-target coverage was required for a
+  markdown-only change, but the suite must exist before any runtime change is validated.
+  Tracked in `TASKS.md`.
+
+Rover left on branch `chore/agent-directive-and-skills` @ `3e6dd99`, clean, all services
+running. **Return it to `main` after this merges.**
 
 **Next session must know:**
 
