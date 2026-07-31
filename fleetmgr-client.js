@@ -22,6 +22,9 @@ const DISCOVERY_PORT_DEFAULT = 3000;
 const PROBE_TIMEOUT_MS       = 500;   // per-host probe timeout
 const PROBE_CONCURRENCY      = 40;    // parallel probes per batch
 const FAIL_THRESHOLD         = 2;     // consecutive heartbeat failures before re-discovering
+// Failed sweeps back off exponentially from the tick interval up to this ceiling,
+// so a rover on a subnet with no Fleet Manager stops burning CPU on it.
+const MAX_SWEEP_BACKOFF_MS   = 5 * 60 * 1000;
 
 function getLocalIp() {
   for (const ifaces of Object.values(os.networkInterfaces())) {
@@ -99,6 +102,8 @@ function start(config) {
   let currentBase = autoMode ? null : fleetUrl;  // resolved FM base URL
   let discovering = false;
   let fails       = 0;
+  let sweepBackoffMs = 0;   // 0 = sweep on the next tick
+  let nextSweepAt    = 0;   // epoch ms; 0 = no delay pending
 
   function heartbeatTo(base) {
     const payload = JSON.stringify({
@@ -134,15 +139,34 @@ function start(config) {
   async function tick() {
     if (currentBase) { heartbeatTo(currentBase); return; }
     if (!autoMode || discovering) return;
+
+    // Back off between failed sweeps.
+    //
+    // A sweep is up to 254 TCP connects at 40-way concurrency with a 500 ms
+    // timeout, so it occupies roughly 3 s of every 5 s tick. On a rover whose
+    // subnet has no Fleet Manager — a common, indefinite state — that ran
+    // forever, measured at ~7% of a core on a Compute Module 4 while otherwise
+    // idle. That CPU is shared with the 20 Hz control loop and the camera
+    // encoder, so a cosmetic dashboard feature was competing with the control
+    // path. Discovery is not urgent: nothing about the vehicle depends on it.
+    if (nextSweepAt !== 0 && Date.now() < nextSweepAt) return;
+
     discovering = true;
     try {
       const ip = await discover(discoveryPort);
       if (ip) {
         currentBase = `http://${ip}:${discoveryPort}`;
+        sweepBackoffMs = 0;
+        nextSweepAt = 0;
         console.log(`Fleet Manager discovered at ${currentBase}`);
         heartbeatTo(currentBase);
       } else {
-        console.log('Fleet Manager not found on LAN; will retry.');
+        sweepBackoffMs = sweepBackoffMs === 0
+          ? intervalMs
+          : Math.min(sweepBackoffMs * 2, MAX_SWEEP_BACKOFF_MS);
+        nextSweepAt = Date.now() + sweepBackoffMs;
+        console.log('Fleet Manager not found on LAN; next sweep in ' +
+          `${Math.round(sweepBackoffMs / 1000)}s.`);
       }
     } finally {
       discovering = false;
