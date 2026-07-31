@@ -172,3 +172,72 @@ test('streams/webrtc.js does not restart mediamtx synchronously', () => {
   assert.doesNotMatch(src, /execSync\s*\(/, 'a synchronous restart would block the event loop');
   assert.match(src, /spawn\(/);
 });
+
+// ── Fuzz: framing must be chunk-independent for ANY split pattern ────────────
+//
+// The `scanned` frontier is the riskiest part of this parser: if it is ever left
+// stale, or pointing past data that a later slice moved, the parser silently
+// mis-frames video. Hand-reasoning about it is not sufficient, so this compares
+// randomly-chunked input against whole-buffer input over many generated streams.
+// Deterministic LCG so a failure is reproducible.
+
+function lcg(seed) {
+  let s = seed >>> 0;
+  return () => { s = (s * 1103515245 + 12345) >>> 0; return s / 4294967296; };
+}
+
+test('framing is chunk-independent across randomly generated streams and splits', () => {
+  const rand = lcg(0xC0FFEE);
+  const types = [7, 8, 6, 9, 5, 1, 1, 1];
+
+  for (let iter = 0; iter < 300; iter++) {
+    // Build a random stream of NALs with random sizes and both start-code lengths.
+    const parts = [];
+    const nalCount = 2 + Math.floor(rand() * 6);
+    for (let i = 0; i < nalCount; i++) {
+      const type = types[Math.floor(rand() * types.length)];
+      const len  = 1 + Math.floor(rand() * 40);
+      const sc   = rand() < 0.5 ? SC3 : SC4;
+      parts.push(nal(type, len, sc));
+    }
+    parts.push(rand() < 0.5 ? SC3 : SC4);   // terminate the last NAL
+    const stream = Buffer.concat(parts);
+
+    const whole = collect([stream]).packets;
+
+    // Random split into 1..6 chunks.
+    const cuts = new Set();
+    const nCuts = 1 + Math.floor(rand() * 5);
+    for (let i = 0; i < nCuts; i++) cuts.add(1 + Math.floor(rand() * (stream.length - 1)));
+    const sorted = [...cuts].sort((a, b) => a - b);
+    const chunks = [];
+    let prev = 0;
+    for (const c of sorted) { chunks.push(stream.subarray(prev, c)); prev = c; }
+    chunks.push(stream.subarray(prev));
+
+    const split = collect(chunks).packets;
+
+    assert.equal(split.length, whole.length,
+      `iter ${iter}: packet count differs for cuts ${sorted.join(',')}`);
+    for (let i = 0; i < whole.length; i++) {
+      assert.equal(split[i].isKey, whole[i].isKey,
+        `iter ${iter}: keyframe flag differs on packet ${i} for cuts ${sorted.join(',')}`);
+      assert.ok(split[i].data.equals(whole[i].data),
+        `iter ${iter}: packet ${i} bytes differ for cuts ${sorted.join(',')}`);
+    }
+  }
+});
+
+test('the scan frontier never exceeds the buffer it indexes', () => {
+  const rand = lcg(0xBEEF);
+  const p = new NalParser(() => {});
+  for (let i = 0; i < 500; i++) {
+    const len = 1 + Math.floor(rand() * 32);
+    const chunk = Buffer.alloc(len);
+    for (let j = 0; j < len; j++) chunk[j] = Math.floor(rand() * 256);
+    p.push(chunk);
+    assert.ok(p.scanned <= p.buf.length,
+      `scanned=${p.scanned} exceeds buffer length ${p.buf.length} at i=${i}`);
+    assert.ok(p.scanned >= 0);
+  }
+});
