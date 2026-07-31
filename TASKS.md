@@ -17,14 +17,62 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 - **Gear change engages throttle and it cannot be turned off** — operator-reported, 2026-07-30.
   On the two rovers fitted with a high/low gearbox, selecting **high gear** engages throttle
-  and it stays engaged, whether the rover was moving or stationary. This is uncommanded,
-  unstoppable motor output — the most severe defect class on this platform, and it outranks
-  everything else in this file. Root cause under investigation across the shift path
-  (`socket.html` `toggleShift` → `app.js` `fromclient` → `pwm_mavproxy_servo.js`
-  `channelMap`/`scale`/`setServoPWM` → RC_CHANNELS_OVERRIDE → ArduRover output mixing, where
-  `FRAME_CLASS=2` (Boat) and `SERVO2_FUNCTION=1` are both suspect).
-  **Validation blocker: `rover3` has no gearbox**, so this fix cannot be validated on the
-  only rover currently reachable. Needs rover1 or rover2 access before it can merge.
+  and it stays engaged, whether the rover was moving or stationary. Uncommanded, unstoppable
+  motor output; outranks everything else in this file. Root cause **not yet identified**, but
+  the investigation has hard results in both directions:
+
+  *Eliminated by live test on rover3 (2026-07-30, bench servo on output 2, throttle and
+  steering pinned at 1500 while ch2 was swept 2000→1500→1100→1000→1500→2000):* servo2 tracked
+  ch2 exactly, and **servo3 (throttle) held 1500 with 0 µs spread across the entire sweep**;
+  `Vservo` held 6012–6017 mV. There is **no gear→throttle coupling in ArduPilot's mixing**, so
+  `FRAME_CLASS=2` (Boat) mixing and the `RCMAP_PITCH=2`/RC2 double-duty conflict are both
+  **refuted** as causes of this defect.
+
+  *Confirmed and still live:* `RCPassThru` (`SERVO2_FUNCTION=1`) **ignores `SERVO2_MIN/MAX`* —
+  commanding 1000 µs produced 1000 µs on an output whose MIN is 1100.
+  **Correction:** `SERVO2_MIN/MAX = 1100/1900` are ArduPilot **factory defaults**, not
+  evidence anyone measured that servo's travel — every `SERVOn_MIN/MAX` on the vehicle is
+  1100/1900 including the disabled channels 6–16; only channel 3 was deliberately widened to
+  1000/2000. An earlier claim that the narrow range was "the fingerprint of a servo hitting
+  its stops" was wrong and is withdrawn. Servo overtravel remains a *speculative* hypothesis
+  needing a loaded bench sweep on a geared rover, not a supported one.
+
+  *Remaining hypotheses, all requiring a geared rover to discriminate:* shifting under load
+  jamming the transmission or stalling the shift servo; an ESC fault latch; or the two
+  verified software defects below (no interlock, unvalidated input) putting the gearbox into a
+  bad state.
+
+  **Blocker: it is unknown what code the geared rovers actually run.** rover3 was found on a
+  stale divergent branch with hand-copied files and an unresolved merge conflict, so assuming
+  rover1/rover2 track `main` is unsafe. Get `git rev-parse HEAD` + `git status --porcelain`
+  from both before designing a fix. `rover3` has no gearbox, so the mechanical hypotheses
+  cannot be tested there at all.
+
+- **A gear change has no interlock whatsoever on `main`** — `socket.html:1411` binds
+  **ShiftLeft/ShiftRight** straight to `toggleShift()`, and keyboard is the default control
+  mode on every non-touch device. `toggleShift()` on `main` flips the gear and immediately
+  calls `sendControlValues()` — no neutral, no stop, no disarm, no speed check
+  (`interlock refs on main: 0`). So pressing the Shift key while driving at full throttle
+  shifts the gearbox instantly. This is exactly the operator's "put into high gear while
+  driving". The only drivetrain interlock that ever existed
+  (`requireNeutralForDrivetrainChange` → stop + disarm + reset inputs) lives solely on the
+  archived branch and has never been deployed. Note the binding dates to `810d2e8`
+  (2026-02-24), five months old, so it does **not** by itself explain "started recently".
+  Fix: require neutral-and-stopped before any drivetrain change, and stop binding a bare
+  modifier key to a mechanical gear shift.
+
+- **Unvalidated `shift` / `tlock_*` input reaches the servo channel raw** — `app.js:137-140`
+  guards `throttle` and `steering` with `Number.isFinite`, but `:156-158` pass `data.shift`,
+  `data.tlock_front` and `data.tlock_rear` straight into `setServoPWM` behind only an
+  `!== undefined` check. Verified empirically against `main`'s own driver: `shift: []` or
+  `shift: null` drives the gear servo to **1500 µs — mid-travel, a half-engaged gear**, while
+  `shift: "abc"`, `{}` or `NaN` yields `channels[1] = 0`, which `buildRCOverride` converts to
+  **65535 = MAVLink "ignore this field"**, so ArduPilot stops refreshing that override and it
+  lapses after `RC_OVERRIDE_TIME`. Any client — and there is no authentication — can do this
+  with one malformed JSON field. `main`'s `setServoPWM` also returns `undefined` in every
+  case, so no caller can distinguish applied from dropped (violates safety invariant 10).
+  Fix: validate every channel identically, reject non-finite input, and return an explicit
+  applied/dropped result.
 
 - **Drop latent frames so the video stream and C2 stop stalling** — operator-reported.
   Bound latency in the video path and stop it propagating into the control link. Related

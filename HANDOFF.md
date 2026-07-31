@@ -235,6 +235,31 @@ MAVLink field until they are. Note the corollary: because read-back currently ve
 `PARAM_VALUE` here. Prove that first; it is the cheapest experiment with the highest
 information value, and it gates both the telemetry feature and any future arm-gating.
 
+**Gear/throttle investigation, 2026-07-30 (live test on rover3).** With a bench test servo on
+output 2 and the servo rail powered (`Vservo` 6014 mV), ch2 was swept
+2000→1500→1100→1000→1500→2000 while ch1 and ch3 were pinned at 1500. Result: servo2 tracked
+the command exactly; **servo3 (throttle) held 1500 with 0 µs spread**; `Vservo` held
+6012–6017 mV. Conclusion: **no gear→throttle coupling exists in ArduPilot's mixing**, which
+refutes both the `FRAME_CLASS=2` (Boat) mixing theory and the `RCMAP_PITCH=2` conflict theory.
+`RCPassThru` was confirmed to ignore `SERVO2_MIN/MAX` (commanded 1000 on an output whose MIN
+is 1100). Note `SERVOn_MIN/MAX = 1100/1900` are ArduPilot factory defaults across all 16
+channels, so they are *not* evidence of a measured mechanical limit — an earlier claim to that
+effect was withdrawn. The test script was throwaway diagnostic tooling and was removed from
+the rover; picar was stopped for the run and restored afterwards.
+
+**The flight controller was found ARMED, and `main` never disarms it.** `base_mode=193` has
+`SAFETY_ARMED` set, before and throughout that test. `main`'s `_connect()` calls only
+`startHeartbeat()` and `startLoop()` — there is no `disarm()` on connect, so arm state
+survives picar restarts, crashes, and companion-computer reboots. The archived branch added
+that disarm. Assume any rover may be armed with no operator connected.
+
+**Telemetry already streaming (relevant to the radio/power task).** From the live tlog:
+`SYS_STATUS` voltage 7861 mV / current 46 cA / remaining 0 % (`BATT_MONITOR=4` is configured,
+but capacity params are not, hence 0 %); `POWER_STATUS` Vcc 5164 mV / Vservo 6014 mV;
+`SERVO_OUTPUT_RAW` and `RC_CHANNELS` at ~4 Hz. `RC_CHANNELS.rssi = 255` (no RC receiver link)
+and **zero `RADIO_STATUS` messages in 656 375 logged frames** — so a SiK radio is either not
+fitted or not on a MAVLink serial port. Confirm before building the Radio indicator.
+
 **Runtime baseline (healthy, post-reconcile).** `picar`, `mavproxy`, `mediamtx` all active;
 `NRestarts=0`; up since 2026-07-30 19:36 BST. Listeners: `:8443` and `:8081` (node),
 `:8889` (mediamtx), `127.0.0.1:5760` (mavproxy). `/status` returns
