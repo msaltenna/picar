@@ -88,34 +88,64 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
   let restarting     = false;
   let restartQueued  = false;
   let restartChild   = null;
+  let restartTimer   = null;
+  let stopped        = false;
+
+  // `systemctl restart` blocks until the unit's job completes, and a unit stuck in
+  // `deactivating` blocks for its full TimeoutStopSec — or indefinitely. Moving it
+  // off the event loop is not enough: without a bound, one hung restart would leave
+  // `restarting` true forever and every later video-param change would be silently
+  // coalesced into a restart that never happens.
+  const RESTART_TIMEOUT_MS = config.mediamtx_restart_timeout_ms ?? 30000;
+
+  function clearRestartState() {
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    restartChild = null;
+    restarting = false;
+  }
 
   function restartMediamtx() {
+    if (stopped) return;   // never spawn during or after shutdown
     restarting = true;
     restartQueued = false;
     console.log('WebRTC: restarting mediamtx…');
     // spawn, not exec: no shell, and no buffering of output we do not read.
-    restartChild = spawn('systemctl', ['restart', 'mediamtx'], { stdio: 'ignore' });
-    restartChild.on('error', (e) => {
+    const child = spawn('systemctl', ['restart', 'mediamtx'], { stdio: 'ignore' });
+    restartChild = child;
+
+    restartTimer = setTimeout(() => {
+      console.error(`WebRTC: mediamtx restart exceeded ${RESTART_TIMEOUT_MS} ms — killing it`);
+      try { child.kill('SIGKILL'); } catch (_) {}
+      clearRestartState();
+    }, RESTART_TIMEOUT_MS);
+    // Must not hold the process open at shutdown.
+    if (typeof restartTimer.unref === 'function') restartTimer.unref();
+
+    child.on('error', (e) => {
       console.error('WebRTC: mediamtx restart failed to spawn:', e.message);
-      restarting = false;
-      restartChild = null;
+      clearRestartState();
     });
-    restartChild.on('close', (code) => {
-      restartChild = null;
-      restarting = false;
+    child.on('close', (code) => {
+      clearRestartState();
       if (code === 0) console.log('WebRTC: mediamtx restarted');
       else console.error(`WebRTC: mediamtx restart exited ${code}`);
       // Apply whatever the operator settled on while this restart was running.
-      if (restartQueued) restartMediamtx();
+      if (restartQueued && !stopped) restartMediamtx();
     });
   }
 
   return {
     clientCount() { return 0; },
     stop() {
-      // Do not leave a restart child behind on shutdown.
-      if (restartChild) { restartChild.kill('SIGTERM'); restartChild = null; }
+      // Latch shutdown BEFORE clearing state. Otherwise a setVideoParams arriving
+      // during teardown — which any unauthenticated socket can send, including
+      // while SIGINT is being handled — would see restarting still true, queue
+      // itself, and then be spawned by the dying child's close handler. That
+      // launched a `systemctl restart` during process teardown, tracked by nothing.
+      stopped = true;
       restartQueued = false;
+      if (restartChild) { try { restartChild.kill('SIGTERM'); } catch (_) {} }
+      clearRestartState();
     },
 
     setParams(newParams) {

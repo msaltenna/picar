@@ -21,6 +21,7 @@ class NalParser {
     this.buf      = Buffer.alloc(0);
     this.pending  = [];
     this.scanned  = 0;
+    this.scanBytes = 0;
     this.onPacket = onPacket;
   }
 
@@ -40,13 +41,26 @@ class NalParser {
 
   reset() { this.buf = Buffer.alloc(0); this.pending = []; this.scanned = 0; }
 
+  // Instrumentation note: `scanBytes` accumulates the bytes actually examined
+  // across all scans. Without it the incremental-frontier optimisation is
+  // invisible to tests — defeating it changes cost, not output, so no behavioural
+  // assertion can catch it. Cost is one arithmetic op per call, not per byte.
   _findSC(from) {
     const b = this.buf;
-    for (let i = from; i < b.length - 2; i++) {
+    const end = b.length - 2;
+    let i = from;
+    for (; i < end; i++) {
       if (b[i] !== 0 || b[i + 1] !== 0) continue;
-      if (b[i + 2] === 1)                               return { pos: i, len: 3 };
-      if (i + 3 < b.length && b[i + 2] === 0 && b[i + 3] === 1) return { pos: i, len: 4 };
+      if (b[i + 2] === 1) {
+        this.scanBytes += i - from + 1;
+        return { pos: i, len: 3 };
+      }
+      if (i + 3 < b.length && b[i + 2] === 0 && b[i + 3] === 1) {
+        this.scanBytes += i - from + 1;
+        return { pos: i, len: 4 };
+      }
     }
+    this.scanBytes += Math.max(0, i - from);
     return null;
   }
 
@@ -125,6 +139,36 @@ function shouldSendFrame(isKeyframe, backlog, dropDeltaBytes, dropAllBytes) {
   return true;
 }
 
+// Send one packet to every open client, dropping it for any client that is backed
+// up. Returns the number of clients it was dropped for.
+//
+// Extracted and exported deliberately: mutation testing showed that with this loop
+// inlined in broadcast(), inverting the drop gate left the whole suite green. Only
+// the pure predicate was covered, so the code that actually decides anything was
+// unverified. Tests now drive this with fake clients.
+//
+// Why drop at all: on a link slower than the encoder, bufferedAmount grows without
+// bound, so the client falls progressively further behind real time and the
+// server's memory grows with it. For teleoperation a late frame is worthless — the
+// operator needs to see *now*, not a faithful replay of ten seconds ago.
+//
+// Keyframes survive a delta-level backlog because dropping them leaves the client
+// unable to resync at all; only a hard backlog drops everything.
+function fanOutToClients(clients, pkt, isKeyframe, opts) {
+  const { dropDeltaBytes, dropAllBytes, openState } = opts;
+  let dropped = 0;
+  for (const ws of clients) {
+    if (ws.readyState !== openState) continue;
+    if (!shouldSendFrame(isKeyframe, ws.bufferedAmount, dropDeltaBytes, dropAllBytes)) {
+      dropped++;
+      continue;
+    }
+    try { ws.send(pkt, { binary: true }); }
+    catch (_) { clients.delete(ws); }
+  }
+  return dropped;
+}
+
 // ── Module factory ────────────────────────────────────────────────────────────
 function createH264Stream(config, streamServer) {
   let WIDTH   = config.h264_width        || 640;
@@ -152,10 +196,18 @@ function createH264Stream(config, streamServer) {
   let droppedFrames = 0;
   let lastDropLog   = 0;
 
-  // Latency budget expressed in queued bytes, because that is what a WebSocket
-  // can actually report. At the default 600 kbps (~75 kB/s) these correspond to
-  // roughly 0.65 s and 2.7 s of backlog. Configurable so a rover on a poor link
-  // can be tuned without a code change.
+  // Latency budget expressed in queued bytes, because that is what a WebSocket can
+  // report.
+  //
+  // Do NOT read these as a time budget. `ws.bufferedAmount` counts only USERSPACE
+  // queueing (`_writableState.length + _sender._bufferedBytes`); bytes already
+  // handed to the kernel vanish from it. With tcp_wmem autotuning to 4 MB, a
+  // measurement on a paused receiver accepted ~2.7 MB before this threshold tripped
+  // at all — tens of seconds of video at 600 kbps, invisible here. So these bound
+  // latency rather than leaving it unbounded, but the bound is "kernel buffer plus
+  // this", not "this". Making it a real time bound needs either a small
+  // writableHighWaterMark/SO_SNDBUF on the accepted socket so bufferedAmount becomes
+  // meaningful, or an enqueue-timestamp check instead of a byte count (TASKS.md).
   const DROP_DELTA_BYTES = config.h264_drop_delta_bytes ?? 48 * 1024;
   const DROP_ALL_BYTES   = config.h264_drop_all_bytes   ?? 200 * 1024;
 
@@ -181,30 +233,11 @@ function createH264Stream(config, streamServer) {
     frameCount = (frameCount + 1) >>> 0;
     const pkt = Buffer.concat([hdr, data]);
 
-    for (const ws of wsClients) {
-      if (ws.readyState !== WebSocket.OPEN) continue;
-
-      // ── Drop stale frames rather than queueing them ────────────────────────
-      //
-      // Previously every frame was handed to ws.send() with no regard for
-      // whether the socket could absorb it. On a link slower than the encoder,
-      // ws.bufferedAmount grows without bound: the client falls further and
-      // further behind real time, latency rises monotonically, and the server's
-      // memory grows with it. For teleoperation a late frame is worthless — the
-      // operator needs to see *now*, not a faithful replay of ten seconds ago.
-      //
-      // So when a client is backed up we drop delta frames for it and let the
-      // next keyframe resynchronise the picture. Keyframes are still allowed
-      // through a moderate backlog, because dropping them means the client
-      // cannot recover at all; only a hard backlog drops everything.
-      if (!shouldSendFrame(isKeyframe, ws.bufferedAmount, DROP_DELTA_BYTES, DROP_ALL_BYTES)) {
-        droppedFrames++;
-        continue;
-      }
-
-      try { ws.send(pkt, { binary: true }); }
-      catch (_) { wsClients.delete(ws); }
-    }
+    droppedFrames += fanOutToClients(wsClients, pkt, isKeyframe, {
+      dropDeltaBytes: DROP_DELTA_BYTES,
+      dropAllBytes:   DROP_ALL_BYTES,
+      openState:      WebSocket.OPEN,
+    });
 
     logDropsIfDue();
 
@@ -342,5 +375,6 @@ module.exports = createH264Stream;
 // than through a reimplementation.
 module.exports.NalParser = NalParser;
 module.exports.shouldSendFrame = shouldSendFrame;
+module.exports.fanOutToClients = fanOutToClients;
 module.exports.MAX_NAL_BUFFER = MAX_NAL_BUFFER;
 

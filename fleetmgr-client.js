@@ -90,6 +90,35 @@ async function discover(port) {
   return null;
 }
 
+// Exponential backoff for failed discovery sweeps.
+//
+// Extracted and exported so the reset-on-success path is testable: with this inline
+// in tick(), deleting the reset left the whole suite green, so a rover that found a
+// Fleet Manager and then lost it would have kept the ceiling delay forever.
+//
+// Uses a caller-supplied `now`, so tests need no timers and the delay does not
+// depend on wall-clock jumps within a single comparison.
+class SweepBackoff {
+  constructor(intervalMs, maxMs) {
+    this.intervalMs = intervalMs;
+    this.maxMs = maxMs;
+    this.delayMs = 0;
+    this.nextAt = 0;   // 0 = due immediately
+  }
+
+  dueNow(now) { return this.nextAt === 0 || now >= this.nextAt; }
+
+  fail(now) {
+    this.delayMs = this.delayMs === 0
+      ? this.intervalMs
+      : Math.min(this.delayMs * 2, this.maxMs);
+    this.nextAt = now + this.delayMs;
+    return this.delayMs;
+  }
+
+  succeed() { this.delayMs = 0; this.nextAt = 0; }
+}
+
 function start(config) {
   const fleetUrl = config.fleetManagerUrl;
   if (!fleetUrl) return;
@@ -102,8 +131,7 @@ function start(config) {
   let currentBase = autoMode ? null : fleetUrl;  // resolved FM base URL
   let discovering = false;
   let fails       = 0;
-  let sweepBackoffMs = 0;   // 0 = sweep on the next tick
-  let nextSweepAt    = 0;   // epoch ms; 0 = no delay pending
+  const backoff = new SweepBackoff(intervalMs, MAX_SWEEP_BACKOFF_MS);
 
   function heartbeatTo(base) {
     const payload = JSON.stringify({
@@ -149,24 +177,20 @@ function start(config) {
     // idle. That CPU is shared with the 20 Hz control loop and the camera
     // encoder, so a cosmetic dashboard feature was competing with the control
     // path. Discovery is not urgent: nothing about the vehicle depends on it.
-    if (nextSweepAt !== 0 && Date.now() < nextSweepAt) return;
+    if (!backoff.dueNow(Date.now())) return;
 
     discovering = true;
     try {
       const ip = await discover(discoveryPort);
       if (ip) {
         currentBase = `http://${ip}:${discoveryPort}`;
-        sweepBackoffMs = 0;
-        nextSweepAt = 0;
+        backoff.succeed();
         console.log(`Fleet Manager discovered at ${currentBase}`);
         heartbeatTo(currentBase);
       } else {
-        sweepBackoffMs = sweepBackoffMs === 0
-          ? intervalMs
-          : Math.min(sweepBackoffMs * 2, MAX_SWEEP_BACKOFF_MS);
-        nextSweepAt = Date.now() + sweepBackoffMs;
+        const delayMs = backoff.fail(Date.now());
         console.log('Fleet Manager not found on LAN; next sweep in ' +
-          `${Math.round(sweepBackoffMs / 1000)}s.`);
+          `${Math.round(delayMs / 1000)}s.`);
       }
     } finally {
       discovering = false;
@@ -180,4 +204,4 @@ function start(config) {
     : `Fleet heartbeat: ${fleetUrl} rover_id=${roverId} every ${intervalMs / 1000}s`);
 }
 
-module.exports = { start, setStatusBit };
+module.exports = { start, setStatusBit, SweepBackoff, MAX_SWEEP_BACKOFF_MS };

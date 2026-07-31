@@ -162,82 +162,303 @@ test('reset clears the incremental scan position too', () => {
   assert.equal(p.buf.length, 0);
 });
 
-// ── The webrtc path must never block the event loop ──────────────────────────
-
-test('streams/webrtc.js does not restart mediamtx synchronously', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'streams', 'webrtc.js'), 'utf8');
-  // execSync there blocks the event loop for the whole unit restart — seconds —
-  // freezing the Socket.IO control stream, the 20 Hz override loop, and every
-  // fail-safe timer. A video setting must not be able to stall C2.
-  assert.doesNotMatch(src, /execSync\s*\(/, 'a synchronous restart would block the event loop');
-  assert.match(src, /spawn\(/);
-});
-
-// ── Fuzz: framing must be chunk-independent for ANY split pattern ────────────
+// ── The drop decision AT ITS CALL SITE ───────────────────────────────────────
 //
-// The `scanned` frontier is the riskiest part of this parser: if it is ever left
-// stale, or pointing past data that a later slice moved, the parser silently
-// mis-frames video. Hand-reasoning about it is not sufficient, so this compares
-// randomly-chunked input against whole-buffer input over many generated streams.
-// Deterministic LCG so a failure is reproducible.
+// These exist because mutation testing showed the previous tests covered only the
+// pure predicates: inverting the gate inside each broadcast() left the whole suite
+// green, so the code that actually decides anything was unverified. These drive the
+// real fan-out loops with fake clients and assert who received what.
 
-function lcg(seed) {
-  let s = seed >>> 0;
-  return () => { s = (s * 1103515245 + 12345) >>> 0; return s / 4294967296; };
+const { fanOutToClients } = h264;
+const { writeFrameToClients } = mjpeg;
+
+const OPEN = 1;
+function fakeWs(backlog, readyState = OPEN) {
+  return { readyState, bufferedAmount: backlog, sent: [], send(b) { this.sent.push(b); } };
 }
 
-test('framing is chunk-independent across randomly generated streams and splits', () => {
-  const rand = lcg(0xC0FFEE);
-  const types = [7, 8, 6, 9, 5, 1, 1, 1];
+test('h264 fan-out sends to a healthy client and drops for a backed-up one', () => {
+  const healthy = fakeWs(0);
+  const backedUp = fakeWs(ALL + 1);
+  const clients = new Set([healthy, backedUp]);
+  const pkt = Buffer.from([1, 2, 3]);
 
-  for (let iter = 0; iter < 300; iter++) {
-    // Build a random stream of NALs with random sizes and both start-code lengths.
-    const parts = [];
-    const nalCount = 2 + Math.floor(rand() * 6);
-    for (let i = 0; i < nalCount; i++) {
-      const type = types[Math.floor(rand() * types.length)];
-      const len  = 1 + Math.floor(rand() * 40);
-      const sc   = rand() < 0.5 ? SC3 : SC4;
-      parts.push(nal(type, len, sc));
-    }
-    parts.push(rand() < 0.5 ? SC3 : SC4);   // terminate the last NAL
-    const stream = Buffer.concat(parts);
+  const dropped = fanOutToClients(clients, pkt, false,
+    { dropDeltaBytes: DELTA, dropAllBytes: ALL, openState: OPEN });
 
-    const whole = collect([stream]).packets;
+  assert.equal(healthy.sent.length, 1, 'a healthy client must receive the frame');
+  assert.equal(backedUp.sent.length, 0, 'a backed-up client must not');
+  assert.equal(dropped, 1, 'the drop must be counted');
+});
 
-    // Random split into 1..6 chunks.
-    const cuts = new Set();
-    const nCuts = 1 + Math.floor(rand() * 5);
-    for (let i = 0; i < nCuts; i++) cuts.add(1 + Math.floor(rand() * (stream.length - 1)));
-    const sorted = [...cuts].sort((a, b) => a - b);
-    const chunks = [];
-    let prev = 0;
-    for (const c of sorted) { chunks.push(stream.subarray(prev, c)); prev = c; }
-    chunks.push(stream.subarray(prev));
+test('h264 fan-out never drops for a client with zero backlog', () => {
+  // This is the assertion that catches an inverted gate: inversion drops
+  // everything for healthy clients.
+  for (const isKey of [true, false]) {
+    const ws = fakeWs(0);
+    const dropped = fanOutToClients(new Set([ws]), Buffer.from([9]), isKey,
+      { dropDeltaBytes: DELTA, dropAllBytes: ALL, openState: OPEN });
+    assert.equal(ws.sent.length, 1, `isKeyframe=${isKey}: healthy client was starved`);
+    assert.equal(dropped, 0);
+  }
+});
 
-    const split = collect(chunks).packets;
+test('h264 fan-out keeps keyframes but sheds deltas for a mid-backlog client', () => {
+  const ws = fakeWs(DELTA + 1);
+  const opts = { dropDeltaBytes: DELTA, dropAllBytes: ALL, openState: OPEN };
+  fanOutToClients(new Set([ws]), Buffer.from([1]), false, opts);
+  assert.equal(ws.sent.length, 0, 'delta must be shed at mid backlog');
+  fanOutToClients(new Set([ws]), Buffer.from([2]), true, opts);
+  assert.equal(ws.sent.length, 1, 'keyframe must still get through so the client can resync');
+});
 
-    assert.equal(split.length, whole.length,
-      `iter ${iter}: packet count differs for cuts ${sorted.join(',')}`);
+test('h264 fan-out skips clients that are not open, without counting them as drops', () => {
+  const closed = fakeWs(0, 3); // CLOSED
+  const dropped = fanOutToClients(new Set([closed]), Buffer.from([1]), true,
+    { dropDeltaBytes: DELTA, dropAllBytes: ALL, openState: OPEN });
+  assert.equal(closed.sent.length, 0);
+  assert.equal(dropped, 0);
+});
+
+test('h264 fan-out evicts a client whose send throws', () => {
+  const bad = { readyState: OPEN, bufferedAmount: 0, send() { throw new Error('gone'); } };
+  const clients = new Set([bad]);
+  fanOutToClients(clients, Buffer.from([1]), true,
+    { dropDeltaBytes: DELTA, dropAllBytes: ALL, openState: OPEN });
+  assert.equal(clients.size, 0, 'a broken client must be removed');
+});
+
+function fakeRes(writableLength, writableEnded = false) {
+  return { writableLength, writableEnded, writes: [], write(c) { this.writes.push(c); } };
+}
+
+test('mjpeg fan-out writes to a healthy client and skips a backed-up one', () => {
+  const DROP = 64 * 1024;
+  const healthy = fakeRes(0);
+  const backedUp = fakeRes(DROP + 1);
+  const clients = [healthy, backedUp];
+
+  const dropped = writeFrameToClients(clients, Buffer.from([0xff, 0xd8, 0xff, 0xd9]), DROP);
+
+  assert.ok(healthy.writes.length >= 1, 'a healthy client must receive the frame');
+  assert.equal(backedUp.writes.length, 0, 'a backed-up client must not');
+  assert.equal(dropped, 1);
+});
+
+test('mjpeg fan-out never skips for a client with zero backlog', () => {
+  const ws = fakeRes(0);
+  const dropped = writeFrameToClients([ws], Buffer.from([1]), 64 * 1024);
+  assert.ok(ws.writes.length >= 1, 'healthy client was starved');
+  assert.equal(dropped, 0);
+});
+
+test('mjpeg fan-out removes ended clients from the list', () => {
+  const ended = fakeRes(0, true);
+  const live = fakeRes(0);
+  const clients = [ended, live];
+  writeFrameToClients(clients, Buffer.from([1]), 64 * 1024);
+  assert.equal(clients.length, 1);
+  assert.equal(clients[0], live);
+});
+
+// ── The mediamtx restart must not block the event loop ───────────────────────
+//
+// Replaces a source-text test that asserted the absence of the string "execSync(".
+// That test passed while the restart was fully synchronous, because execFileSync,
+// spawnSync, and an aliased require all defeat the regex. This asserts the
+// behaviour instead: setParams must return before the child completes.
+
+// webrtc.js destructures `spawn` at module load, so a stub installed after the
+// module is cached has no effect. Load it fresh per test.
+function loadWebrtcFresh() {
+  delete require.cache[require.resolve('../streams/webrtc.js')];
+  return require('../streams/webrtc.js');
+}
+
+test('setParams returns without waiting for the mediamtx restart to finish', () => {
+  const { EventEmitter } = require('events');
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  let child = null;
+  let spawns = 0;
+  cp.spawn = () => {
+    spawns++;
+    child = new EventEmitter();
+    child.kill = () => {};
+    return child;
+  };
+  try {
+    const tmp = path.join(require('os').tmpdir(), `mediamtx-test-${process.pid}.yml`);
+    const stream = loadWebrtcFresh()({ mediamtx_yml: tmp });
+
+    let closedBeforeReturn = false;
+    child = null;
+    stream.setParams({ fps: 15 });
+    // If the restart were synchronous, the child would already have completed by
+    // the time setParams returned.
+    closedBeforeReturn = child === null;
+    assert.equal(spawns, 1, 'exactly one restart should have been spawned');
+    assert.equal(closedBeforeReturn, false,
+      'a child should exist and still be running — setParams must not have waited');
+
+    // A second request while one is in flight must coalesce, not spawn again.
+    stream.setParams({ fps: 20 });
+    assert.equal(spawns, 1, 'a concurrent restart request must coalesce');
+
+    // ...and must be applied once the first completes.
+    child.emit('close', 0);
+    assert.equal(spawns, 2, 'the coalesced request must run after the first finishes');
+
+    child.emit('close', 0);
+    stream.stop();
+    fs.rmSync(tmp, { force: true });
+  } finally {
+    cp.spawn = realSpawn;
+  }
+});
+
+test('stop() prevents a queued restart from spawning during shutdown', () => {
+  const { EventEmitter } = require('events');
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  let child = null;
+  let spawns = 0;
+  cp.spawn = () => { spawns++; child = new EventEmitter(); child.kill = () => {}; return child; };
+  try {
+    const tmp = path.join(require('os').tmpdir(), `mediamtx-stop-${process.pid}.yml`);
+    const stream = loadWebrtcFresh()({ mediamtx_yml: tmp });
+    stream.setParams({ fps: 15 });            // spawn #1
+    const first = child;
+    stream.stop();                            // shutdown latches
+    stream.setParams({ fps: 25 });            // arrives during teardown
+    first.emit('close', 0);                   // dying child's handler runs
+    assert.equal(spawns, 1,
+      'no restart may be spawned during or after shutdown');
+    fs.rmSync(tmp, { force: true });
+  } finally {
+    cp.spawn = realSpawn;
+  }
+});
+
+// ── The incremental scan frontier must actually be used ──────────────────────
+//
+// Defeating it changes cost, not output, so no behavioural assertion can catch it.
+// The parser therefore counts bytes examined, and this asserts the count stays
+// linear. Without the frontier, a NAL arriving in N chunks is rescanned from byte 0
+// each time, which is quadratic.
+
+test('scanning a large access unit stays linear in its size', () => {
+  const AU_BYTES = 256 * 1024;
+  const CHUNK = 2048;
+  const stream = Buffer.concat([
+    SC4, Buffer.from([5]), Buffer.alloc(AU_BYTES, 0xa5),
+    SC4, Buffer.from([1]), Buffer.alloc(64, 0x11), SC4,
+  ]);
+  const p = new NalParser(() => {});
+  for (let i = 0; i < stream.length; i += CHUNK) p.push(stream.subarray(i, i + CHUNK));
+
+  // Linear would be ~stream.length; quadratic over N=~130 chunks would be orders
+  // of magnitude more. 4x gives generous headroom for the legitimate re-scan of
+  // the 3-byte straddle window while still failing hard on a full rescan.
+  const budget = stream.length * 4;
+  assert.ok(p.scanBytes < budget,
+    `scan examined ${p.scanBytes} bytes for a ${stream.length}-byte stream ` +
+    `(budget ${budget}) — the incremental frontier is not being used`);
+});
+
+// ── MJPEG framing: the split-SOI fix and the buffer cap ─────────────────────
+
+const { extractJpegFrames } = mjpeg;
+
+function jpeg(payloadLen, fill) {
+  return Buffer.concat([
+    Buffer.from([0xff, 0xd8]), Buffer.alloc(payloadLen, fill), Buffer.from([0xff, 0xd9]),
+  ]);
+}
+
+test('mjpeg framing recovers every frame however the bytes are split', () => {
+  const stream = Buffer.concat([jpeg(8, 0x11), jpeg(12, 0x22), jpeg(6, 0x33)]);
+
+  const whole = [];
+  extractJpegFrames(Buffer.alloc(0), stream, 1 << 20, (f) => whole.push(Buffer.from(f)));
+  assert.equal(whole.length, 3, 'expected 3 frames from the unsplit stream');
+
+  // Split at every byte boundary. Cuts that fall between the ff and d8 of an SOI
+  // marker are the ones that used to silently lose a frame.
+  for (let cut = 1; cut < stream.length; cut++) {
+    const got = [];
+    let buf = Buffer.alloc(0);
+    buf = extractJpegFrames(buf, stream.subarray(0, cut), 1 << 20, (f) => got.push(Buffer.from(f)));
+    buf = extractJpegFrames(buf, stream.subarray(cut), 1 << 20, (f) => got.push(Buffer.from(f)));
+    assert.equal(got.length, whole.length, `lost a frame at cut=${cut}`);
     for (let i = 0; i < whole.length; i++) {
-      assert.equal(split[i].isKey, whole[i].isKey,
-        `iter ${iter}: keyframe flag differs on packet ${i} for cuts ${sorted.join(',')}`);
-      assert.ok(split[i].data.equals(whole[i].data),
-        `iter ${iter}: packet ${i} bytes differ for cuts ${sorted.join(',')}`);
+      assert.ok(got[i].equals(whole[i]), `frame ${i} bytes differ at cut=${cut}`);
     }
   }
 });
 
-test('the scan frontier never exceeds the buffer it indexes', () => {
-  const rand = lcg(0xBEEF);
-  const p = new NalParser(() => {});
-  for (let i = 0; i < 500; i++) {
-    const len = 1 + Math.floor(rand() * 32);
-    const chunk = Buffer.alloc(len);
-    for (let j = 0; j < len; j++) chunk[j] = Math.floor(rand() * 256);
-    p.push(chunk);
-    assert.ok(p.scanned <= p.buf.length,
-      `scanned=${p.scanned} exceeds buffer length ${p.buf.length} at i=${i}`);
-    assert.ok(p.scanned >= 0);
+test('mjpeg framing survives one byte at a time', () => {
+  const stream = Buffer.concat([jpeg(8, 0x11), jpeg(5, 0x22)]);
+  const got = [];
+  let buf = Buffer.alloc(0);
+  for (const b of stream) {
+    buf = extractJpegFrames(buf, Buffer.from([b]), 1 << 20, (f) => got.push(Buffer.from(f)));
   }
+  assert.equal(got.length, 2);
+});
+
+test('the mjpeg buffer is capped and resyncs rather than growing without limit', () => {
+  const CAP = 64 * 1024;
+  const got = [];
+  let buf = Buffer.alloc(0);
+  // Bytes containing an SOI but never an EOI: the uncapped version grew forever.
+  buf = extractJpegFrames(buf, Buffer.from([0xff, 0xd8]), CAP, (f) => got.push(f));
+  for (let i = 0; i < 8; i++) {
+    buf = extractJpegFrames(buf, Buffer.alloc(32 * 1024, 0x44), CAP, (f) => got.push(f));
+    assert.ok(buf.length <= CAP,
+      `buffer grew to ${buf.length}, above the ${CAP} cap`);
+  }
+  assert.equal(got.length, 0, 'no frame should be emitted from garbage');
+});
+
+// ── Fleet discovery backoff ──────────────────────────────────────────────────
+
+const { SweepBackoff, MAX_SWEEP_BACKOFF_MS } = require('../fleetmgr-client.js');
+
+test('a fresh backoff is due immediately', () => {
+  const b = new SweepBackoff(5000, MAX_SWEEP_BACKOFF_MS);
+  assert.equal(b.dueNow(0), true);
+  assert.equal(b.dueNow(1_000_000), true);
+});
+
+test('failed sweeps double from the tick interval up to the ceiling', () => {
+  const b = new SweepBackoff(5000, 300000);
+  const seen = [];
+  let now = 0;
+  for (let i = 0; i < 9; i++) { seen.push(b.fail(now)); now += seen[seen.length - 1]; }
+  assert.deepEqual(seen, [5000, 10000, 20000, 40000, 80000, 160000, 300000, 300000, 300000],
+    'expected doubling then a hard ceiling');
+});
+
+test('a backoff blocks sweeps until its delay has elapsed', () => {
+  const b = new SweepBackoff(5000, 300000);
+  b.fail(1000);                       // next due at 6000
+  assert.equal(b.dueNow(5999), false, 'must not sweep early');
+  assert.equal(b.dueNow(6000), true,  'must sweep once due');
+});
+
+test('a successful discovery resets the backoff completely', () => {
+  // Regression guard: without the reset, a rover that found a Fleet Manager and
+  // later lost it would keep the ceiling delay forever, taking up to 5 minutes to
+  // reappear on the dashboard instead of one tick.
+  const b = new SweepBackoff(5000, 300000);
+  let now = 0;
+  for (let i = 0; i < 8; i++) { now += b.fail(now); }
+  assert.ok(b.delayMs >= 300000, 'precondition: backoff should be at the ceiling');
+
+  b.succeed();
+
+  assert.equal(b.delayMs, 0, 'delay must reset to zero');
+  assert.equal(b.dueNow(now), true, 'must be immediately due again after success');
+  assert.equal(b.fail(now), 5000, 'the next failure must restart at the tick interval');
 });

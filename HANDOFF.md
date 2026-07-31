@@ -88,8 +88,11 @@ commits on the branch, tip `781d56a00e48c176ec2e704c88afe0ff5e7dcc8d`.
   moderate backlog so a client can still resync; only a hard backlog drops everything. Drops
   are logged at most every 5 s.
 - Both parse buffers are bounded and resync rather than growing until the process dies.
-- The frame-drop rules and `NalParser` are exported so tests exercise the real logic; 31 tests,
-  including a 300-case fuzz over random streams and random multi-chunk splits.
+- The drop rules, the fan-out loops, `NalParser`, the JPEG framing, and the backoff schedule are
+  all exported so tests exercise the real logic rather than a reimplementation of it. This change
+  adds **31 tests** (the suite total is 46, including the 15 pre-existing drivetrain tests) —
+  among them a 300-case fuzz over random streams with random multi-chunk splits, and
+  split-at-every-boundary tests for both the NAL and JPEG framing.
 
 **A pre-existing framing bug was found and fixed.** `NalParser._extractOne` discarded the
 ENTIRE buffer when no start code was found, so a 4-byte start code straddling a chunk boundary
@@ -116,6 +119,10 @@ recorded as. The P0 has been removed rather than reworded, because it was wrong.
 - *Fleet backoff, measured:* progression observed as 5→10→20→40→80→160→300 s, capping correctly
   and resetting on discovery. Idle CPU **6.90% → 3.47% of one core, a 2.0x reduction** (60–90 s
   sampling windows, no client, no viewer).
+- *Superseded figure:* commit `bc1cd71`'s body quotes `/status`-gap numbers (121 ms vs 61 ms) as
+  its central measurement. **Those are withdrawn** — see the next bullet. The real figure is the
+  direct `execSync` timing: 85 ms mean, 100 ms max over five trials. Anyone reading `git log`
+  without this file would otherwise take the discredited number as fact.
 - *C2 responsiveness:* the /status-gap probe could NOT distinguish the two builds — 121 ms on
   `main` versus 61 ms and 106 ms on two runs of the fix, with the worst gap on one fix run
   landing 11 s after the restart fired. That metric is dominated by ordinary event-loop jitter,

@@ -12,6 +12,68 @@ function shouldSkipFrame(writableLength, dropBytes) {
   return writableLength > dropBytes;
 }
 
+// Write one frame to every client, skipping any that has not drained the previous
+// ones. Mutates `clients` in place to drop ended/errored ones. Returns the number
+// of clients the frame was skipped for.
+//
+// Extracted and exported deliberately: with this loop inlined, mutation testing
+// showed that inverting the skip gate left the whole suite green — only the pure
+// predicate was covered, not the code that decides anything.
+//
+// MJPEG frames are independently decodable, so a skipped frame costs nothing but
+// smoothness; there is no keyframe dependency to break. Writing regardless let a
+// client slower than the camera accumulate unbounded backlog in Node's socket
+// buffer, so latency grew without limit and memory grew with it.
+function writeFrameToClients(clients, frame, dropBytes) {
+  const hdr = `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`;
+  let dropped = 0;
+  for (let i = clients.length - 1; i >= 0; i--) {
+    const c = clients[i];
+    if (c.writableEnded) { clients.splice(i, 1); continue; }
+    if (shouldSkipFrame(c.writableLength, dropBytes)) {
+      dropped++;
+      continue;
+    }
+    try {
+      c.write(hdr);
+      c.write(frame);
+      c.write('\r\n');
+    } catch (_) { clients.splice(i, 1); }
+  }
+  return dropped;
+}
+
+// Append a chunk and emit every complete JPEG in it, returning the leftover buffer.
+//
+// Exported so the framing is testable: the buffer cap and the split-SOI handling
+// both live here, and neither was reachable from a test while this was inlined in
+// the camera stdout handler.
+function extractJpegFrames(buf, chunk, maxBuffer, onFrame) {
+  buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+  // A wedged camera that never emits an end-of-image marker would otherwise grow
+  // this without limit until the process dies. Resyncing is always recoverable:
+  // each JPEG is independently decodable, so the next complete one restores video.
+  if (buf.length > maxBuffer) {
+    console.error(`MJPEG: buffer exceeded ${maxBuffer} bytes — resyncing`);
+    return Buffer.alloc(0);
+  }
+  while (true) {
+    const s = buf.indexOf(JPEG_START);
+    if (s === -1) {
+      // Retain the trailing byte. JPEG_START is two bytes (ff d8), so a chunk
+      // boundary can fall between them; discarding the whole buffer here threw the
+      // leading `ff` away and silently lost the frame. Same defect as the one fixed
+      // in the h264 NAL parser — it was present in both.
+      return buf.length > 1 ? buf.subarray(buf.length - 1) : buf;
+    }
+    if (s > 0) buf = buf.subarray(s);
+    const e = buf.indexOf(JPEG_END, 2);
+    if (e === -1) return buf;
+    onFrame(buf.subarray(0, e + 2));
+    buf = buf.subarray(e + 2);
+  }
+}
+
 function createMjpegStream(config, streamServer) {
   let WIDTH   = config.mjpeg_width     || 480;
   let HEIGHT  = config.mjpeg_height    || 360;
@@ -42,30 +104,7 @@ function createMjpegStream(config, streamServer) {
   function clientCount() { return clients.length; }
 
   function broadcast(frame) {
-    const hdr = `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`;
-    for (let i = clients.length - 1; i >= 0; i--) {
-      const c = clients[i];
-      if (c.writableEnded) { clients.splice(i, 1); continue; }
-
-      // Drop this frame for any client that has not drained the previous ones.
-      //
-      // MJPEG sends a whole independently-decodable image per frame, so a
-      // dropped frame costs nothing but smoothness — there is no keyframe
-      // dependency to break. Previously every frame was written regardless, so a
-      // client slower than the camera accumulated unbounded backlog in Node's
-      // socket buffer: latency grew without limit and the server's memory grew
-      // with it. For teleoperation the newest frame is the only useful one.
-      if (shouldSkipFrame(c.writableLength, DROP_BYTES)) {
-        droppedFrames++;
-        continue;
-      }
-
-      try {
-        c.write(hdr);
-        c.write(frame);
-        c.write('\r\n');
-      } catch (_) { clients.splice(i, 1); }
-    }
+    droppedFrames += writeFrameToClients(clients, frame, DROP_BYTES);
     logDropsIfDue();
   }
 
@@ -107,21 +146,7 @@ function createMjpegStream(config, streamServer) {
 
     cameraProc.stdout.on('data', (chunk) => {
       if (!gotFirst) { gotFirst = true; console.log('MJPEG: stream live'); }
-      jpegBuf = jpegBuf.length === 0 ? chunk : Buffer.concat([jpegBuf, chunk]);
-      if (jpegBuf.length > MAX_JPEG_BUFFER) {
-        console.error(`MJPEG: buffer exceeded ${MAX_JPEG_BUFFER} bytes — resyncing`);
-        jpegBuf = Buffer.alloc(0);
-        return;
-      }
-      while (true) {
-        const s = jpegBuf.indexOf(JPEG_START);
-        if (s === -1) { jpegBuf = Buffer.alloc(0); break; }
-        if (s > 0) jpegBuf = jpegBuf.subarray(s);
-        const e = jpegBuf.indexOf(JPEG_END, 2);
-        if (e === -1) break;
-        broadcast(jpegBuf.subarray(0, e + 2));
-        jpegBuf = jpegBuf.subarray(e + 2);
-      }
+      jpegBuf = extractJpegFrames(jpegBuf, chunk, MAX_JPEG_BUFFER, broadcast);
     });
 
     cameraProc.stderr.on('data', (d) => console.log('MJPEG camera:', d.toString().trim()));
@@ -182,3 +207,5 @@ function createMjpegStream(config, streamServer) {
 
 module.exports = createMjpegStream;
 module.exports.shouldSkipFrame = shouldSkipFrame;
+module.exports.writeFrameToClients = writeFrameToClients;
+module.exports.extractJpegFrames = extractJpegFrames;
