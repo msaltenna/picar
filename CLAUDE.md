@@ -22,7 +22,8 @@ is not obvious from the code.
 > **Read this first.** The safety layer described below — `control-safety.js`,
 > `client-control-safety.js`, the `test/` suite, and the arm-gating in
 > `pwm_mavproxy_servo.js` — is **not on `main`**. It exists only on the unmerged branch
-> `agent/fix-control-failsafe`. On `main`, `app.js` arms the vehicle from any socket with no
+> the archived branch `origin/archive/control-failsafe-2026-07-30`, which is shelved and not
+> scheduled. On `main`, `app.js` arms the vehicle from any socket with no
 > lease, token, sequence, or staleness check. Validating and merging that branch is the
 > platform's top priority (`TASKS.md`, P0). Until it lands, the invariants below are the
 > **required standard**, not a description of `main`.
@@ -71,7 +72,8 @@ app.js ── control-safety.js ── pwm_servo.js ─► pwm_mavproxy_servo.js
 `picar-cfg.local.json` (holds per-rover `rover_id`). Never commit machine-specific values
 to the tracked config.
 
-**Tests:** `npm test` (`node --test`, 24 tests in `test/`) — on `agent/fix-control-failsafe`.
+**Tests:** `main` has **no** `test` script and no `test/` directory — `npm test` fails. A
+24-test suite exists only on the archived `origin/archive/control-failsafe-2026-07-30`.
 `main` has no `test` script and no `test/` directory. These are host-side unit and
 source-wiring tests; they are necessary and not sufficient — see Validation.
 
