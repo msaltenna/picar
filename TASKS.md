@@ -190,6 +190,21 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **Re-review two changes under Codex once credits are restored** — both were cleared by the
+  `opus-fallback` reviewer, which is the same model family as the author and therefore a weaker
+  check. `chore/adversarial-review-fallback` (the fallback rule itself) and
+  `perf/bound-video-latency` (video frame dropping; still unmerged and additionally awaiting
+  on-target validation of the drop paths). Neither touches the ten safety invariants, so the
+  fallback cleared them legitimately — but a Codex pass on both is owed.
+
+- **Nothing mechanically enforces the review gate** — the `Reviewed-by:` commit trailer added in
+  `chore/adversarial-review-fallback` makes the claim durable and auditable, but nothing
+  *verifies* it: a merge with no trailer, or a false trailer, is not blocked. Same shape as the
+  validation-attestation gap already filed below, and the same durable fix applies — a required
+  protected-branch status check. Fold reviewer attestation into that work.
+
+
+
 - **`test/on-target/` does not exist** — the validation bar requires a committed, repeatable
   on-target suite, and there is none, so every validation so far has been ad hoc. Nothing
   runtime-affecting should be validated until it exists. Bootstrap it with the checks

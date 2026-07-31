@@ -1,6 +1,6 @@
 ---
 name: second-opinion-validator
-description: Get an independent adversarial second opinion on picar changes or decisions through Codex, reviewing under the same CLAUDE.md directive. Use before deploying any change, whenever a safety invariant is touched, and when a design decision is contested. Review-only — never edits or commits.
+description: Get an independent adversarial second opinion on picar changes or decisions — Codex primarily, falling back to Opus 5 only when Codex cannot run at all. Reviews under the same CLAUDE.md directive. Use before deploying any change, whenever a safety invariant is touched, and when a design decision is contested. Review-only — never edits or commits.
 ---
 
 # Second Opinion Validator
@@ -18,7 +18,76 @@ same directive and the same safety invariants — that is the point of the exerc
 
 ## How to run it
 
-Use the Codex plugin — it is installed.
+**Codex is the primary reviewer. Opus 5 is the fallback, and only when Codex cannot run at all.**
+
+Try Codex first, every time.
+
+#### The bright line is INFORMATION, not exit status
+
+**Once you have seen any Codex finding for this diff, the fallback is unavailable for this diff
+— however Codex terminated.** A crash after findings printed, a truncated review, a review you
+disagree with: all of these mean you have the information, so you triage it. Keying the rule to
+"did Codex return cleanly" instead would route crash-after-findings to a second reviewer *after*
+the author already saw the first one's objections, which is precisely what this control exists
+to prevent.
+
+#### Fallback is permitted only on these, and nothing else
+
+Codex produced **no findings at all**, because of one of:
+
+- `out of credits` / quota exhausted
+- authentication failure
+- the `codex` CLI or the plugin is not installed
+
+**Default-deny: any outcome not on that list is NOT a fallback condition** — escalate to the
+operator instead of deciding for yourself. That explicitly includes an empty review, malformed
+or truncated output, a review of the wrong scope, and an explicit refusal.
+
+**A timeout is not a self-serve fallback condition.** Foreground Codex runs time out on
+multi-file diffs — this skill tells you to prefer `--background` for exactly that reason — so
+letting an author trigger the friendlier reviewer by running foreground twice would be a defeat
+path requiring no dishonesty at all. On a timeout: re-run with `--background` and wait. If it
+still produces nothing, escalate to the operator.
+
+Quote Codex's **verbatim failure string** in your report and in the `HANDOFF.md` entry. A
+false claim then has to be an active fabrication rather than an omission.
+
+### The fallback
+
+Dispatch the **`adversarial-reviewer`** subagent (`.claude/agents/adversarial-reviewer.md`,
+Opus, isolated context, read-only). Give it the base ref and what the change claims to do — it
+derives the diff itself. It runs with **no access to this conversation**, deliberately: a
+reviewer that inherits the author's reasoning inherits the author's blind spots.
+
+#### The fallback does NOT clear a safety-invariant change
+
+If the change touches any of the ten safety invariants in `CLAUDE.md`, the fallback review
+**runs and its findings must be addressed, but it does not authorise a merge to `main`.** That
+change waits for Codex.
+
+This is deliberate and it follows `CLAUDE.md`'s own stated standard for accepting a weakening:
+the evidence-commit exemption is accepted because its alternative is *unachievable*. Here the
+alternative is *wait for Codex credits* — entirely achievable, with no deadline and no flight
+battery connected. So a same-model-family review may clear hygiene, performance, and
+documentation work, which is where the stalling actually hurts; it may not put safety-path code
+on a vehicle.
+
+For everything else, a fallback review clears the stage normally.
+
+#### Record it, because nothing enforces any of this
+
+- First line of your report: `codex` or `opus-fallback`, and if fallback, Codex's verbatim
+  failure string.
+- The `HANDOFF.md` entry for the change records the same. A reader must be able to tell a
+  Codex-reviewed merge from a fallback-reviewed one without digging.
+- Ask the DevOps Engineer for a `Reviewed-by: codex` or `Reviewed-by: opus-fallback` trailer on
+  the commit. That binds the claim to an immutable commit object rather than to prose in a file
+  that every later change rewrites.
+- A fallback review of anything non-trivial goes in `TASKS.md` for re-review once Codex is back.
+
+### Running Codex
+
+The Codex plugin is installed.
 
 - **`/codex:adversarial-review`** is the default. It challenges the approach, the design
   choices, the tradeoffs, and the assumptions, not just the implementation defects. That is
@@ -55,9 +124,12 @@ protect earlier work is the one failure mode this stage exists to prevent.
 
 Run this stage before every deploy, and always when a change touches: `control-safety.js`,
 `client-control-safety.js`, the arm/disarm or framing paths in `pwm_mavproxy_servo.js`, any
-`*_timeout_ms` / `max_command_*` config value, or any of the eight safety invariants.
+`*_timeout_ms` / `max_command_*` config value, or any of the ten safety invariants.
 
 ## Output
 
-Codex's verbatim output, then the triage, then a clear recommendation: proceed to deploy,
-return to the Optimizer, or escalate.
+The reviewer's verbatim output, then the triage, then a clear recommendation: proceed to
+deploy, return to the Optimizer, or escalate.
+
+State **which reviewer ran** — `codex` or `opus-fallback` — as the first line of your report,
+and if it was the fallback, why Codex did not run.

@@ -74,6 +74,60 @@ armed; and the CA and server private keys are committed to the repository. These
 
 Newest first.
 
+### 2026-07-31 — `chore/adversarial-review-fallback`
+
+Adds the operator-requested rule: when Codex cannot run, adversarial review falls back to
+Opus 5 rather than the pipeline stalling or the stage being silently skipped.
+
+- `CLAUDE.md` pipeline stage 3 documents the fallback, defers the permitted-condition list to
+  the skill (single authority), and sets two hard limits.
+- `.claude/skills/second-opinion-validator/SKILL.md` holds the conditions: default-deny, only
+  `out of credits` / auth failure / CLI-or-plugin missing, and **a timeout is explicitly not
+  one** — foreground Codex times out on multi-file diffs, so a timeout trigger would let an
+  author reach the friendlier reviewer with no dishonesty at all.
+- **The bright line is information, not exit status:** once any Codex finding for a diff has
+  been seen, the fallback is unavailable for that diff however Codex terminated. Keying it to
+  "returned cleanly" would route crash-after-findings to a second reviewer after the author had
+  already seen the first one's objections.
+- **The fallback does not clear a change touching the ten safety invariants.** It runs and its
+  findings must be addressed, but that merge waits for Codex. `CLAUDE.md` accepts the
+  evidence-commit exemption because its alternative is *unachievable*; the alternative here is
+  *wait for credits*, which is achievable, so it does not meet the same bar. Hygiene,
+  performance and documentation work — where stalling actually hurts — is cleared normally.
+- New `.claude/agents/adversarial-reviewer.md`: Opus, isolated context, no rover access. It
+  derives the diff itself rather than trusting the dispatch prompt, must establish a green
+  `npm test` baseline before mutating anything, and follows an explicit
+  mutate / restore / verify-clean protocol.
+- Git workflow now requires a **`Reviewed-by: codex`** or **`Reviewed-by: opus-fallback`**
+  commit trailer. Prose in this file is rewritten by every later change; a commit object is not,
+  so the trailer is the only durable record of whether the gate was honoured and by whom.
+
+**Also corrected a false statement `CLAUDE.md` carried twice:** that `main` has no `test` script
+and no `test/` directory. It has both, and `npm test` passes 15/15 on `main`. That error would
+have disabled the new reviewer's highest-value check — a reviewer who believes there is no suite
+does not mutation-test.
+
+**Reviewer: `opus-fallback`.** Codex did not run; verbatim: *"Your workspace is out of credits.
+Ask your workspace owner to refill in order to continue."* This is the first exercise of the new
+rule, on the change that creates it.
+
+The fallback returned **NEEDS-ATTENTION with 10 findings, 2 HIGH**, and the whole
+minimum-to-ship set was accepted and fixed before commit: the timeout defeat path, the
+permissive enumeration, the two documents disagreeing on the trigger set, the non-binding
+safety-invariant mitigation, the read-only-versus-mutation contradiction in the agent file, the
+missing green-baseline instruction, and an invariant count reading "eight" in two files where
+`CLAUDE.md` defines ten. It also ran a real mutation test — inverting the fail-safe wire order in
+`pwm_mavproxy_servo.js` — which the suite **caught** (3 of 15 failing, by name), then restored
+the tree clean. That is evidence the fallback path does useful work, not merely that it runs.
+
+**Validation: PASS** — rover3, 2026-07-31 17:49 BST.
+**Validated SHA: `69ffc1bc2df529a408e4242070f6e074462a4fb8`** (deployed by git bundle).
+Markdown-only (`git diff --name-only main..69ffc1b` → zero runtime files), so this proves the
+rover is healthy on the deployed SHA rather than exercising new behaviour. All services active,
+`NRestarts=0`, 15/15 host tests under the rover's Node v20.19.2, zero error lines in the startup
+window, `Rover ID: 3`, `MAVProxy: Sending DISARM` on connect, `/status` OK, `socket.html` 200.
+No arming attempted; no actuation is possible with the flight battery disconnected.
+
 ### 2026-07-31 — `fix/drivetrain-change-safety`
 
 Made a drivetrain change a gated server-side transaction. Addresses the operator-reported P0

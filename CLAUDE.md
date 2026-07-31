@@ -72,10 +72,12 @@ app.js ── control-safety.js ── pwm_servo.js ─► pwm_mavproxy_servo.js
 `picar-cfg.local.json` (holds per-rover `rover_id`). Never commit machine-specific values
 to the tracked config.
 
-**Tests:** `main` has **no** `test` script and no `test/` directory — `npm test` fails. A
-24-test suite exists only on the archived `origin/archive/control-failsafe-2026-07-30`.
-`main` has no `test` script and no `test/` directory. These are host-side unit and
-source-wiring tests; they are necessary and not sufficient — see Validation.
+**Tests:** `npm test` (`node --test`) runs on `main` and passes. **Verify by running it rather
+than trusting this paragraph** — it has been wrong before, and a reviewer who believes there is
+no suite skips mutation testing, which is the highest-value check available here. A larger but
+unmerged suite also exists on the archived `origin/archive/control-failsafe-2026-07-30`. These
+are host-side unit and source-wiring tests; necessary and not sufficient — see Validation.
+There is still **no** `test/on-target/` suite (`TASKS.md`).
 
 ---
 
@@ -152,6 +154,18 @@ afterwards.
    session, plus optimizations the Auditor missed. Owns all source edits.
 3. **Second Opinion Validator** — independent adversarial review through Codex, using this
    file as its directive. Review-only; it never edits or commits.
+   **If Codex produces no findings at all because it cannot run, the review falls back to
+   Opus 5** via the `adversarial-reviewer` subagent, in isolated context with no access to the
+   authoring conversation. The stage is never skipped and no deploy proceeds without a review.
+   The permitted fallback conditions are enumerated in
+   `.claude/skills/second-opinion-validator/SKILL.md`, which is the single authority for them —
+   default-deny, and a timeout is not one of them.
+   Two hard limits. **The bright line is information, not exit status:** once you have seen any
+   Codex finding for a diff, the fallback is unavailable for that diff however Codex terminated.
+   And **the fallback does not clear a change touching the ten safety invariants** — it runs,
+   its findings must be addressed, but the merge waits for Codex. Opus reviewing Opus is the
+   same model family checking its own work, and unlike the evidence-commit exemption below, the
+   alternative here (wait for credits) is achievable. Record which reviewer ran.
 4. **DevOps Engineer** — owns all git operations. One focused branch and one focused commit
    per feature or fix. Deploys the branch to the rover over SSH.
 5. **Embedded Validator** — proves the change works **on the rover**. Only this stage can
@@ -195,7 +209,7 @@ run in isolated context also have a subagent in `.claude/agents/`.
 | --- | --- |
 | `/auditor` | Audit current state; update `TASKS.md` + `HANDOFF.md`; flag bugs, inconsistencies, improvement opportunities |
 | `/optimizer` | Implement audit findings and main-session flags; propose what the audit missed |
-| `/second-opinion-validator` | Adversarial Codex review of decisions and diffs, under this directive |
+| `/second-opinion-validator` | Adversarial review of decisions and diffs under this directive — Codex, falling back to Opus 5 when Codex cannot run |
 | `/devops-engineer` | Branches, focused commits, branch hygiene, SSH deploy, push and merge |
 | `/embedded-validator` | On-rover validation: test scripts, WebUI drive, MAVLink wire capture, service inspection |
 | `/fleet` | Summon a right-sized fleet of agents; match model tier to task complexity |
@@ -232,6 +246,10 @@ Both are tracked. They have **disjoint** content — never duplicate between the
   revertible.
 - Commit subject in the imperative, under 72 characters. The body explains *why*, plus any
   safety-invariant justification.
+- Every commit that passed the Second Opinion stage carries a
+  **`Reviewed-by: codex`** or **`Reviewed-by: opus-fallback`** trailer. Prose in `HANDOFF.md`
+  gets rewritten by every later change; a commit trailer does not, so this is the only durable
+  record of whether the gate was honoured and by which reviewer.
 - Delete local branches once merged. **Do not delete, rewrite, or force-push remote
   branches** — leave `origin` alone unless explicitly asked.
 - Merge to `main` only after an Embedded Validator pass.
