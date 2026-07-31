@@ -108,7 +108,37 @@ still correct — unbounded synchronous work reachable from a socket handler is 
 its full stop timeout — but it is a robustness fix worth ~85 ms, not the emergency it was
 recorded as. The P0 has been removed rather than reworded, because it was wrong.
 
-**Validation: PARTIAL. Deployed and exercised on rover3 at SHA `781d56a`, but NOT MERGED.**
+**Validation: PASS** — rover3, 2026-07-31 18:27 BST.
+**Validated SHA: `ba796d6b1f71d3eec22a662678b27d04c5bff901`**
+
+- *Reviewer:* `opus-fallback`. Codex did not run; verbatim: *"Your workspace is out of credits."*
+  The review returned NEEDS-ATTENTION and ran 9 mutations against the previous tip, of which
+  **5 survived** — including inversion of the drop gate at BOTH call sites, and replacing `spawn`
+  with a fully synchronous `execFileSync` while the test literally named "does not restart
+  mediamtx synchronously" still reported `ok`. Every finding on its minimum-to-ship list was
+  fixed, and **all nine mutations are now caught** (re-verified individually).
+- *Host suite:* 46/46 on-target under the rover's Node v20.19.2 (31 added by this change).
+- *Services:* all active, `NRestarts=0`, `/status` OK, WHEP 204.
+- *Fleet backoff:* progression 5→10→20→40→80→160→300 s observed live, capping and resetting
+  correctly. Idle CPU **6.90% → 3.47% of one core (2.0x)**.
+- *THE DROP PATH IS NOW VERIFIED ON HARDWARE.* rover3 was temporarily switched to
+  `stream_codec: "h264"` through the untracked per-rover overlay (mediamtx stopped to free the
+  camera; both reverted afterwards, overlay back to identity-only). A WebSocket client received
+  **165 frames / 11 keyframes / 403 kB**, confirming the path runs. With the threshold forced low,
+  the server logged `dropped 149` and `dropped 150 stale frame(s)` while the client received
+  **29 frames, all 29 keyframes** — proving the keyframe-priority rule works on real hardware:
+  deltas shed, keyframes still delivered, picture recoverable.
+- *A NEGATIVE RESULT THAT MATTERS.* With the **default** thresholds, stalling a client's socket
+  for 12 s produced **no drops at all**. This confirms finding F3 empirically: `ws.bufferedAmount`
+  counts only userspace queueing, so a multi-megabyte kernel socket buffer sits underneath the
+  threshold invisibly. On a local link the defaults are effectively unreachable. Latency is
+  bounded rather than unbounded — the mechanism is real and works when it engages — but **not by
+  the configured amount**, and on loopback it does not engage. Filed in `TASKS.md`; the fix is a
+  small `SO_SNDBUF`/`writableHighWaterMark` on the accepted socket, or gating on an enqueue
+  timestamp instead of a byte count.
+- *Not tested:* the mjpeg path on hardware (host tests only, including split-at-every-boundary).
+
+Superseded: the earlier partial validation of `781d56a`.
 
 - *Blocking reason:* the mandatory Second Opinion stage could not run — the Codex workspace is
   out of credits ("Your workspace is out of credits"). `CLAUDE.md` requires an adversarial
