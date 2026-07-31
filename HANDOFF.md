@@ -74,6 +74,64 @@ armed; and the CA and server private keys are committed to the repository. These
 
 Newest first.
 
+### 2026-07-31 — `feature/battery-and-radio-telemetry` — VALIDATED, NOT MERGED
+
+Battery, board-power and radio/link telemetry, surfaced in the controller UI, on
+`/status`, and on the Fleet Manager dashboard. Branch tip
+`667534182de9d09585e645d10d4edfea2b9c3bfd`.
+
+**This unblocked and RESOLVED a standing P0.** "Prove MAVLink read-back works on this
+Pixhawk at all" was the single highest-risk unknown on the platform: nothing had ever
+verified a parameter. It now does, live — all seven `EXPECTED_CRITICAL_PARAMS` read back,
+`missing: []`, `mismatched: {}`.
+
+Getting there required fixing the receive path, because no telemetry was reachable:
+
+- **MAVProxy forwards MAVLink v2 EXCLUSIVELY here** — measured, 1028 v2 frames and zero v1
+  in 12 s — while the parser accepted only v1. It also did **no CRC check at all**, so it
+  resynced onto chance `0xFE` bytes inside v2 payloads and occasionally announced a
+  "Pixhawk heartbeat" from pure garbage. Every frame is now CRC-verified, and the heartbeat
+  handler rejects `MAV_AUTOPILOT_INVALID` and foreign sysIds.
+- **v2 zero-trims payloads**, which is not optional to handle: a 31-byte `SYS_STATUS`
+  arrives as 17–18 bytes, a 6-byte `POWER_STATUS` as 5. Payloads are zero-extended to their
+  declared length; a missing length entry is now a load-time error, and the socket data
+  handler catches and resyncs rather than dying on an out-of-range read.
+- Every CRC_EXTRA and field offset came from pymavlink on the target, then was checked
+  against live frames — not from memory.
+
+**Validation: PASS** — rover3, 2026-07-31 21:30 BST. **Validated SHA `6675341`.**
+
+- Services active, `NRestarts=0`, 76/76 host tests on the rover's Node v20.19.2, zero parse
+  errors or out-of-range reads in the window, `socket.html` 200.
+- Live `/status`: **battery 7.188 V / 0.45 A** (stable across 4 samples, ages 24–219 ms),
+  **board rail 5.163 V, servo rail 6.014 V, flags 37** — flags decoded as 37, not the
+  36901 a naive fixed-offset read produced, so the zero-extension works.
+- `remainingPct: null` — correctly unknown, because `BATT_CAPACITY` is unset on this
+  vehicle. Voltage is the trustworthy signal, which is why `batteryWarnVolts` exists.
+- `radio: null` — correct, no SiK radio is fitted. Wi-Fi fallback reads `wlan0 66 % / −64 dBm`.
+- `autopilotHeartbeat: true`, `awaitingAutopilot: false`, journal shows
+  `Received first Pixhawk heartbeat (sys=1 MAVLink 2)` followed by seven `verified` lines.
+- Note `FRAME_CLASS` verifies as **2** — it matches `EXPECTED_CRITICAL_PARAMS`, which still
+  expects the Boat value. The wrong-frame-class task is unaffected and still open.
+
+**NOT MERGED, and why.** The fallback reviewer showed the safety assessment in the first
+draft of the commit was wrong. The parameter overlay is now gated behind a *genuine*
+autopilot heartbeat, where previously any msgid-0 frame satisfied it — and that overlay
+writes `RC_OVERRIDE_TIME=0.2`, the flight controller's own stale-override failsafe. A
+vehicle whose heartbeat never matched would keep ArduPilot's 3.0 s default: a 15× longer
+window in which stale overrides persist. That is fail-safe timing on the wire, so per
+`CLAUDE.md` a same-model-family fallback review **does not clear it**. Mitigated with a loud
+warning and an `awaitingAutopilot` flag, but **it must wait for Codex.**
+
+**Reviewer: `opus-fallback`.** Codex did not run; verbatim: *"Your workspace is out of
+credits. Ask your workspace owner to refill in order to continue."* The review returned
+NEEDS-ATTENTION with 13 findings and 11 mutations, of which **7 survived**. All confirmed
+findings were fixed and 6 of the 7 mutations are now caught. The 7th (`PARAM_VALUE` payload
+length) is unobservable: `param_type` is always non-zero, so v2 never trims that message and
+the declared length is never consulted. Notably the reviewer independently re-derived all
+five CRC_EXTRA constants from pymavlink's checksum algorithm and confirmed 50/124/185/203/220,
+which simultaneously validates every field offset and signedness choice.
+
 ### 2026-07-31 — `perf/bound-video-latency` — NOT MERGED
 
 Bounds video latency and stops the video path from starving the control path. Four focused

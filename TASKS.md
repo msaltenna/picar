@@ -114,26 +114,6 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   can move. *(Reclassified from P3 hygiene — the original priority contradicted this repo's
   own definition of P0/P1, per Codex adversarial review.)*
 
-- **Prove MAVLink read-back works on this Pixhawk at all** — on rover3 today **zero**
-  parameters verify, because `main`'s parser is v1-only (see the P1 parser entry below). Until
-  a v2-capable parser is shown to actually receive `PARAM_VALUE` from this flight controller,
-  two things are unsafe to assume: that the radio/power telemetry work can read anything, and
-  that any future arm-gating would ever open. This is the cheapest high-value experiment
-  available — cherry-pick the archived v2 parser, deploy to rover3, and confirm
-  `verified SERVO1_FUNCTION=26` and friends appear in the journal. Do it before building on
-  MAVLink receive.
-
-- **`setVideoParams` is unauthenticated, unthrottled, and still does a synchronous write** —
-  the restart it triggers is now asynchronous, but `streams/webrtc.js::setParams` still calls
-  `fs.writeFileSync` on the event loop *before* spawning, and `app.js`'s `setVideoParams` handler
-  has no arm check, no lease check, and no rate limit. Measured: 200 calls produce 200 synchronous
-  `writeFileSync` calls (1 coalesced spawn). A client looping on `setVideoParams` drives an
-  unbounded rate of synchronous filesystem writes on the event loop that carries the 20 Hz
-  override loop and the fail-safe watchdog, on SD-card-backed storage. This is the **unfixed half
-  of a P0 that `perf/bound-video-latency` deleted while fixing only the restart**; restoring it
-  here so it is not lost. Fix: `fs.promises.writeFile`, refuse video-param changes while a
-  control lease is held, and rate-limit the handler.
-
 - **Private keys are committed to the repository** — `certs/ca.key`, `certs/key.pem` are
   tracked. Anyone with repo access holds the CA that every operator device is told to
   trust, plus the rover server key. Fix: rotate the CA and server certs, purge the keys
@@ -199,6 +179,13 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **`feature/battery-and-radio-telemetry` awaits a Codex review before merge** — branch tip
+  `6675341`, validated on rover3 (battery 7.188 V live, all seven critical params verified).
+  It cannot merge under the `opus-fallback` reviewer because it changes *when* the parameter
+  overlay asserts `RC_OVERRIDE_TIME` — the flight controller's stale-override failsafe — and
+  introduces a path where it is never asserted. That is fail-safe timing, so `CLAUDE.md`
+  requires Codex. Everything else about it is done and proven.
+
 - **Re-review two changes under Codex once credits are restored** — both were cleared by the
   `opus-fallback` reviewer, which is the same model family as the author and therefore a weaker
   check. `chore/adversarial-review-fallback` (the fallback rule itself) and
@@ -221,21 +208,6 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   autopilot heartbeat seen, RC_CHANNELS_OVERRIDE streaming neutral, `/status` shape, and
   HTTP reachability of `socket.html` / `socket.io` / WHEP. Author it via the Optimizer, not
   the validator.
-
-- **`main`'s MAVLink receive path is dead in practice** — two defects that compound, both
-  observed live on rover3 and both already fixed on the archived branch:
-  1. `pwm_mavproxy_servo.js:367` accepts only `0xFE` (MAVLink v1). MAVProxy forwards v2
-     (`0xFD`) frames from a modern Pixhawk, so every `PARAM_VALUE` reply is silently
-     discarded. rover3's journal shows nine `PARAM_SET` writes followed by **zero**
-     `verified` or `WARNING` lines — the read-back verification has never once run.
-  2. `handleMessage` treats *any* HEARTBEAT as the autopilot's — no `autopilot != 8` check
-     and no `sysId` filter — so MAVProxy's own v1 GCS heartbeat satisfies it. The reassuring
-     "Received first Pixhawk heartbeat" in the log is very likely MAVProxy talking to
-     itself, not evidence the flight controller is alive.
-
-  Together these mean `main` reports a healthy, verified flight controller while having
-  confirmed nothing at all. Harmless only because nothing on `main` gates on it — which is
-  exactly what the safety branch changes.
 
 - **Critical-param verification never retries** — `pwm_mavproxy_servo.js:379` fires one
   `PARAM_REQUEST_READ` per critical param on a `setTimeout` chain. A single dropped
