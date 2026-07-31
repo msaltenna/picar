@@ -397,7 +397,8 @@
     <kbd>S</kbd> / <kbd>↓</kbd> Reverse<br>
     <kbd>A</kbd> / <kbd>←</kbd> Left &nbsp;
     <kbd>D</kbd> / <kbd>→</kbd> Right &nbsp;
-    <kbd>Space</kbd> Stop
+    <kbd>Space</kbd> Stop<br>
+    <kbd>G</kbd> Gear <span style="opacity:.6">(stops &amp; disarms first)</span>
   </div>
 
   <!-- Config modal -->
@@ -1184,6 +1185,10 @@
     let tlockFrontValue  = 1;
     let tlockRearValue   = -1;
     let controlSendInterval = null;
+    // Assigned when the joysticks are wired up further down. Default to no-ops so
+    // the drivetrain interlock is safe to call regardless of load order.
+    let resetThrottleJoystick = () => {};
+    let resetSteeringJoystick = () => {};
 
     const STEERING_DEADZONE = 0.08;
     const STEERING_EXPO     = 2.0;
@@ -1193,23 +1198,79 @@
       return sign * Math.pow((abs - STEERING_DEADZONE) / (1 - STEERING_DEADZONE), STEERING_EXPO);
     }
 
+    // ── Drivetrain-change interlock ───────────────────────────────────────────
+    //
+    // A gear or differential change drives a mechanical actuator against the
+    // drivetrain. Doing that under power shifts the transmission mid-drive,
+    // which is how a gear change ends up fighting an engaged motor. So every
+    // drivetrain change first commands neutral and disarms, and the operator
+    // must press Start again deliberately. This runs for the on-screen buttons
+    // and the keyboard shortcut alike — there must be no path that changes the
+    // drivetrain while the vehicle can move.
+    // The AUTHORITY for this interlock is the server's 'setDrivetrain' handler,
+    // which forces neutral and disarm onto the wire before moving the actuator.
+    // This function only does the local half: stop commanding motion, reset the
+    // inputs so nothing snaps back when the operator re-arms, and reflect the
+    // stopped state in the UI. It deliberately does not decide whether it is
+    // safe to shift — a browser cannot know that, and this control plane is
+    // unauthenticated so a second tab could disagree.
+    function localStopForDrivetrainChange() {
+      throttleValue = 0;
+      steeringValue = 0;
+      resetThrottleJoystick();
+      resetSteeringJoystick();
+      for (const key of Object.keys(keysDown)) delete keysDown[key];
+      stopControlSendLoop();
+      stopped = true;
+      stopBtn.textContent = 'Start';
+      stopBtn.style.background = '#333';
+      renderStatusBar();
+    }
+
+    // Request a drivetrain change and only update the UI once the server has
+    // confirmed it applied. The optimistic-toggle-then-send pattern was wrong:
+    // it left the button claiming HIGH when the server had refused.
+    function requestDrivetrain(fields, onApplied) {
+      localStopForDrivetrainChange();
+      if (!isConnected) { showDrivetrainError('not connected'); return; }
+      socket.emit('setDrivetrain', fields, (result) => {
+        if (result && result.ok) onApplied();
+        else showDrivetrainError(result && result.error ? result.error : 'refused');
+      });
+    }
+
+    function showDrivetrainError(message) {
+      stopBtn.title = `Drivetrain change failed: ${message}`;
+      stopBtn.textContent = 'Start ⚠';
+      console.warn('Drivetrain change failed:', message);
+    }
+
     function toggleShift() {
-      const btn = document.getElementById('shiftBtn');
-      if (shiftValue > 0) { shiftValue = -1; btn.textContent = 'Gear: HIGH'; btn.classList.add('high'); }
-      else                { shiftValue =  1; btn.textContent = 'Gear: LOW';  btn.classList.remove('high'); }
-      sendControlValues();
+      const next = shiftValue > 0 ? -1 : 1;
+      requestDrivetrain({ shift: next }, () => {
+        shiftValue = next;
+        const btn = document.getElementById('shiftBtn');
+        if (next < 0) { btn.textContent = 'Gear: HIGH'; btn.classList.add('high'); }
+        else          { btn.textContent = 'Gear: LOW';  btn.classList.remove('high'); }
+      });
     }
     function toggleTlockFront() {
-      const btn = document.getElementById('tlockFrontBtn');
-      if (tlockFrontValue > 0) { tlockFrontValue = -1; btn.textContent = 'F.Diff: Lock'; btn.classList.add('locked'); }
-      else                     { tlockFrontValue =  1; btn.textContent = 'F.Diff: Open'; btn.classList.remove('locked'); }
-      sendControlValues();
+      const next = tlockFrontValue > 0 ? -1 : 1;
+      requestDrivetrain({ tlock_front: next }, () => {
+        tlockFrontValue = next;
+        const btn = document.getElementById('tlockFrontBtn');
+        if (next < 0) { btn.textContent = 'F.Diff: Lock'; btn.classList.add('locked'); }
+        else          { btn.textContent = 'F.Diff: Open'; btn.classList.remove('locked'); }
+      });
     }
     function toggleTlockRear() {
-      const btn = document.getElementById('tlockRearBtn');
-      if (tlockRearValue < 0) { tlockRearValue =  1; btn.textContent = 'R.Diff: Lock'; btn.classList.add('locked'); }
-      else                    { tlockRearValue = -1; btn.textContent = 'R.Diff: Open'; btn.classList.remove('locked'); }
-      sendControlValues();
+      const next = tlockRearValue < 0 ? 1 : -1;
+      requestDrivetrain({ tlock_rear: next }, () => {
+        tlockRearValue = next;
+        const btn = document.getElementById('tlockRearBtn');
+        if (next > 0) { btn.textContent = 'R.Diff: Lock'; btn.classList.add('locked'); }
+        else          { btn.textContent = 'R.Diff: Open'; btn.classList.remove('locked'); }
+      });
     }
 
     function addButtonHandlers(id, toggleFn) {
@@ -1242,7 +1303,11 @@
       return controlMode === 'orientation' ? steeringValue : applyCurve(steeringValue);
     }
 
-    function sendControlValues() {
+    // reliable=true opts out of volatile delivery. The periodic 20 Hz stream is
+    // volatile on purpose — a dropped frame is superseded 50 ms later. But a
+    // neutral command that must land *before* a disarm is not superseded by
+    // anything, so it has to be sent reliably or it can be silently discarded.
+    function sendControlValues({ reliable = false } = {}) {
       const data = {
         throttle:    throttleValue,
         steering:    currentSteeringCommand(),
@@ -1251,7 +1316,8 @@
         tlock_rear:  tlockRearValue,
       };
       statUpBytes += JSON.stringify(data).length;
-      socket.volatile.emit('fromclient', data);
+      if (reliable) socket.emit('fromclient', data);
+      else          socket.volatile.emit('fromclient', data);
     }
 
     function startControlSendLoop() {
@@ -1377,15 +1443,31 @@
       };
       zoneEl.addEventListener('touchend',   endTouch,    { passive: false });
       zoneEl.addEventListener('touchcancel', cancelTouch, { passive: false });
+
+      // Expose the reset so a fail-safe stop can also snap the thumb back to
+      // centre. Without this the stick renders deflected while the command
+      // stream is neutral, which reads to the operator as a stuck control.
+      return () => { active = false; touchId = null; resetThumb(); };
     }
 
-    setupJoystick(joystickLeftEl,  thumbLeft,  'throttle');
-    setupJoystick(joystickRightEl, thumbRight, 'steering');
+    resetThrottleJoystick = setupJoystick(joystickLeftEl,  thumbLeft,  'throttle');
+    resetSteeringJoystick = setupJoystick(joystickRightEl, thumbRight, 'steering');
 
     // ── Keyboard controls ─────────────────────────────────────────────────────
     const keysDown = {};
     const KEY_THROTTLE_STEP = 0.05, KEY_STEERING_STEP = 0.15;
     let keyboardInterval = null;
+
+    // True when the UI, not the vehicle, should own the keystroke: a modal is
+    // open, or focus is inside a form control. Without this, typing or dragging a
+    // slider in the Video/Config modals reaches the drive controls.
+    function isUiCapturingKeys() {
+      if (configModal.classList.contains('open')) return true;
+      if (videoModal.classList.contains('open')) return true;
+      const el = document.activeElement;
+      if (!el) return false;
+      return /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(el.tagName) || el.isContentEditable;
+    }
 
     function startKeyboardLoop() {
       if (keyboardInterval) return;
@@ -1406,9 +1488,26 @@
       if (controlMode !== 'keyboard') return;
       if (e.code === 'Space') {
         e.preventDefault(); throttleValue = 0; steeringValue = 0;
-        sendControlValues(); return;
+        // An operator hitting the panic key must not have it dropped.
+        sendControlValues({ reliable: true }); return;
       }
-      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') { e.preventDefault(); toggleShift(); return; }
+      // Gear is on KeyG, not on Shift. A bare modifier is the wrong key for a
+      // mechanical gear change: Shift is held while typing, is part of habitual
+      // Shift+W "sprint" muscle memory, and auto-repeats as keydown on some
+      // platforms — which would toggle the transmission repeatedly.
+      //
+      // Guarded three ways, because an accidental gear change is a mechanical
+      // event: auto-repeat is ignored so holding G shifts once; any modifier is
+      // ignored so browser chords like Ctrl/Cmd+G do not shift; and it is ignored
+      // while a modal is open or a form control has focus, so adjusting the video
+      // sliders cannot shift the transmission.
+      if (e.code === 'KeyG') {
+        if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+        if (isUiCapturingKeys()) return;
+        e.preventDefault();
+        toggleShift();
+        return;
+      }
       if (!keysDown[e.code]) { keysDown[e.code] = true; startKeyboardLoop(); }
       if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
     });
@@ -1416,7 +1515,23 @@
 
     // ── Socket status ─────────────────────────────────────────────────────────
     socket.on('connect',    () => { isConnected = true;  renderStatusBar(); });
-    socket.on('disconnect', () => { isConnected = false; renderStatusBar(); });
+    socket.on('disconnect', () => {
+      isConnected = false;
+      // A dropped link means our commands are no longer reaching the vehicle, so
+      // stop claiming to be armed. The operator must re-arm deliberately after a
+      // reconnect rather than resuming the previous throttle.
+      if (!stopped) localStopForDrivetrainChange();
+      renderStatusBar();
+    });
+
+    // The server broadcasts this when it forces a stop — including to the tab that
+    // did not initiate it, since a drivetrain change disarms the whole vehicle and
+    // any other connected controller must stop believing it is armed.
+    socket.on('controlStopped', (event) => {
+      if (!stopped) localStopForDrivetrainChange();
+      stopBtn.title = `Stopped: ${event && event.reason ? event.reason : 'server fail-safe'}`;
+      renderStatusBar();
+    });
 
     // ── Startup ───────────────────────────────────────────────────────────────
     window.addEventListener('load', () => {

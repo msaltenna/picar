@@ -110,6 +110,14 @@ const input_timeout_ms = config.input_timeout_ms ?? 500;
 let old_throttle      = control_neutral;
 let old_steering      = control_neutral;
 let smoothed_throttle = control_neutral;
+
+// How long to wait after neutral+DISARM before moving a drivetrain actuator, so a
+// coasting vehicle has slowed. Not a confirmed stop — see the setDrivetrain
+// handler for why a timer is the honest substitute on this hardware.
+const drivetrain_settle_ms = config.drivetrain_settle_ms ?? 1000;
+// True while a drivetrain change is between its disarm and its actuation. Arming
+// is refused in that window.
+let drivetrainBusy = false;
 let logcount = 0;
 let lastAction = null;
 
@@ -122,8 +130,101 @@ io.on('connection', (socket) => {
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
 
-  socket.on('arm',    () => { console.log('ARM');    if (typeof pwm.arm    === 'function') pwm.arm();    });
-  socket.on('disarm', () => { console.log('DISARM'); if (typeof pwm.disarm === 'function') pwm.disarm(); });
+  socket.on('arm', () => {
+    // Refuse to arm while a drivetrain change is settling. Otherwise an arm
+    // arriving mid-transaction re-energises the motor while the gear actuator is
+    // still moving — the exact condition this whole path exists to prevent.
+    if (drivetrainBusy) {
+      console.error('Refusing ARM: a drivetrain change is in progress');
+      socket.emit('controlStopped', { reason: 'drivetrain-change-in-progress' });
+      return;
+    }
+    console.log('ARM');
+    if (typeof pwm.arm === 'function') pwm.arm();
+  });
+
+  // Operator stop. Goes through the fail-safe primitive so neutral is on the wire
+  // before the DISARM; calling pwm.disarm() directly transmitted DISARM first and
+  // left neutral waiting for the next periodic tick.
+  socket.on('disarm', () => { failSafeStop('operator stop'); });
+
+  // ── Drivetrain changes are a server-side operation, not a control field ─────
+  //
+  // A gear or diff-lock change moves a mechanical actuator against the
+  // drivetrain, so it must never happen while the vehicle can drive. Enforcing
+  // that in the browser is not enough: this control plane is unauthenticated, so
+  // any client — or a second browser tab racing the first — could previously
+  // send {throttle: 1, shift: -1} in one packet and shift at full throttle. The
+  // gate therefore lives here, where it cannot be bypassed, and the drivetrain
+  // fields have been removed from the ordinary 'fromclient' stream entirely.
+  //
+  // The sequence is unconditional. We do NOT trust any client's belief about
+  // whether the vehicle is stopped, and we do not trust our own: the flight
+  // controller can be armed from a previous session, across a picar restart, or
+  // by another socket. So every drivetrain change re-asserts neutral and disarm
+  // on the wire first, in that order, and only then moves the actuator.
+  socket.on('setDrivetrain', (request, acknowledge) => {
+    const reply = (result) => {
+      if (typeof acknowledge === 'function') acknowledge(result);
+      return result;
+    };
+    if (!request || typeof request !== 'object') {
+      return reply({ ok: false, error: 'malformed drivetrain request' });
+    }
+
+    const requested = {};
+    for (const name of ['shift', 'tlock_front', 'tlock_rear']) {
+      const value = request[name];
+      if (value === undefined) continue;
+      // Two-position actuators: only the endpoints are valid positions. Anything
+      // else — including 0, which is what a zero-coerced or missing field looks
+      // like — would command a half-engaged gear.
+      if (value !== 1 && value !== -1) {
+        return reply({ ok: false, error: `${name} must be exactly 1 or -1` });
+      }
+      requested[name] = value;
+    }
+    const names = Object.keys(requested);
+    if (names.length === 0) {
+      return reply({ ok: false, error: 'no drivetrain channel requested' });
+    }
+
+    if (drivetrainBusy) {
+      return reply({ ok: false, error: 'a drivetrain change is already in progress' });
+    }
+
+    const failSafe = failSafeStop('drivetrain change requested');
+    if (!failSafe.neutralSent || !failSafe.disarmSent) {
+      // The link is down, so nothing was guaranteed to reach the vehicle. Refuse
+      // to move the actuator rather than moving it on an unknown-state vehicle.
+      console.error('Refusing drivetrain change: neutral/disarm did not reach the link');
+      return reply({ ok: false, error: 'flight controller link unavailable', failSafe });
+    }
+
+    // Neutral and DISARM are on the wire, but a rover that was moving is still
+    // coasting. Shifting a mechanical gearbox against a turning driveline is what
+    // grinds it, so wait before actuating.
+    //
+    // This is a fixed dwell, not a confirmed stop: there is no wheel encoder and
+    // GPS is disabled on this vehicle (AHRS_GPS_USE=0), so zero speed cannot
+    // actually be verified. A conservative timer is the honest substitute, and the
+    // limitation is recorded in TASKS.md.
+    drivetrainBusy = true;
+    // Tell every connected controller — not just the requester — since the whole
+    // vehicle just disarmed and any other tab must stop believing it is armed.
+    io.emit('controlStopped', { reason: 'drivetrain-change' });
+    setTimeout(() => {
+      const applied = {};
+      for (const name of names) {
+        applied[name] = pwm.setServoPWM(name, requested[name]);
+        if (!applied[name]) console.error(`Driver refused ${name}=${requested[name]}`);
+      }
+      drivetrainBusy = false;
+      console.log(`Drivetrain change applied after ${drivetrain_settle_ms} ms settle: ` +
+        `${JSON.stringify(requested)}`);
+      reply({ ok: Object.values(applied).every(Boolean), applied });
+    }, drivetrain_settle_ms);
+  });
 
   socket.on('setVideoParams', (params) => {
     console.log('setVideoParams:', params);
@@ -153,23 +254,42 @@ io.on('connection', (socket) => {
 
     pwm.setServoPWM('throttle', smoothed_throttle);
     pwm.setServoPWM('steering', steeringCmd);
-    if (data.shift       !== undefined) pwm.setServoPWM('shift',       data.shift);
-    if (data.tlock_front !== undefined) pwm.setServoPWM('tlock_front', data.tlock_front);
-    if (data.tlock_rear  !== undefined) pwm.setServoPWM('tlock_rear',  data.tlock_rear);
+    // data.shift / data.tlock_* are deliberately IGNORED here. Accepting them on
+    // the continuous control stream is what let {throttle: 1, shift: -1} shift the
+    // gearbox at full throttle, and it let an unvalidated field park the actuator
+    // at mid-travel or release its override via the 65535 sentinel. Drivetrain
+    // changes now go through the 'setDrivetrain' event above, which forces neutral
+    // and disarm on the wire first. Any client still putting them here simply has
+    // no effect, which is the safe direction to fail.
 
     clearTimeout(lastAction);
     lastAction = setTimeout(() => {
-      pwm.setServoPWM('throttle', control_neutral);
-      pwm.setServoPWM('steering', control_neutral);
-      console.log(`### EMERGENCY STOP (no input for ${input_timeout_ms} ms)`);
+      // Route through the primitive so neutral reaches the wire BEFORE the
+      // disarm. Setting the channel buffer alone left the vehicle armed with the
+      // neutral value merely queued for the next 20 Hz tick.
+      failSafeStop(`no input for ${input_timeout_ms} ms`);
     }, input_timeout_ms);
   });
 });
 
+// Single entry point for every fail-safe stop, so the neutral-then-DISARM wire
+// order holds on all of them rather than only where someone remembered it.
+function failSafeStop(reason) {
+  smoothed_throttle = control_neutral;
+  old_throttle      = control_neutral;
+  old_steering      = control_neutral;
+  const result = typeof pwm.neutralizeAndDisarm === 'function'
+    ? pwm.neutralizeAndDisarm()
+    : { neutralSent: false, disarmSent: false };
+  console.error(`### FAIL-SAFE STOP (${reason}) ` +
+    `neutral=${result.neutralSent} disarm=${result.disarmSent}`);
+  return result;
+}
+
 process.on('SIGINT', () => {
-  pwm.setServoPWM('throttle', control_neutral);
-  pwm.setServoPWM('steering', control_neutral);
+  failSafeStop('process shutdown');
   stream.stop();
   console.log('\nShutting down');
-  process.exit();
+  // Give the neutral + DISARM packets a moment to flush before the process dies.
+  setTimeout(() => process.exit(), 100);
 });

@@ -23,6 +23,10 @@ const MAV_CMD_DO_SET_MODE = 176;
 // MAV_PARAM_TYPE values
 const MAV_PARAM_TYPE_REAL32 = 9;
 
+// Channels driving two-position mechanical actuators. Only the endpoints are
+// valid positions for these; see setServoPWM.
+const DISCRETE_CHANNELS = new Set(['shift', 'tlock_front', 'tlock_rear']);
+
 // Minimal Pixhawk/ArduRover overlay for this car.
 // Keep trims/endpoints in picar-config.json; only fix params that are out of line.
 // These are pushed on every MAVProxy connect so a fresh/replacement flight
@@ -98,6 +102,14 @@ class PWMMavproxy {
       tlock_rear: 4   // RC channel 5 (0-indexed)
     };
 
+    // Remembered so a fail-safe can restore motion channels to the SAME values
+    // the driver booted with, rather than recomputing a midpoint that may not
+    // match this vehicle's configured trim.
+    this.channelNeutralUs = {
+      steering: this.channels[0],
+      throttle: this.channels[2],
+    };
+
     this.rate_hz = config.mavproxy_rate_hz || 20;
     this.interval = null;
     this.heartbeatInterval = null;
@@ -109,7 +121,11 @@ class PWMMavproxy {
       `(neutral=${this.legacyInputScale ? this.pwm_neutral : 0})`
     );
 
-    this.startServer();
+    // Opening the MAVProxy socket in the constructor makes the driver impossible
+    // to exercise on a host: the pending connection keeps the process alive and a
+    // test runner hangs. Default is unchanged (connect), so this is inert in
+    // production and only lets tests construct the driver without a link.
+    if (config.mavproxy_autostart !== false) this.startServer();
   }
 
   startServer() {
@@ -124,6 +140,13 @@ class PWMMavproxy {
       this.pixhawkHeartbeatSeen = false;
       this.paramOverlayApplied = false;
       this.startHeartbeat();
+
+      // A reconnect must never inherit an armed vehicle. ArduPilot arm state
+      // survives a picar restart, a crash, and a companion-computer reboot — this
+      // flight controller has been observed sitting armed with no operator
+      // connected. So put neutral and DISARM on the link BEFORE starting the
+      // override stream, and make the operator re-arm deliberately.
+      this.neutralizeAndDisarm();
       this.startLoop();
     });
 
@@ -147,14 +170,39 @@ class PWMMavproxy {
     });
   }
 
+  // Returns true only if the bytes were handed to the socket. A fail-safe that
+  // cannot report a failed write is indistinguishable from one that worked.
   sendPacket(buf) {
-    if (this.client && !this.client.destroyed) {
-      try {
-        this.client.write(buf);
-      } catch (e) {
-        console.error('TCP write error:', e.message);
-      }
+    if (!this.client || this.client.destroyed) return false;
+    try {
+      this.client.write(buf);
+      return true;
+    } catch (e) {
+      console.error('TCP write error:', e.message);
+      return false;
     }
+  }
+
+  // Fail-safe ordering is a property of the WIRE, not of call order.
+  //
+  // setServoPWM only mutates the channel buffer — it transmits nothing, and the
+  // value does not leave until the next 20 Hz tick. So "set neutral, then
+  // disarm()" actually puts DISARM on the link FIRST and neutral up to 50 ms
+  // later, which is the reverse of the intent. Socket.IO event ordering on the
+  // client does not help; the reordering happens here, below it.
+  //
+  // This transmits an explicit neutral RC_CHANNELS_OVERRIDE packet and only then
+  // the DISARM, on the same socket, in that order. Both results are reported so
+  // a caller can tell a real fail-safe from a silently failed one.
+  neutralizeAndDisarm() {
+    this.channels[this.channelMap.throttle] = this.channelNeutralUs.throttle;
+    this.channels[this.channelMap.steering] = this.channelNeutralUs.steering;
+    const neutralSent = this.sendPacket(this.buildRCOverride());
+    // Propagate the real result. An earlier version used `disarmed !== false`,
+    // which reported success when disarm() returned undefined — exactly the
+    // silent-failure pattern this is meant to eliminate.
+    const disarmSent = this.disarm() === true;
+    return { neutralSent, disarmSent };
   }
 
   scale(value) {
@@ -177,10 +225,41 @@ class PWMMavproxy {
     return Math.round(midpoint + outputHalfRange * normalized);
   }
 
+  // Returns true when the channel buffer was updated, false when the command was
+  // refused. A silent refusal on the motion path is not acceptable: the caller
+  // must be able to tell "applied" from "dropped".
+  //
+  // Note this only mutates the channel buffer — it transmits nothing. The value
+  // goes out on the next RC_CHANNELS_OVERRIDE tick.
   setServoPWM(name, value) {
     const ch = this.channelMap[name];
-    if (ch === undefined) return;
-    this.channels[ch] = this.clamp(this.scale(value), this.min_us, this.max_us);
+    if (ch === undefined) return false;
+
+    // Validate the RAW input, not just the scaled result. `[]` and `null` both
+    // coerce to 0 and would scale to a perfectly finite mid-travel value, so
+    // checking only the output would let a malformed field move a mechanical
+    // actuator to the middle of its range. Don't trust the caller to have
+    // filtered: this is the last gate before the channel buffer.
+    if (!Number.isFinite(value)) return false;
+
+    // Drivetrain channels drive two-position mechanical actuators — a gear
+    // selector and diff locks. There is no such thing as "half a gear": any
+    // value between the endpoints parks the shift fork between gears, which
+    // grinds or jams the transmission. So these accept ONLY the endpoints,
+    // unlike throttle and steering which are genuinely continuous. Note this
+    // rejects 0, which is what a missing or zero-coerced field looks like.
+    if (DISCRETE_CHANNELS.has(name) && value !== 1 && value !== -1) return false;
+
+    // scale() is arithmetic, so a non-numeric input yields NaN. A Uint16Array
+    // silently stores NaN as 0, and buildRCOverride maps 0 to the 65535
+    // "ignore this field" sentinel — so an unvalidated value would quietly
+    // release the channel's override instead of setting it. Reject it here so
+    // the buffer can never hold a value nobody asked for.
+    const scaled = this.scale(value);
+    if (!Number.isFinite(scaled)) return false;
+
+    this.channels[ch] = this.clamp(scaled, this.min_us, this.max_us);
+    return true;
   }
 
   clamp(v, lo, hi) {
@@ -464,18 +543,33 @@ class PWMMavproxy {
     // Set mode to MANUAL (mode number 0 for ArduRover MANUAL)
     // MANUAL mode = 0, but must include proper base mode flag
     this.sendPacket(this.buildCommandLong(MAV_CMD_DO_SET_MODE, 1, 0));
-    // Arm: MAV_CMD_COMPONENT_ARM_DISARM param1=1 (arm), param2=21196 (force)
-    setTimeout(() => {
+
+    // The ARM itself is deferred so the mode change lands first. The handle is
+    // TRACKED: an untracked timer here meant a disarm could not cancel a pending
+    // arm, so a fail-safe would send DISARM and then the vehicle would re-arm
+    // itself a moment later with no operator action at all.
+    if (this.armTimeout) clearTimeout(this.armTimeout);
+    this.armTimeout = setTimeout(() => {
+      this.armTimeout = null;
+      // Arm: MAV_CMD_COMPONENT_ARM_DISARM param1=1 (arm), param2=21196 (force)
       this.sendPacket(this.buildCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, 1, 21196));
       console.log('MAVProxy: ARM command sent');
-    }, 500);
+    }, this.armDelayMs);
+    return true;
   }
 
-  // Disarm the vehicle
+  // Disarm the vehicle. Returns whether the DISARM packet reached the socket, so
+  // callers can distinguish a real disarm from a silently failed one.
   disarm() {
     console.log('MAVProxy: Sending DISARM...');
+    // Cancel any pending arm first, or it would fire after this disarm.
+    if (this.armTimeout) {
+      clearTimeout(this.armTimeout);
+      this.armTimeout = null;
+      console.log('MAVProxy: cancelled a pending ARM');
+    }
     // Disarm: param1=0 (disarm), param2=21196 (force)
-    this.sendPacket(this.buildCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, 0, 21196));
+    return this.sendPacket(this.buildCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, 0, 21196));
   }
 }
 

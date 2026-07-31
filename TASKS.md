@@ -37,42 +37,23 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   its stops" was wrong and is withdrawn. Servo overtravel remains a *speculative* hypothesis
   needing a loaded bench sweep on a geared rover, not a supported one.
 
-  *Remaining hypotheses, all requiring a geared rover to discriminate:* shifting under load
-  jamming the transmission or stalling the shift servo; an ESC fault latch; or the two
-  verified software defects below (no interlock, unvalidated input) putting the gearbox into a
-  bad state.
+  *Fixed and validated on rover3 (2026-07-31, SHA `c6043d7`):* the two software defects that
+  could put the gearbox into a bad state are gone. A gear change is now a gated server-side
+  transaction — neutral+DISARM on the wire, a settle dwell, then actuate — and non-endpoint
+  values are refused. Verified on the wire: `SERVO_OUTPUT_RAW` servo2 moved 1000<->2000 while
+  servo3 (throttle) held 1500, and every RC_OVERRIDE preceding a DISARM carried neutral.
+
+  *Still unconfirmed, which is why this stays open:* nothing yet explains why throttle STAYS
+  engaged on the geared rovers. The remaining hypotheses need a geared rover — shifting under
+  load jamming the transmission or stalling the shift servo, or an ESC fault latch. The fix
+  removes the software paths that could trigger it; it does not prove they were the cause.
+  **The operator must confirm on rover1 or rover2.**
 
   **Blocker: it is unknown what code the geared rovers actually run.** rover3 was found on a
   stale divergent branch with hand-copied files and an unresolved merge conflict, so assuming
   rover1/rover2 track `main` is unsafe. Get `git rev-parse HEAD` + `git status --porcelain`
   from both before designing a fix. `rover3` has no gearbox, so the mechanical hypotheses
   cannot be tested there at all.
-
-- **A gear change has no interlock whatsoever on `main`** — `socket.html:1411` binds
-  **ShiftLeft/ShiftRight** straight to `toggleShift()`, and keyboard is the default control
-  mode on every non-touch device. `toggleShift()` on `main` flips the gear and immediately
-  calls `sendControlValues()` — no neutral, no stop, no disarm, no speed check
-  (`interlock refs on main: 0`). So pressing the Shift key while driving at full throttle
-  shifts the gearbox instantly. This is exactly the operator's "put into high gear while
-  driving". The only drivetrain interlock that ever existed
-  (`requireNeutralForDrivetrainChange` → stop + disarm + reset inputs) lives solely on the
-  archived branch and has never been deployed. Note the binding dates to `810d2e8`
-  (2026-02-24), five months old, so it does **not** by itself explain "started recently".
-  Fix: require neutral-and-stopped before any drivetrain change, and stop binding a bare
-  modifier key to a mechanical gear shift.
-
-- **Unvalidated `shift` / `tlock_*` input reaches the servo channel raw** — `app.js:137-140`
-  guards `throttle` and `steering` with `Number.isFinite`, but `:156-158` pass `data.shift`,
-  `data.tlock_front` and `data.tlock_rear` straight into `setServoPWM` behind only an
-  `!== undefined` check. Verified empirically against `main`'s own driver: `shift: []` or
-  `shift: null` drives the gear servo to **1500 µs — mid-travel, a half-engaged gear**, while
-  `shift: "abc"`, `{}` or `NaN` yields `channels[1] = 0`, which `buildRCOverride` converts to
-  **65535 = MAVLink "ignore this field"**, so ArduPilot stops refreshing that override and it
-  lapses after `RC_OVERRIDE_TIME`. Any client — and there is no authentication — can do this
-  with one malformed JSON field. `main`'s `setServoPWM` also returns `undefined` in every
-  case, so no caller can distinguish applied from dropped (violates safety invariant 10).
-  Fix: validate every channel identically, reject non-finite input, and return an explicit
-  applied/dropped result.
 
 - **Drop latent frames so the video stream and C2 stop stalling** — operator-reported.
   Bound latency in the video path and stop it propagating into the control link. Related
@@ -99,18 +80,24 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   take the new frame class. This is also a live suspect in the gear/throttle defect above,
   since Boat mixing may route a channel differently than Rover mixing.
 
-- **Fail-safe sends DISARM before neutral on the wire** — `control-safety.js::_failSafe`
-  calls `_neutralize()`, but `setServoPWM` only mutates the driver's channel buffer and
-  transmits nothing; `pwm_mavproxy_servo.js::disarm()` then sends COMMAND_LONG DISARM
-  immediately, while the neutral RC_CHANNELS_OVERRIDE waits for the next 20 Hz tick
-  (`pwm_mavproxy_servo.js:278`). So the actual packet order is **disarm, then neutral** —
-  the reverse of what the code reads like, what `README.md` claims, and what this file
-  previously claimed. Impact is bounded: ≤50 ms of stale override, with the flight
-  controller's `RC_OVERRIDE_TIME=0.2` as a backstop — hence P1, not P0. But the existing
-  tests assert *method-call* order against a mock and therefore cannot see it. Fix: send an
-  explicit neutral RC override packet before DISARM, and cover it with a host test that
-  asserts packet order plus an on-target capture. Correct the `README.md` claim too.
-  *(Found by Codex adversarial review, 2026-07-30; verified against the source.)*
+- **Fail-safe wire order is fixed on the server; three residuals remain** — as of `c6043d7`,
+  operator stop, input timeout, process shutdown, MAVProxy reconnect and drivetrain changes all
+  route through `pwm_mavproxy_servo.js::neutralizeAndDisarm()`, which transmits a neutral
+  RC_CHANNELS_OVERRIDE packet and only then COMMAND_LONG DISARM. Verified live on rover3: every
+  RC_OVERRIDE packet preceding a DISARM carried neutral throttle. Still open:
+  1. **A successful `write()` is not proof of delivery.** `sendPacket` reports that bytes
+     reached the socket, not that MAVProxy forwarded them or the Pixhawk acted. Real
+     confirmation needs COMMAND_ACK tracking, which nothing parses yet — and cannot, until the
+     v1-only receive path is fixed (see the P1 parser entry).
+  2. **No confirmed stop before actuating a drivetrain change.** `drivetrain_settle_ms`
+     (default 1000) is a conservative dwell, not evidence the vehicle stopped. No wheel encoder
+     and GPS is disabled (`AHRS_GPS_USE=0`), so zero speed cannot be verified. Needs a speed
+     source to close properly.
+  3. **`app.js`'s Socket.IO handlers have no host test harness**, so arm-refusal, the settle
+     dwell, and fromclient-ignores-shift are covered only by an on-target integration check,
+     not by `npm test`. A mutation breaking the `disarm` handler did not fail the suite.
+  4. `socket.html`'s own stop paths still emit `disarm` and rely on the server primitive; that
+     is correct today but means the client has no independent guarantee.
 
 - **Orientation control has no throttle deadzone — uncommanded motion** — `socket.html:1409`
   maps device tilt straight to throttle via `(45 - beta) / 50` with no deadzone and no
