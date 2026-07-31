@@ -7,7 +7,7 @@
 
 const fs   = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { spawn } = require('child_process');
 
 function generateMediaMTXConfig(cfg, params) {
   const port    = cfg.webrtc_port     || 8889;
@@ -82,9 +82,41 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
   console.log(`WebRTC: WHEP at ${PROTOCOL}://<host>:${PORT}/${PATH_NAME}/whep`);
   console.log(`WebRTC: ${params.width}×${params.height}@${params.fps}fps ${params.bitrate}kbps`);
 
+  // Restart state. A restart takes seconds, and the operator can drag a slider
+  // several times in that window; coalesce instead of queueing N restarts, and
+  // never run two at once.
+  let restarting     = false;
+  let restartQueued  = false;
+  let restartChild   = null;
+
+  function restartMediamtx() {
+    restarting = true;
+    restartQueued = false;
+    console.log('WebRTC: restarting mediamtx…');
+    // spawn, not exec: no shell, and no buffering of output we do not read.
+    restartChild = spawn('systemctl', ['restart', 'mediamtx'], { stdio: 'ignore' });
+    restartChild.on('error', (e) => {
+      console.error('WebRTC: mediamtx restart failed to spawn:', e.message);
+      restarting = false;
+      restartChild = null;
+    });
+    restartChild.on('close', (code) => {
+      restartChild = null;
+      restarting = false;
+      if (code === 0) console.log('WebRTC: mediamtx restarted');
+      else console.error(`WebRTC: mediamtx restart exited ${code}`);
+      // Apply whatever the operator settled on while this restart was running.
+      if (restartQueued) restartMediamtx();
+    });
+  }
+
   return {
     clientCount() { return 0; },
-    stop() {},
+    stop() {
+      // Do not leave a restart child behind on shutdown.
+      if (restartChild) { restartChild.kill('SIGTERM'); restartChild = null; }
+      restartQueued = false;
+    },
 
     setParams(newParams) {
       if (newParams.width      !== undefined) params.width      = newParams.width;
@@ -93,13 +125,19 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
       if (newParams.bitrate    !== undefined) params.bitrate    = newParams.bitrate;
       if (newParams.idr_period !== undefined) params.idr_period = newParams.idr_period;
       writeYml();
-      try {
-        console.log('WebRTC: restarting mediamtx…');
-        execSync('systemctl restart mediamtx', { stdio: 'inherit' });
-        console.log('WebRTC: mediamtx restarted');
-      } catch (e) {
-        console.error('WebRTC: mediamtx restart failed:', e.message);
+
+      // ASYNCHRONOUS on purpose. This used to be execSync, which blocks the Node
+      // event loop for the whole duration of a systemd unit restart — seconds.
+      // Everything else in this process stops during that: the Socket.IO control
+      // stream, the 20 Hz RC override loop, and every fail-safe timer. So changing
+      // a video slider could freeze the control path while the vehicle was armed
+      // and moving. A video setting must never be able to stall C2.
+      if (restarting) {
+        console.log('WebRTC: mediamtx restart already in flight, coalescing');
+        restartQueued = true;
+        return;
       }
+      restartMediamtx();
     },
 
     getStreamConfig() {
