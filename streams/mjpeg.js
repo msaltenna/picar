@@ -6,7 +6,75 @@ const { spawn, execSync } = require('child_process');
 const JPEG_START = Buffer.from([0xff, 0xd8]);
 const JPEG_END   = Buffer.from([0xff, 0xd9]);
 
-module.exports = function createMjpegStream(config, streamServer) {
+// Skip a frame for a client that has not drained the previous ones. Exported so
+// the rule is tested directly rather than reimplemented in a test.
+function shouldSkipFrame(writableLength, dropBytes) {
+  return writableLength > dropBytes;
+}
+
+// Write one frame to every client, skipping any that has not drained the previous
+// ones. Mutates `clients` in place to drop ended/errored ones. Returns the number
+// of clients the frame was skipped for.
+//
+// Extracted and exported deliberately: with this loop inlined, mutation testing
+// showed that inverting the skip gate left the whole suite green — only the pure
+// predicate was covered, not the code that decides anything.
+//
+// MJPEG frames are independently decodable, so a skipped frame costs nothing but
+// smoothness; there is no keyframe dependency to break. Writing regardless let a
+// client slower than the camera accumulate unbounded backlog in Node's socket
+// buffer, so latency grew without limit and memory grew with it.
+function writeFrameToClients(clients, frame, dropBytes) {
+  const hdr = `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`;
+  let dropped = 0;
+  for (let i = clients.length - 1; i >= 0; i--) {
+    const c = clients[i];
+    if (c.writableEnded) { clients.splice(i, 1); continue; }
+    if (shouldSkipFrame(c.writableLength, dropBytes)) {
+      dropped++;
+      continue;
+    }
+    try {
+      c.write(hdr);
+      c.write(frame);
+      c.write('\r\n');
+    } catch (_) { clients.splice(i, 1); }
+  }
+  return dropped;
+}
+
+// Append a chunk and emit every complete JPEG in it, returning the leftover buffer.
+//
+// Exported so the framing is testable: the buffer cap and the split-SOI handling
+// both live here, and neither was reachable from a test while this was inlined in
+// the camera stdout handler.
+function extractJpegFrames(buf, chunk, maxBuffer, onFrame) {
+  buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+  // A wedged camera that never emits an end-of-image marker would otherwise grow
+  // this without limit until the process dies. Resyncing is always recoverable:
+  // each JPEG is independently decodable, so the next complete one restores video.
+  if (buf.length > maxBuffer) {
+    console.error(`MJPEG: buffer exceeded ${maxBuffer} bytes — resyncing`);
+    return Buffer.alloc(0);
+  }
+  while (true) {
+    const s = buf.indexOf(JPEG_START);
+    if (s === -1) {
+      // Retain the trailing byte. JPEG_START is two bytes (ff d8), so a chunk
+      // boundary can fall between them; discarding the whole buffer here threw the
+      // leading `ff` away and silently lost the frame. Same defect as the one fixed
+      // in the h264 NAL parser — it was present in both.
+      return buf.length > 1 ? buf.subarray(buf.length - 1) : buf;
+    }
+    if (s > 0) buf = buf.subarray(s);
+    const e = buf.indexOf(JPEG_END, 2);
+    if (e === -1) return buf;
+    onFrame(buf.subarray(0, e + 2));
+    buf = buf.subarray(e + 2);
+  }
+}
+
+function createMjpegStream(config, streamServer) {
   let WIDTH   = config.mjpeg_width     || 480;
   let HEIGHT  = config.mjpeg_height    || 360;
   let FPS     = config.mjpeg_framerate || 12;
@@ -21,18 +89,33 @@ module.exports = function createMjpegStream(config, streamServer) {
   console.log(`MJPEG camera command: ${cameraCmd || '(none found)'}`);
 
   let clients    = [];   // HTTP response objects
-  let cameraProc = null;
-  let jpegBuf    = Buffer.alloc(0);
+  let cameraProc    = null;
+  let jpegBuf       = Buffer.alloc(0);
+  let droppedFrames = 0;
+  let lastDropLog   = 0;
+
+  // One 480x360 JPEG at quality 20 is roughly 15-25 kB, so this is about two
+  // frames of slack before we start dropping.
+  const DROP_BYTES = config.mjpeg_drop_bytes ?? 64 * 1024;
+  // A wedged camera that never emits an end-of-image marker would otherwise grow
+  // jpegBuf without limit.
+  const MAX_JPEG_BUFFER = config.mjpeg_max_buffer_bytes ?? 4 * 1024 * 1024;
 
   function clientCount() { return clients.length; }
 
   function broadcast(frame) {
-    const hdr = `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`;
-    for (let i = clients.length - 1; i >= 0; i--) {
-      const c = clients[i];
-      try { if (!c.writableEnded) { c.write(hdr); c.write(frame); c.write('\r\n'); } }
-      catch (_) { clients.splice(i, 1); }
-    }
+    droppedFrames += writeFrameToClients(clients, frame, DROP_BYTES);
+    logDropsIfDue();
+  }
+
+  // A silent drop looks exactly like a stall to whoever is debugging it.
+  function logDropsIfDue() {
+    if (droppedFrames === 0) return;
+    const now = Date.now();
+    if (now - lastDropLog < 5000) return;
+    lastDropLog = now;
+    console.log(`MJPEG: dropped ${droppedFrames} stale frame(s) to bound latency`);
+    droppedFrames = 0;
   }
 
   function stop() {
@@ -63,16 +146,7 @@ module.exports = function createMjpegStream(config, streamServer) {
 
     cameraProc.stdout.on('data', (chunk) => {
       if (!gotFirst) { gotFirst = true; console.log('MJPEG: stream live'); }
-      jpegBuf = Buffer.concat([jpegBuf, chunk]);
-      while (true) {
-        const s = jpegBuf.indexOf(JPEG_START);
-        if (s === -1) { jpegBuf = Buffer.alloc(0); break; }
-        if (s > 0) jpegBuf = jpegBuf.subarray(s);
-        const e = jpegBuf.indexOf(JPEG_END, 2);
-        if (e === -1) break;
-        broadcast(jpegBuf.subarray(0, e + 2));
-        jpegBuf = jpegBuf.subarray(e + 2);
-      }
+      jpegBuf = extractJpegFrames(jpegBuf, chunk, MAX_JPEG_BUFFER, broadcast);
     });
 
     cameraProc.stderr.on('data', (d) => console.log('MJPEG camera:', d.toString().trim()));
@@ -130,3 +204,8 @@ module.exports = function createMjpegStream(config, streamServer) {
     },
   };
 };
+
+module.exports = createMjpegStream;
+module.exports.shouldSkipFrame = shouldSkipFrame;
+module.exports.writeFrameToClients = writeFrameToClients;
+module.exports.extractJpegFrames = extractJpegFrames;

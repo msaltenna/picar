@@ -12,44 +12,94 @@ const { WebSocket, WebSocketServer } = require('ws');
 //
 // WebCodecs EncodedVideoChunk for a 'key' frame must include the SPS+PPS so
 // the decoder can (re)configure itself — hence the grouping.
+// A single access unit at 640x480/600 kbps is a few KB; 4 MB means something is
+// badly wrong, so resync rather than grow without bound.
+const MAX_NAL_BUFFER = 4 * 1024 * 1024;
+
 class NalParser {
   constructor(onPacket) {
     this.buf      = Buffer.alloc(0);
     this.pending  = [];
+    this.scanned  = 0;
+    this.scanBytes = 0;
     this.onPacket = onPacket;
   }
 
   push(chunk) {
-    this.buf = Buffer.concat([this.buf, chunk]);
+    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
+    // Bound the buffer. Without this, a camera producing bytes that never contain
+    // a second start code (a wedged encoder, or a stream we fail to parse) grows
+    // this buffer without limit until the process dies. Dropping back to a
+    // resync is always recoverable — the next keyframe restores the picture.
+    if (this.buf.length > MAX_NAL_BUFFER) {
+      console.error(`H264: NAL buffer exceeded ${MAX_NAL_BUFFER} bytes — resyncing`);
+      this.reset();
+      return;
+    }
     while (this._extractOne()) { /* drain */ }
   }
 
-  reset() { this.buf = Buffer.alloc(0); this.pending = []; }
+  reset() { this.buf = Buffer.alloc(0); this.pending = []; this.scanned = 0; }
 
+  // Instrumentation note: `scanBytes` accumulates the bytes actually examined
+  // across all scans. Without it the incremental-frontier optimisation is
+  // invisible to tests — defeating it changes cost, not output, so no behavioural
+  // assertion can catch it. Cost is one arithmetic op per call, not per byte.
   _findSC(from) {
     const b = this.buf;
-    for (let i = from; i < b.length - 2; i++) {
+    const end = b.length - 2;
+    let i = from;
+    for (; i < end; i++) {
       if (b[i] !== 0 || b[i + 1] !== 0) continue;
-      if (b[i + 2] === 1)                               return { pos: i, len: 3 };
-      if (i + 3 < b.length && b[i + 2] === 0 && b[i + 3] === 1) return { pos: i, len: 4 };
+      if (b[i + 2] === 1) {
+        this.scanBytes += i - from + 1;
+        return { pos: i, len: 3 };
+      }
+      if (i + 3 < b.length && b[i + 2] === 0 && b[i + 3] === 1) {
+        this.scanBytes += i - from + 1;
+        return { pos: i, len: 4 };
+      }
     }
+    this.scanBytes += Math.max(0, i - from);
     return null;
   }
 
   _extractOne() {
+    // `scanned` remembers how far we already searched without finding a second
+    // start code, so a partially-received NAL is not rescanned from byte 0 on
+    // every chunk. That rescan made this O(n^2) in the size of an access unit,
+    // on the per-frame hot path.
     const sc1 = this._findSC(0);
-    if (!sc1) { this.buf = Buffer.alloc(0); return false; }
+    if (!sc1) {
+      // No start code yet. KEEP the trailing 3 bytes: a 4-byte start code can
+      // straddle a chunk boundary, and discarding the whole buffer here — which
+      // is what this did — threw those bytes away and corrupted the framing of
+      // the next access unit. Three is the most that can be pending, since a
+      // 4-byte start code with its last byte still unreceived is 3 bytes long.
+      if (this.buf.length > 3) this.buf = this.buf.subarray(this.buf.length - 3);
+      this.scanned = 0;
+      return false;
+    }
 
     const nalStart = sc1.pos + sc1.len;
-    const sc2      = this._findSC(nalStart + 1);
+    const resumeAt = Math.max(nalStart + 1, this.scanned);
+    const sc2      = this._findSC(resumeAt);
     if (!sc2) {
-      if (sc1.pos > 0) this.buf = this.buf.slice(sc1.pos);
+      if (sc1.pos > 0) {
+        this.buf = this.buf.slice(sc1.pos);
+        // Keep `scanned` relative to the new buffer start, minus the 3-byte
+        // overlap a start code could straddle.
+        this.scanned = Math.max(0, this.buf.length - 3);
+      } else {
+        this.scanned = Math.max(0, this.buf.length - 3);
+      }
       return false;
     }
 
     const rawNal  = this.buf.slice(sc1.pos, sc2.pos);
     const nalType = this.buf[nalStart] & 0x1f;
     this.buf = this.buf.slice(sc2.pos);
+    this.scanned = 0;
 
     switch (nalType) {
       case 7:  // SPS
@@ -77,8 +127,50 @@ class NalParser {
   }
 }
 
+// Whether a frame is worth sending to a client with `backlog` bytes still queued.
+//
+// Keyframes survive a delta-level backlog because dropping them leaves the client
+// unable to resync at all; only a hard backlog drops everything. Named and
+// exported so the rule itself is testable — a copy of it in a test would not
+// catch an inverted comparison here.
+function shouldSendFrame(isKeyframe, backlog, dropDeltaBytes, dropAllBytes) {
+  if (backlog > dropAllBytes) return false;
+  if (!isKeyframe && backlog > dropDeltaBytes) return false;
+  return true;
+}
+
+// Send one packet to every open client, dropping it for any client that is backed
+// up. Returns the number of clients it was dropped for.
+//
+// Extracted and exported deliberately: mutation testing showed that with this loop
+// inlined in broadcast(), inverting the drop gate left the whole suite green. Only
+// the pure predicate was covered, so the code that actually decides anything was
+// unverified. Tests now drive this with fake clients.
+//
+// Why drop at all: on a link slower than the encoder, bufferedAmount grows without
+// bound, so the client falls progressively further behind real time and the
+// server's memory grows with it. For teleoperation a late frame is worthless — the
+// operator needs to see *now*, not a faithful replay of ten seconds ago.
+//
+// Keyframes survive a delta-level backlog because dropping them leaves the client
+// unable to resync at all; only a hard backlog drops everything.
+function fanOutToClients(clients, pkt, isKeyframe, opts) {
+  const { dropDeltaBytes, dropAllBytes, openState } = opts;
+  let dropped = 0;
+  for (const ws of clients) {
+    if (ws.readyState !== openState) continue;
+    if (!shouldSendFrame(isKeyframe, ws.bufferedAmount, dropDeltaBytes, dropAllBytes)) {
+      dropped++;
+      continue;
+    }
+    try { ws.send(pkt, { binary: true }); }
+    catch (_) { clients.delete(ws); }
+  }
+  return dropped;
+}
+
 // ── Module factory ────────────────────────────────────────────────────────────
-module.exports = function createH264Stream(config, streamServer) {
+function createH264Stream(config, streamServer) {
   let WIDTH   = config.h264_width        || 640;
   let HEIGHT  = config.h264_height       || 480;
   let FPS     = config.h264_framerate    || 30;
@@ -99,10 +191,39 @@ module.exports = function createH264Stream(config, streamServer) {
   // This prevents WebCodecs from seeing a delta frame before any key frame.
   const wsClients = new Set();
   const wsPending = new Set();
-  let frameCount  = 0;
-  let cameraProc  = null;
+  let frameCount    = 0;
+  let cameraProc    = null;
+  let droppedFrames = 0;
+  let lastDropLog   = 0;
+
+  // Latency budget expressed in queued bytes, because that is what a WebSocket can
+  // report.
+  //
+  // Do NOT read these as a time budget. `ws.bufferedAmount` counts only USERSPACE
+  // queueing (`_writableState.length + _sender._bufferedBytes`); bytes already
+  // handed to the kernel vanish from it. With tcp_wmem autotuning to 4 MB, a
+  // measurement on a paused receiver accepted ~2.7 MB before this threshold tripped
+  // at all — tens of seconds of video at 600 kbps, invisible here. So these bound
+  // latency rather than leaving it unbounded, but the bound is "kernel buffer plus
+  // this", not "this". Making it a real time bound needs either a small
+  // writableHighWaterMark/SO_SNDBUF on the accepted socket so bufferedAmount becomes
+  // meaningful, or an enqueue-timestamp check instead of a byte count (TASKS.md).
+  const DROP_DELTA_BYTES = config.h264_drop_delta_bytes ?? 48 * 1024;
+  const DROP_ALL_BYTES   = config.h264_drop_all_bytes   ?? 200 * 1024;
 
   function clientCount() { return wsClients.size + wsPending.size; }
+
+  // Report drops periodically. A silent drop is indistinguishable from a stall,
+  // and the whole point of this change is that the operator can tell the
+  // difference between "the link is slow" and "the stream is broken".
+  function logDropsIfDue() {
+    if (droppedFrames === 0) return;
+    const now = Date.now();
+    if (now - lastDropLog < 5000) return;
+    lastDropLog = now;
+    console.log(`H264: dropped ${droppedFrames} stale frame(s) to bound latency`);
+    droppedFrames = 0;
+  }
 
   function broadcast(data, isKeyframe) {
     if (!wsClients.size && !wsPending.size) return;
@@ -112,12 +233,13 @@ module.exports = function createH264Stream(config, streamServer) {
     frameCount = (frameCount + 1) >>> 0;
     const pkt = Buffer.concat([hdr, data]);
 
-    for (const ws of wsClients) {
-      if (ws.readyState === WebSocket.OPEN) {
-        try { ws.send(pkt, { binary: true }); }
-        catch (_) { wsClients.delete(ws); }
-      }
-    }
+    droppedFrames += fanOutToClients(wsClients, pkt, isKeyframe, {
+      dropDeltaBytes: DROP_DELTA_BYTES,
+      dropAllBytes:   DROP_ALL_BYTES,
+      openState:      WebSocket.OPEN,
+    });
+
+    logDropsIfDue();
 
     if (isKeyframe && wsPending.size) {
       for (const ws of wsPending) {
@@ -246,3 +368,13 @@ module.exports = function createH264Stream(config, streamServer) {
     },
   };
 };
+
+module.exports = createH264Stream;
+// Exported for tests: the framing parser and the frame-drop rule are the two
+// pieces most likely to regress silently, so they are exercised directly rather
+// than through a reimplementation.
+module.exports.NalParser = NalParser;
+module.exports.shouldSendFrame = shouldSendFrame;
+module.exports.fanOutToClients = fanOutToClients;
+module.exports.MAX_NAL_BUFFER = MAX_NAL_BUFFER;
+

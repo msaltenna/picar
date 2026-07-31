@@ -50,5 +50,10 @@
   "h264_height": 480,
   "h264_framerate": 30,
   "h264_bitrate_kbps": 600,
-  "h264_intra_period": 15
+  "h264_intra_period": 15,
+
+  "comment_latency": "Video latency is bounded by DROPPING stale frames rather than queueing them. h264_drop_delta_bytes: per-client WebSocket backlog above which delta frames are dropped (keyframes still sent so the client can resync). h264_drop_all_bytes: hard backlog above which everything is dropped. mjpeg_drop_bytes: socket backlog above which an MJPEG frame is skipped.",
+  "h264_drop_delta_bytes": 49152,
+  "h264_drop_all_bytes": 204800,
+  "mjpeg_drop_bytes": 65536
 }

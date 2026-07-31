@@ -74,6 +74,97 @@ armed; and the CA and server private keys are committed to the repository. These
 
 Newest first.
 
+### 2026-07-31 — `perf/bound-video-latency` — NOT MERGED
+
+Bounds video latency and stops the video path from starving the control path. Four focused
+commits on the branch, tip `781d56a00e48c176ec2e704c88afe0ff5e7dcc8d`.
+
+- `fleetmgr-client.js`: failed Fleet Manager discovery sweeps now back off exponentially from
+  the tick interval to a 5-minute ceiling.
+- `streams/webrtc.js`: mediamtx restart moved from `execSync` to `spawn`, with coalescing of
+  restarts requested while one is in flight and child cleanup on `stop()`.
+- `streams/h264.js` / `streams/mjpeg.js`: frames are dropped when a client's socket backlog
+  exceeds a configured budget rather than queued without bound. h264 keeps keyframes through a
+  moderate backlog so a client can still resync; only a hard backlog drops everything. Drops
+  are logged at most every 5 s.
+- Both parse buffers are bounded and resync rather than growing until the process dies.
+- The drop rules, the fan-out loops, `NalParser`, the JPEG framing, and the backoff schedule are
+  all exported so tests exercise the real logic rather than a reimplementation of it. This change
+  adds **31 tests** (the suite total is 46, including the 15 pre-existing drivetrain tests) —
+  among them a 300-case fuzz over random streams with random multi-chunk splits, and
+  split-at-every-boundary tests for both the NAL and JPEG framing.
+
+**A pre-existing framing bug was found and fixed.** `NalParser._extractOne` discarded the
+ENTIRE buffer when no start code was found, so a 4-byte start code straddling a chunk boundary
+was thrown away, corrupting the framing of the next access unit. Found by the byte-exact
+split-at-every-boundary test, confirmed by mutation. This affected `main`, not just this branch.
+
+**CORRECTION — an earlier claim in this repo was wrong by ~2 orders of magnitude.** `TASKS.md`
+carried, as a P0, that `execSync('systemctl restart mediamtx')` "freezes the Node event loop for
+seconds", so the input watchdog could not fire. Measured directly on rover3, five trials:
+**85 ms mean, 100 ms max.** The 1000 ms watchdog was never actually at risk. The async change is
+still correct — unbounded synchronous work reachable from a socket handler is a defect, and
+`systemctl` blocks until the unit's job completes, so a unit slow to terminate could block for
+its full stop timeout — but it is a robustness fix worth ~85 ms, not the emergency it was
+recorded as. The P0 has been removed rather than reworded, because it was wrong.
+
+**Validation: PASS** — rover3, 2026-07-31 18:27 BST.
+**Validated SHA: `ba796d6b1f71d3eec22a662678b27d04c5bff901`**
+
+- *Reviewer:* `opus-fallback`. Codex did not run; verbatim: *"Your workspace is out of credits."*
+  The review returned NEEDS-ATTENTION and ran 9 mutations against the previous tip, of which
+  **5 survived** — including inversion of the drop gate at BOTH call sites, and replacing `spawn`
+  with a fully synchronous `execFileSync` while the test literally named "does not restart
+  mediamtx synchronously" still reported `ok`. Every finding on its minimum-to-ship list was
+  fixed, and **all nine mutations are now caught** (re-verified individually).
+- *Host suite:* 46/46 on-target under the rover's Node v20.19.2 (31 added by this change).
+- *Services:* all active, `NRestarts=0`, `/status` OK, WHEP 204.
+- *Fleet backoff:* progression 5→10→20→40→80→160→300 s observed live, capping and resetting
+  correctly. Idle CPU **6.90% → 3.47% of one core (2.0x)**.
+- *THE DROP PATH IS NOW VERIFIED ON HARDWARE.* rover3 was temporarily switched to
+  `stream_codec: "h264"` through the untracked per-rover overlay (mediamtx stopped to free the
+  camera; both reverted afterwards, overlay back to identity-only). A WebSocket client received
+  **165 frames / 11 keyframes / 403 kB**, confirming the path runs. With the threshold forced low,
+  the server logged `dropped 149` and `dropped 150 stale frame(s)` while the client received
+  **29 frames, all 29 keyframes** — proving the keyframe-priority rule works on real hardware:
+  deltas shed, keyframes still delivered, picture recoverable.
+- *A NEGATIVE RESULT THAT MATTERS.* With the **default** thresholds, stalling a client's socket
+  for 12 s produced **no drops at all**. This confirms finding F3 empirically: `ws.bufferedAmount`
+  counts only userspace queueing, so a multi-megabyte kernel socket buffer sits underneath the
+  threshold invisibly. On a local link the defaults are effectively unreachable. Latency is
+  bounded rather than unbounded — the mechanism is real and works when it engages — but **not by
+  the configured amount**, and on loopback it does not engage. Filed in `TASKS.md`; the fix is a
+  small `SO_SNDBUF`/`writableHighWaterMark` on the accepted socket, or gating on an enqueue
+  timestamp instead of a byte count.
+- *Not tested:* the mjpeg path on hardware (host tests only, including split-at-every-boundary).
+
+Superseded: the earlier partial validation of `781d56a`.
+
+- *Blocking reason:* the mandatory Second Opinion stage could not run — the Codex workspace is
+  out of credits ("Your workspace is out of credits"). `CLAUDE.md` requires an adversarial
+  review before deploy, and this change touches the video hot path and a fail-safe-adjacent
+  timing property. It is deployed for measurement only and must not merge until reviewed.
+- *Services:* all active, `NRestarts=0`, `/status` OK, 31/31 host tests pass under the rover's
+  Node v20.19.2.
+- *Fleet backoff, measured:* progression observed as 5→10→20→40→80→160→300 s, capping correctly
+  and resetting on discovery. Idle CPU **6.90% → 3.47% of one core, a 2.0x reduction** (60–90 s
+  sampling windows, no client, no viewer).
+- *Superseded figure:* commit `bc1cd71`'s body quotes `/status`-gap numbers (121 ms vs 61 ms) as
+  its central measurement. **Those are withdrawn** — see the next bullet. The real figure is the
+  direct `execSync` timing: 85 ms mean, 100 ms max over five trials. Anyone reading `git log`
+  without this file would otherwise take the discredited number as fact.
+- *C2 responsiveness:* the /status-gap probe could NOT distinguish the two builds — 121 ms on
+  `main` versus 61 ms and 106 ms on two runs of the fix, with the worst gap on one fix run
+  landing 11 s after the restart fired. That metric is dominated by ordinary event-loop jitter,
+  so it is not evidence either way. The direct `execSync` timing above is the real measurement.
+- *NOT validated:* the frame-dropping paths themselves. rover3 runs `webrtc`, where picar never
+  touches a frame, so neither the h264 nor the mjpeg drop path executed at all on hardware.
+  Host tests cover the logic; on-target proof needs a rover on `h264`/`mjpeg` with a slow client.
+- *Parser benchmark* (workstation, not rover): large access units 2.1x faster at 64 kB, 4.7x at
+  256 kB, 8.9x at 1 MB. Real access units are a few kB, so the practical win is on large
+  keyframes, not typical frames.
+
+Rover was returned to `main` afterwards.
 ### 2026-07-31 — `chore/adversarial-review-fallback`
 
 Adds the operator-requested rule: when Codex cannot run, adversarial review falls back to

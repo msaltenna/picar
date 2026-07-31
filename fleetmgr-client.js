@@ -22,6 +22,9 @@ const DISCOVERY_PORT_DEFAULT = 3000;
 const PROBE_TIMEOUT_MS       = 500;   // per-host probe timeout
 const PROBE_CONCURRENCY      = 40;    // parallel probes per batch
 const FAIL_THRESHOLD         = 2;     // consecutive heartbeat failures before re-discovering
+// Failed sweeps back off exponentially from the tick interval up to this ceiling,
+// so a rover on a subnet with no Fleet Manager stops burning CPU on it.
+const MAX_SWEEP_BACKOFF_MS   = 5 * 60 * 1000;
 
 function getLocalIp() {
   for (const ifaces of Object.values(os.networkInterfaces())) {
@@ -87,6 +90,35 @@ async function discover(port) {
   return null;
 }
 
+// Exponential backoff for failed discovery sweeps.
+//
+// Extracted and exported so the reset-on-success path is testable: with this inline
+// in tick(), deleting the reset left the whole suite green, so a rover that found a
+// Fleet Manager and then lost it would have kept the ceiling delay forever.
+//
+// Uses a caller-supplied `now`, so tests need no timers and the delay does not
+// depend on wall-clock jumps within a single comparison.
+class SweepBackoff {
+  constructor(intervalMs, maxMs) {
+    this.intervalMs = intervalMs;
+    this.maxMs = maxMs;
+    this.delayMs = 0;
+    this.nextAt = 0;   // 0 = due immediately
+  }
+
+  dueNow(now) { return this.nextAt === 0 || now >= this.nextAt; }
+
+  fail(now) {
+    this.delayMs = this.delayMs === 0
+      ? this.intervalMs
+      : Math.min(this.delayMs * 2, this.maxMs);
+    this.nextAt = now + this.delayMs;
+    return this.delayMs;
+  }
+
+  succeed() { this.delayMs = 0; this.nextAt = 0; }
+}
+
 function start(config) {
   const fleetUrl = config.fleetManagerUrl;
   if (!fleetUrl) return;
@@ -99,6 +131,7 @@ function start(config) {
   let currentBase = autoMode ? null : fleetUrl;  // resolved FM base URL
   let discovering = false;
   let fails       = 0;
+  const backoff = new SweepBackoff(intervalMs, MAX_SWEEP_BACKOFF_MS);
 
   function heartbeatTo(base) {
     const payload = JSON.stringify({
@@ -134,15 +167,30 @@ function start(config) {
   async function tick() {
     if (currentBase) { heartbeatTo(currentBase); return; }
     if (!autoMode || discovering) return;
+
+    // Back off between failed sweeps.
+    //
+    // A sweep is up to 254 TCP connects at 40-way concurrency with a 500 ms
+    // timeout, so it occupies roughly 3 s of every 5 s tick. On a rover whose
+    // subnet has no Fleet Manager — a common, indefinite state — that ran
+    // forever, measured at ~7% of a core on a Compute Module 4 while otherwise
+    // idle. That CPU is shared with the 20 Hz control loop and the camera
+    // encoder, so a cosmetic dashboard feature was competing with the control
+    // path. Discovery is not urgent: nothing about the vehicle depends on it.
+    if (!backoff.dueNow(Date.now())) return;
+
     discovering = true;
     try {
       const ip = await discover(discoveryPort);
       if (ip) {
         currentBase = `http://${ip}:${discoveryPort}`;
+        backoff.succeed();
         console.log(`Fleet Manager discovered at ${currentBase}`);
         heartbeatTo(currentBase);
       } else {
-        console.log('Fleet Manager not found on LAN; will retry.');
+        const delayMs = backoff.fail(Date.now());
+        console.log('Fleet Manager not found on LAN; next sweep in ' +
+          `${Math.round(delayMs / 1000)}s.`);
       }
     } finally {
       discovering = false;
@@ -156,4 +204,4 @@ function start(config) {
     : `Fleet heartbeat: ${fleetUrl} rover_id=${roverId} every ${intervalMs / 1000}s`);
 }
 
-module.exports = { start, setStatusBit };
+module.exports = { start, setStatusBit, SweepBackoff, MAX_SWEEP_BACKOFF_MS };
