@@ -3,7 +3,10 @@
   "comment_fleetManagerUrl": "'auto' = discover the Fleet Manager on the LAN (OS-agnostic, no IP/hostname needed). Or set an explicit http://host:port. Empty disables.",
   "fleetManagerUrl": "auto",
   "fleet_heartbeat_interval_s": 5,
+  "comment_telemetry": "Battery/power come from the flight controller (SYS_STATUS, POWER_STATUS). batteryWarnLevel is a remaining-percentage threshold and only works if BATT_CAPACITY is set on the flight controller - it reports 0 when unset, which is why batteryWarnVolts exists as a voltage threshold that always works. Set batteryWarnVolts for your pack (e.g. 3.5V x cells).",
   "batteryWarnLevel": 20,
+  "batteryWarnVolts": null,
+  "telemetry_interval_ms": 1000,
 
   "comment1": "pigpion is for the native picpio lib in C",
   "comment2": "mavproxy is backend for mavproxy to talk w/ pixhawk, push pwm there ",

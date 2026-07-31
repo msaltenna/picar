@@ -28,6 +28,8 @@ function getRoverList() {
     online:         (now - r.lastSeen) < OFFLINE_THRESHOLD,
     lastSeen:       r.lastSeen,
     ...decodeStatus(r.status || 0),
+    // Additive: absent from older rovers, which still report the status bitmask.
+    telemetry:      r.telemetry || null,
     controllerUrl:  `https://${r.ip}:8443/socket.html`,
   }));
 }

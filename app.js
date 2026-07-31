@@ -35,7 +35,8 @@ console.log(`Rover ID: ${config.rover_id ?? 1}`);
 const PWMDriver = require('./pwm_servo');
 const pwm = PWMDriver(config);
 
-require('./fleetmgr-client').start(config);
+const fleetClient = require('./fleetmgr-client');
+fleetClient.start(config);
 
 const file = new static.Server();
 const options = {
@@ -77,7 +78,12 @@ const appServer = https.createServer(options, (req, res) => {
   const parsed = url.parse(req.url, true);
   if (parsed.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'OK', throttle: old_throttle, steering: old_steering }));
+    res.end(JSON.stringify({
+      status: 'OK',
+      throttle: old_throttle,
+      steering: old_steering,
+      telemetry: currentTelemetry(),
+    }));
   } else if (parsed.pathname === '/manifest.json') {
     const roverId = config.rover_id ?? 1;
     const manifest = {
@@ -124,11 +130,94 @@ let lastAction = null;
 const throttle_ramp_up   = 0;
 const throttle_ramp_down = 0;
 
+
+// ── Telemetry: battery, board power, radio link ───────────────────────────────
+//
+// Battery and board power come from the flight controller over MAVLink
+// (SYS_STATUS / POWER_STATUS). "Radio" has two possible sources and they are not
+// interchangeable:
+//   - RADIO_STATUS from a SiK telemetry radio. Absent on this platform unless one
+//     is fitted; the driver reports null rather than inventing a value.
+//   - The Wi-Fi link carrying the control connection, read from the kernel. This
+//     is the link that actually matters for teleoperation here, so it is reported
+//     separately and never conflated with the MAVLink radio.
+// Clamped, not just defaulted. This key is reachable through the untracked
+// picar-cfg.local.json overlay, so a rover-local 0 or a typo would otherwise become
+// setInterval(fn, 1) — measured at ~10% of a core from the /proc read alone.
+const telemetry_interval_ms = Math.max(250, Number(config.telemetry_interval_ms) || 1000);
+const batteryWarnLevel      = config.batteryWarnLevel ?? 20;
+const batteryWarnVolts      = config.batteryWarnVolts ?? null;
+
+let wifiLink = null;
+
+// /proc/net/wireless is a two-line-header text file; parsing it costs nothing and
+// needs no external tool. Read ASYNCHRONOUSLY: this runs on the same event loop as
+// the 20 Hz override stream and the fail-safe timers, and a synchronous read of a
+// proc file is exactly the kind of hidden stall invariant 9 forbids.
+function refreshWifiLink() {
+  fs.promises.readFile('/proc/net/wireless', 'utf8').then((text) => {
+    const line = text.split('\n').find((l) => /^\s*\w+:/.test(l));
+    if (!line) { wifiLink = null; return; }
+    const [iface, rest] = line.split(':');
+    const cols = rest.trim().split(/\s+/);
+    // status, link quality, signal level (dBm), noise level
+    const quality = parseFloat(cols[1]);
+    const signal  = parseFloat(cols[2]);
+    wifiLink = {
+      iface: iface.trim(),
+      // Quality is reported out of 70 by most drivers.
+      qualityPct: Number.isFinite(quality) ? Math.round((quality / 70) * 100) : null,
+      signalDbm:  Number.isFinite(signal) ? signal : null,
+    };
+  }).catch(() => { wifiLink = null; });
+}
+
+function currentTelemetry() {
+  const fc = typeof pwm.getTelemetry === 'function' ? pwm.getTelemetry() : {};
+  return { ...fc, wifi: wifiLink };
+}
+
+// A battery is "in trouble" when the flight controller reports a remaining
+// percentage at or below batteryWarnLevel, or a pack voltage at or below
+// batteryWarnVolts when that is configured. Remaining percentage is unreliable
+// unless BATT_CAPACITY is set on the flight controller — it reads 0 when unset —
+// so the driver reports null in that case and only voltage can raise the warning.
+function batteryTrouble(t) {
+  if (!t.battery) return false;
+  const { remainingPct, voltageV } = t.battery;
+  if (remainingPct !== null && remainingPct <= batteryWarnLevel) return true;
+  if (batteryWarnVolts !== null && voltageV !== null && voltageV <= batteryWarnVolts) return true;
+  return false;
+}
+
+setInterval(() => {
+  refreshWifiLink();
+  const t = currentTelemetry();
+  // Bit 0 of the Fleet Manager status bitmask is "battery trouble". It was defined
+  // and exported but never actually set by anything until now.
+  fleetClient.setStatusBit(0, batteryTrouble(t));
+  fleetClient.setTelemetry({
+    batteryV:    t.battery ? t.battery.voltageV : null,
+    batteryPct:  t.battery ? t.battery.remainingPct : null,
+    batteryA:    t.battery ? t.battery.currentA : null,
+    radioRssi:   t.radio ? t.radio.rssi : null,
+    boardV:      t.power ? t.power.boardV : null,
+    servoV:      t.power ? t.power.servoV : null,
+    wifiPct:     t.wifi ? t.wifi.qualityPct : null,
+    wifiDbm:     t.wifi ? t.wifi.signalDbm : null,
+    linkUp:      !!t.linkUp,
+  });
+  io.emit('telemetry', t);
+}, telemetry_interval_ms);
+refreshWifiLink();
+
 io.on('connection', (socket) => {
   console.log('Control client connected');
 
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
+  socket.emit('telemetryConfig', { batteryWarnLevel, batteryWarnVolts });
+  socket.emit('telemetry', currentTelemetry());
 
   socket.on('arm', () => {
     // Refuse to arm while a drivetrain change is settling. Otherwise an arm

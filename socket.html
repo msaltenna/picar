@@ -425,6 +425,9 @@
           <h3>Feedback</h3>
           <label><input type="checkbox" id="cfgThrottle"> Throttle</label>
           <label><input type="checkbox" id="cfgSteering"> Steering</label>
+          <label><input type="checkbox" id="cfgBattery"> Battery</label>
+          <label><input type="checkbox" id="cfgRadio"> Radio / link</label>
+          <label><input type="checkbox" id="cfgRails"> Board rails</label>
         </div>
       </div>
 
@@ -521,6 +524,9 @@
       showBtnFrontDiff:false,
       showBtnRearDiff: false,
       showKeyboardHint:true,
+      showBattery:     true,
+      showRadio:       false,
+      showRails:       false,
     };
 
     let uiCfg = { ...CFG_DEFAULTS };
@@ -548,6 +554,9 @@
       cfgBtnFrontDiff: 'showBtnFrontDiff',
       cfgBtnRearDiff:  'showBtnRearDiff',
       cfgKeyboardHint: 'showKeyboardHint',
+      cfgBattery:      'showBattery',
+      cfgRadio:        'showRadio',
+      cfgRails:        'showRails',
     };
 
     function openConfig() {
@@ -584,6 +593,14 @@
 
     // ── Status bar ────────────────────────────────────────────────────────────
     let liveStats = { downKbps: null, upKbps: null, fps: null, latencyMs: null, resW: null, resH: null };
+    // Latest telemetry pushed by the server. null until the first message; each
+    // sub-object is null when that source is unavailable or its reading is stale,
+    // so the UI can show "--" rather than a last-known value dressed up as live.
+    let telemetry = null;
+    // Thresholds come from the server so the UI warns on the same rule the fleet
+    // status bit uses. Percentage alone is not usable: it is null unless
+    // BATT_CAPACITY is set on the flight controller.
+    let telemetryCfg = { batteryWarnLevel: 20, batteryWarnVolts: null };
 
     function renderStatusBar() {
       // Column 1: connection + control mode
@@ -605,7 +622,61 @@
       const c3 = [];
       if (uiCfg.showThrottle) c3.push(`Thr: ${throttleValue.toFixed(2)}`);
       if (uiCfg.showSteering) c3.push(`Str: ${applyCurve(steeringValue).toFixed(2)}`);
+      if (uiCfg.showBattery)  c3.push(formatBattery());
+      if (uiCfg.showRadio)    c3.push(formatRadio());
+      if (uiCfg.showRails)    c3.push(formatRails());
       statusCol3.innerHTML = c3.join('<br>');
+    }
+
+
+    // ── Telemetry formatting ──────────────────────────────────────────────────
+    //
+    // Every one of these can legitimately be unavailable, and showing a stale or
+    // invented value on a vehicle status display is worse than showing nothing. So
+    // each returns an explicit "--" when the source is absent or stale.
+    function formatBattery() {
+      const b = telemetry && telemetry.battery;
+      if (!b) return 'Batt: --';
+      const parts = [];
+      if (b.voltageV !== null && b.voltageV !== undefined) parts.push(`${b.voltageV.toFixed(1)}V`);
+      // remainingPct is null unless BATT_CAPACITY is configured on the flight
+      // controller, so voltage is the field to trust.
+      if (b.remainingPct !== null && b.remainingPct !== undefined) parts.push(`${b.remainingPct}%`);
+      if (b.currentA !== null && b.currentA !== undefined) parts.push(`${b.currentA.toFixed(1)}A`);
+      const text = parts.length ? parts.join(' ') : '--';
+      const lowPct = b.remainingPct !== null && b.remainingPct !== undefined
+        && b.remainingPct <= telemetryCfg.batteryWarnLevel;
+      const lowV = telemetryCfg.batteryWarnVolts !== null && b.voltageV !== null
+        && b.voltageV !== undefined && b.voltageV <= telemetryCfg.batteryWarnVolts;
+      const low = lowPct || lowV;
+      return low ? `Batt: ${text} ⚠` : `Batt: ${text}`;
+    }
+
+    // Board 5V rail and servo rail, from the flight controller's POWER_STATUS. A
+    // servo rail at 0 V means nothing can actuate even when everything else looks
+    // healthy, which is worth being able to see.
+    function formatRails() {
+      const p = telemetry && telemetry.power;
+      if (!p) return 'Rails: --';
+      return `Rails: ${p.boardV.toFixed(2)}V / ${p.servoV.toFixed(2)}V`;
+    }
+
+    function formatRadio() {
+      if (!telemetry) return 'Link: --';
+      // A SiK telemetry radio, if one is fitted. Distinct from the Wi-Fi link.
+      if (telemetry.radio) {
+        return `Radio: ${telemetry.radio.rssi}/${telemetry.radio.noise} ` +
+               `rem ${telemetry.radio.remRssi}`;
+      }
+      // Otherwise report the Wi-Fi link that is actually carrying this session.
+      const w = telemetry.wifi;
+      if (w && (w.signalDbm !== null || w.qualityPct !== null)) {
+        const bits = [];
+        if (w.qualityPct !== null) bits.push(`${w.qualityPct}%`);
+        if (w.signalDbm !== null) bits.push(`${w.signalDbm}dBm`);
+        return `Link: ${bits.join(' ')}`;
+      }
+      return 'Link: --';
     }
 
     // ── Client-side stats ─────────────────────────────────────────────────────
@@ -1514,9 +1585,15 @@
     document.addEventListener('keyup', (e) => { delete keysDown[e.code]; });
 
     // ── Socket status ─────────────────────────────────────────────────────────
+    socket.on('telemetry', (t) => { telemetry = t; renderStatusBar(); });
+    socket.on('telemetryConfig', (c) => { telemetryCfg = { ...telemetryCfg, ...c }; });
     socket.on('connect',    () => { isConnected = true;  renderStatusBar(); });
     socket.on('disconnect', () => {
       isConnected = false;
+      // Clear telemetry too. No further messages arrive, so the server's staleness
+      // window cannot help: the bar would keep showing the last battery voltage
+      // indefinitely after the link dropped.
+      telemetry = null;
       // A dropped link means our commands are no longer reaching the vehicle, so
       // stop claiming to be armed. The operator must re-arm deliberately after a
       // reconnect rather than resuming the previous throttle.
