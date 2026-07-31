@@ -55,12 +55,18 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   from both before designing a fix. `rover3` has no gearbox, so the mechanical hypotheses
   cannot be tested there at all.
 
-- **Drop latent frames so the video stream and C2 stop stalling** — operator-reported.
-  Bound latency in the video path and stop it propagating into the control link. Related
-  known causes already filed here: the `execSync` event-loop block in `streams/webrtc.js`,
-  the O(n²) NAL scanning in `streams/h264.js`, the O(n²) browser MJPEG parser, and the
-  never-backing-off fleet discovery sweep burning ~3 s of every 5 s on a CM4. Needs a
-  bounded, drop-oldest queue discipline rather than more buffering.
+- **Frame dropping is implemented but UNVALIDATED on target** — as of `781d56a`, `h264` sheds
+  delta frames (keeping keyframes so a client can resync) and `mjpeg` skips whole frames once a
+  client's socket backlog exceeds the configured budget, instead of queueing without bound.
+  Both rules and the NAL parser are unit-tested against real logic and mutation-tested.
+  **But neither path was exercised on rover3**, because rover3 runs `stream_codec: "webrtc"`,
+  where picar never touches a video frame — MediaMTX owns the whole path. Proving the drop
+  behaviour on-target needs a rover switched to `h264` or `mjpeg` with a deliberately slow
+  client. Until then the frame-dropping logic is host-tested only.
+
+  Also still open: **the default webrtc path has no picar-side latency control at all.** There
+  is no queue to drop from, so bounding latency there means MediaMTX tuning plus a client-side
+  `playoutDelayHint`, neither of which is done.
 
 - **Shelved: the control-safety layer** — the work described in `HANDOFF.md` now lives only
   at `origin/archive/control-failsafe-2026-07-30` (`6220780`). Shelved on operator
@@ -116,14 +122,6 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   available — cherry-pick the archived v2 parser, deploy to rover3, and confirm
   `verified SERVO1_FUNCTION=26` and friends appear in the journal. Do it before building on
   MAVLink receive.
-
-- **Video-param change blocks the event loop while armed** — `streams/webrtc.js:98`
-  (`setParams` → `execSync('systemctl restart mediamtx')`), reachable from
-  `app.js:129` (`setVideoParams`) with no arm check. A synchronous `systemctl restart`
-  freezes the Node event loop for seconds, so the `control-safety.js` input watchdog
-  cannot fire and no fail-safe can run while the rover is armed and moving. Violates
-  safety invariant 7. Fix: make the restart asynchronous, and refuse video-param changes
-  while a control lease is held.
 
 - **Private keys are committed to the repository** — `certs/ca.key`, `certs/key.pem` are
   tracked. Anyone with repo access holds the CA that every operator device is told to
@@ -264,6 +262,15 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   startup.
 
 ### P2 — performance
+
+- **picar still burns 3.5% of a core while completely idle** — measured on rover3 with no
+  client connected, no video viewer, and discovery backed off to its 5-minute ceiling. The
+  Fleet Manager sweep accounted for half the original 6.9% and is fixed; the remaining 3.5% is
+  unexplained. Likely candidates: `parseIncoming` doing a `Buffer.concat` per socket data event
+  while MAVProxy streams ~6 message types at 4 Hz, and per-tick Buffer allocation in
+  `buildRCOverride`. Worth profiling before adding anything else to this process.
+
+
 
 - **O(n²) NAL scanning** — `streams/h264.js:38` restarts `_findSC` from offset 0 on every
   extraction, and `push` does a `Buffer.concat` per chunk. Per-frame cost on the video hot

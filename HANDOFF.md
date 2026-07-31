@@ -74,6 +74,60 @@ armed; and the CA and server private keys are committed to the repository. These
 
 Newest first.
 
+### 2026-07-31 — `perf/bound-video-latency` — NOT MERGED
+
+Bounds video latency and stops the video path from starving the control path. Four focused
+commits on the branch, tip `781d56a00e48c176ec2e704c88afe0ff5e7dcc8d`.
+
+- `fleetmgr-client.js`: failed Fleet Manager discovery sweeps now back off exponentially from
+  the tick interval to a 5-minute ceiling.
+- `streams/webrtc.js`: mediamtx restart moved from `execSync` to `spawn`, with coalescing of
+  restarts requested while one is in flight and child cleanup on `stop()`.
+- `streams/h264.js` / `streams/mjpeg.js`: frames are dropped when a client's socket backlog
+  exceeds a configured budget rather than queued without bound. h264 keeps keyframes through a
+  moderate backlog so a client can still resync; only a hard backlog drops everything. Drops
+  are logged at most every 5 s.
+- Both parse buffers are bounded and resync rather than growing until the process dies.
+- The frame-drop rules and `NalParser` are exported so tests exercise the real logic; 31 tests,
+  including a 300-case fuzz over random streams and random multi-chunk splits.
+
+**A pre-existing framing bug was found and fixed.** `NalParser._extractOne` discarded the
+ENTIRE buffer when no start code was found, so a 4-byte start code straddling a chunk boundary
+was thrown away, corrupting the framing of the next access unit. Found by the byte-exact
+split-at-every-boundary test, confirmed by mutation. This affected `main`, not just this branch.
+
+**CORRECTION — an earlier claim in this repo was wrong by ~2 orders of magnitude.** `TASKS.md`
+carried, as a P0, that `execSync('systemctl restart mediamtx')` "freezes the Node event loop for
+seconds", so the input watchdog could not fire. Measured directly on rover3, five trials:
+**85 ms mean, 100 ms max.** The 1000 ms watchdog was never actually at risk. The async change is
+still correct — unbounded synchronous work reachable from a socket handler is a defect, and
+`systemctl` blocks until the unit's job completes, so a unit slow to terminate could block for
+its full stop timeout — but it is a robustness fix worth ~85 ms, not the emergency it was
+recorded as. The P0 has been removed rather than reworded, because it was wrong.
+
+**Validation: PARTIAL. Deployed and exercised on rover3 at SHA `781d56a`, but NOT MERGED.**
+
+- *Blocking reason:* the mandatory Second Opinion stage could not run — the Codex workspace is
+  out of credits ("Your workspace is out of credits"). `CLAUDE.md` requires an adversarial
+  review before deploy, and this change touches the video hot path and a fail-safe-adjacent
+  timing property. It is deployed for measurement only and must not merge until reviewed.
+- *Services:* all active, `NRestarts=0`, `/status` OK, 31/31 host tests pass under the rover's
+  Node v20.19.2.
+- *Fleet backoff, measured:* progression observed as 5→10→20→40→80→160→300 s, capping correctly
+  and resetting on discovery. Idle CPU **6.90% → 3.47% of one core, a 2.0x reduction** (60–90 s
+  sampling windows, no client, no viewer).
+- *C2 responsiveness:* the /status-gap probe could NOT distinguish the two builds — 121 ms on
+  `main` versus 61 ms and 106 ms on two runs of the fix, with the worst gap on one fix run
+  landing 11 s after the restart fired. That metric is dominated by ordinary event-loop jitter,
+  so it is not evidence either way. The direct `execSync` timing above is the real measurement.
+- *NOT validated:* the frame-dropping paths themselves. rover3 runs `webrtc`, where picar never
+  touches a frame, so neither the h264 nor the mjpeg drop path executed at all on hardware.
+  Host tests cover the logic; on-target proof needs a rover on `h264`/`mjpeg` with a slow client.
+- *Parser benchmark* (workstation, not rover): large access units 2.1x faster at 64 kB, 4.7x at
+  256 kB, 8.9x at 1 MB. Real access units are a few kB, so the practical win is on large
+  keyframes, not typical frames.
+
+Rover was returned to `main` afterwards.
 ### 2026-07-31 — `chore/adversarial-review-fallback`
 
 Adds the operator-requested rule: when Codex cannot run, adversarial review falls back to
