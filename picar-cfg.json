@@ -11,6 +11,8 @@
   "mavproxy_host": "127.0.0.1",
   "mavproxy_port": 5760,
   "mavproxy_rate_hz": 20,
+  "comment_drivetrain": "drivetrain_settle_ms: delay between the neutral+DISARM of a gear/diff change and actually moving the actuator, so a coasting vehicle slows first. Not a confirmed stop - this vehicle has no wheel encoder and GPS is disabled.",
+  "drivetrain_settle_ms": 1000,
   "input_timeout_ms": 1000,
   "steering_gpio": 13,
   "throttle_gpio": 12,
