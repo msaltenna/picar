@@ -94,7 +94,15 @@ Shelved the control-safety branch and recorded four new operator priorities.
 - Purged now-false statements about the safety branch being local and unpushed, and removed
   the completed directive/pipeline task from `TASKS.md` per its own contract.
 
-**Validation:** documentation only — no runtime file touched, no rover state changed.
+**Validation: PASS** — rover3, 2026-07-31 15:21 BST.
+**Validated SHA: `a8f041ccb359f2de8a6728eb937478eb00791d6b`** (deployed by git bundle).
+Markdown-only (`git diff --name-only main..a8f041c` → zero runtime files), so this proves the
+rover is healthy on the deployed SHA rather than exercising new behavior. Services all active,
+`NRestarts=0`, zero error/refusal lines in the startup window, `Rover ID: 3`, Pixhawk heartbeat
+received, `/status` OK, `socket.html` 200. No arming attempted; **no actuation is possible with
+the flight battery disconnected.** The `SERVO*_MIN/MAX` factory-default correction recorded
+above was itself verified on-target: 15 of 16 outputs at 1100/1900, including the disabled
+`SERVO6–10` (`FUNCTION=0`); only `SERVO3` differs at 1000/2000.
 
 ### 2026-07-30 — `chore/agent-directive-and-skills`
 
