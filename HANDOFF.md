@@ -120,7 +120,13 @@ missing green-baseline instruction, and an invariant count reading "eight" in tw
 `pwm_mavproxy_servo.js` — which the suite **caught** (3 of 15 failing, by name), then restored
 the tree clean. That is evidence the fallback path does useful work, not merely that it runs.
 
-**Validation:** documentation and agent-definition only; no runtime file touched.
+**Validation: PASS** — rover3, 2026-07-31 17:49 BST.
+**Validated SHA: `69ffc1bc2df529a408e4242070f6e074462a4fb8`** (deployed by git bundle).
+Markdown-only (`git diff --name-only main..69ffc1b` → zero runtime files), so this proves the
+rover is healthy on the deployed SHA rather than exercising new behaviour. All services active,
+`NRestarts=0`, 15/15 host tests under the rover's Node v20.19.2, zero error lines in the startup
+window, `Rover ID: 3`, `MAVProxy: Sending DISARM` on connect, `/status` OK, `socket.html` 200.
+No arming attempted; no actuation is possible with the flight battery disconnected.
 
 ### 2026-07-31 — `fix/drivetrain-change-safety`
 
