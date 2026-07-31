@@ -6,7 +6,13 @@ const { spawn, execSync } = require('child_process');
 const JPEG_START = Buffer.from([0xff, 0xd8]);
 const JPEG_END   = Buffer.from([0xff, 0xd9]);
 
-module.exports = function createMjpegStream(config, streamServer) {
+// Skip a frame for a client that has not drained the previous ones. Exported so
+// the rule is tested directly rather than reimplemented in a test.
+function shouldSkipFrame(writableLength, dropBytes) {
+  return writableLength > dropBytes;
+}
+
+function createMjpegStream(config, streamServer) {
   let WIDTH   = config.mjpeg_width     || 480;
   let HEIGHT  = config.mjpeg_height    || 360;
   let FPS     = config.mjpeg_framerate || 12;
@@ -21,8 +27,17 @@ module.exports = function createMjpegStream(config, streamServer) {
   console.log(`MJPEG camera command: ${cameraCmd || '(none found)'}`);
 
   let clients    = [];   // HTTP response objects
-  let cameraProc = null;
-  let jpegBuf    = Buffer.alloc(0);
+  let cameraProc    = null;
+  let jpegBuf       = Buffer.alloc(0);
+  let droppedFrames = 0;
+  let lastDropLog   = 0;
+
+  // One 480x360 JPEG at quality 20 is roughly 15-25 kB, so this is about two
+  // frames of slack before we start dropping.
+  const DROP_BYTES = config.mjpeg_drop_bytes ?? 64 * 1024;
+  // A wedged camera that never emits an end-of-image marker would otherwise grow
+  // jpegBuf without limit.
+  const MAX_JPEG_BUFFER = config.mjpeg_max_buffer_bytes ?? 4 * 1024 * 1024;
 
   function clientCount() { return clients.length; }
 
@@ -30,9 +45,38 @@ module.exports = function createMjpegStream(config, streamServer) {
     const hdr = `--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`;
     for (let i = clients.length - 1; i >= 0; i--) {
       const c = clients[i];
-      try { if (!c.writableEnded) { c.write(hdr); c.write(frame); c.write('\r\n'); } }
-      catch (_) { clients.splice(i, 1); }
+      if (c.writableEnded) { clients.splice(i, 1); continue; }
+
+      // Drop this frame for any client that has not drained the previous ones.
+      //
+      // MJPEG sends a whole independently-decodable image per frame, so a
+      // dropped frame costs nothing but smoothness — there is no keyframe
+      // dependency to break. Previously every frame was written regardless, so a
+      // client slower than the camera accumulated unbounded backlog in Node's
+      // socket buffer: latency grew without limit and the server's memory grew
+      // with it. For teleoperation the newest frame is the only useful one.
+      if (shouldSkipFrame(c.writableLength, DROP_BYTES)) {
+        droppedFrames++;
+        continue;
+      }
+
+      try {
+        c.write(hdr);
+        c.write(frame);
+        c.write('\r\n');
+      } catch (_) { clients.splice(i, 1); }
     }
+    logDropsIfDue();
+  }
+
+  // A silent drop looks exactly like a stall to whoever is debugging it.
+  function logDropsIfDue() {
+    if (droppedFrames === 0) return;
+    const now = Date.now();
+    if (now - lastDropLog < 5000) return;
+    lastDropLog = now;
+    console.log(`MJPEG: dropped ${droppedFrames} stale frame(s) to bound latency`);
+    droppedFrames = 0;
   }
 
   function stop() {
@@ -63,7 +107,12 @@ module.exports = function createMjpegStream(config, streamServer) {
 
     cameraProc.stdout.on('data', (chunk) => {
       if (!gotFirst) { gotFirst = true; console.log('MJPEG: stream live'); }
-      jpegBuf = Buffer.concat([jpegBuf, chunk]);
+      jpegBuf = jpegBuf.length === 0 ? chunk : Buffer.concat([jpegBuf, chunk]);
+      if (jpegBuf.length > MAX_JPEG_BUFFER) {
+        console.error(`MJPEG: buffer exceeded ${MAX_JPEG_BUFFER} bytes — resyncing`);
+        jpegBuf = Buffer.alloc(0);
+        return;
+      }
       while (true) {
         const s = jpegBuf.indexOf(JPEG_START);
         if (s === -1) { jpegBuf = Buffer.alloc(0); break; }
@@ -130,3 +179,6 @@ module.exports = function createMjpegStream(config, streamServer) {
     },
   };
 };
+
+module.exports = createMjpegStream;
+module.exports.shouldSkipFrame = shouldSkipFrame;
