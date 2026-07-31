@@ -74,6 +74,57 @@ armed; and the CA and server private keys are committed to the repository. These
 
 Newest first.
 
+### 2026-07-31 — `fix/drivetrain-change-safety`
+
+Made a drivetrain change a gated server-side transaction. Addresses the operator-reported P0
+where selecting high gear engaged throttle unstoppably.
+
+- Moved gear/diff changes out of the `fromclient` control stream into a `setDrivetrain` event
+  handled server-side. A browser-side interlock was decorative: this control plane is
+  unauthenticated, so any client or a second tab could send `{throttle: 1, shift: -1}` in one
+  packet and shift at full throttle.
+- Added `neutralizeAndDisarm()` to the driver, which transmits a neutral RC_CHANNELS_OVERRIDE
+  packet and only then COMMAND_LONG DISARM, and routed operator stop, input timeout, process
+  shutdown and MAVProxy reconnect through it. Fail-safe order is a wire property; `setServoPWM`
+  only mutates a buffer.
+- Drivetrain channels now accept only their endpoints. `shift: 0` — and `[]`/`null`, which
+  coerce to 0 — previously parked the shift fork at 1500 us, half-engaged.
+- Fixed `arm()` scheduling its ARM packet on an untracked `setTimeout`: a fail-safe sent DISARM
+  and the vehicle re-armed itself 500 ms later with no operator action.
+- Moved the keyboard gear shortcut off the bare Shift modifier to KeyG, ignoring auto-repeat,
+  modifiers, and keystrokes while a modal or form control has focus.
+- Added `drivetrain_settle_ms` (default 1000) between the disarm and the actuation.
+- `setServoPWM`, `disarm()` and `sendPacket()` now report applied/dropped instead of returning
+  `undefined`.
+
+Two rounds of Codex adversarial review. The first found the interlock was client-side only and
+bypassable, that `shift: 0` was accepted, that DISARM still preceded neutral, and that the
+tests asserted source text vacuously — all accepted and reworked. The second confirmed those
+fixes hold (it mutation-tested the packet-order assertion) and found four more, of which the
+pending-ARM leak and the `disarm() !== false` false-success were real bugs and are fixed here.
+
+**Validation: PASS** — rover3, 2026-07-31 16:0x BST.
+**Validated SHA: `c6043d7e8cbdc292cb8b861800770354df3c3952`** (deployed by git bundle).
+
+- *Host suite on-target:* 15/15 under the rover's Node v20.19.2 (not just the workstation's
+  Node 22). Services active, `NRestarts=0`.
+- *Reconnect disarm:* `MAVProxy: Sending DISARM...` now appears on connect.
+- *Integration, over the real Socket.IO protocol:* 8/9 checks passed —
+  `shift` in the `fromclient` stream is ignored (ch2 unchanged); `setDrivetrain` refuses `0`,
+  `0.5`, `'abc'` and an empty request; the ack returns after 1013 ms, confirming the settle
+  dwell; throttle stayed neutral throughout. The one FAIL was a defect in the throwaway test
+  script, not the code: it read the driver's `RC Override` log line, which prints only once
+  every 5 s, so a 1.5 s read saw a stale line. Re-verified on the wire instead.
+- *MAVLink wire verification:* `RC_OVERRIDE` ch2 took values [1000, 2000] and
+  `SERVO_OUTPUT_RAW` servo2 followed to [1000, 2000] — the flight controller really drove the
+  output, and the bench test servo on output 2 physically moved. `SERVO_OUTPUT_RAW` servo3
+  (throttle) held **1500 throughout**. The RC_OVERRIDE packets immediately preceding each
+  DISARM all carried neutral throttle, confirming neutral-before-disarm on the wire.
+- *Not proven here:* rover3 has **no gearbox**, so nothing about a loaded transmission,
+  shifting under load, or an ESC latch was tested. **The operator must confirm on a geared
+  rover before this is trusted to have fixed the reported symptom.** No flight battery, so no
+  actuation of the drivetrain itself was possible.
+
 ### 2026-07-30 — `chore/priorities-and-branch-archive`
 
 Shelved the control-safety branch and recorded four new operator priorities.
