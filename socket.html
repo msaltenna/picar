@@ -600,7 +600,7 @@
     // Thresholds come from the server so the UI warns on the same rule the fleet
     // status bit uses. Percentage alone is not usable: it is null unless
     // BATT_CAPACITY is set on the flight controller.
-    let telemetryCfg = { batteryWarnLevel: 20, batteryWarnVolts: null };
+    let telemetryCfg = { batteryWarnLevel: 20, batteryWarnVolts: null, batteryWarnOnNoReading: true };
 
     function renderStatusBar() {
       // Column 1: connection + control mode
@@ -652,7 +652,15 @@
         && b.remainingPct <= telemetryCfg.batteryWarnLevel;
       const lowV = telemetryCfg.batteryWarnVolts !== null && b.voltageV !== null
         && b.voltageV !== undefined && b.voltageV <= telemetryCfg.batteryWarnVolts;
-      const low = lowPct || lowV;
+      // Fail closed here too, matching batteryTrouble() on the server. The fleet
+      // status bit already treated an unreadable monitor as trouble, but this bar
+      // did not, so the operator looking at the vehicle saw a bare "Batt: --" with
+      // no warning while the dashboard flagged it. A dead pack and a missing
+      // monitor look identical from here, and neither is an all-clear.
+      const noReading = telemetryCfg.batteryWarnOnNoReading !== false
+        && (b.remainingPct === null || b.remainingPct === undefined)
+        && (b.voltageV === null || b.voltageV === undefined);
+      const low = lowPct || lowV || noReading;
       return low ? `Batt: ${text} ⚠` : `Batt: ${text}`;
     }
 

@@ -81,13 +81,18 @@ const TELEMETRY_STALE_MS = 3000;
 // controller (e.g. Pixhawk 6C mini) gets the right output mapping without
 // needing to load mav.parm by hand.
 const DEFAULT_PARAM_OVERLAY = {
+  // FIRST deliberately. applyParamOverlay spaces its writes 250 ms apart, and this
+  // one is the flight controller's own stale-override failsafe — until it lands,
+  // ArduPilot is on its 3.0 s default. As the seventh entry it went out ~1500 ms
+  // after connect, which is 1500 ms of a 15x-too-long override window on a vehicle
+  // that is already streaming overrides.
+  RC_OVERRIDE_TIME: 0.2,
   SERVO1_FUNCTION: 26, // GroundSteering on RC1 (steering)
   SERVO2_FUNCTION: 1,  // RC passthrough: transmission on RC2
   SERVO3_FUNCTION: 70, // Throttle on RC3
   SERVO4_FUNCTION: 1,  // RC passthrough: front diff on RC4
   SERVO5_FUNCTION: 1,  // RC passthrough: rear diff on RC5
   FRAME_CLASS: 2,      // Rover (must be set or steering/throttle outputs are wrong)
-  RC_OVERRIDE_TIME: 0.2, // release stale overrides quickly if packets stop
   AHRS_GPS_USE: 0,     // no GPS installed
   GPS1_TYPE: 0         // no GPS installed
 };
@@ -172,6 +177,9 @@ class PWMMavproxy {
       : 5;
     this.batteryVoltHistory = [];
 
+    // Handles for the param-overlay's timer chain, so it can be cancelled.
+    this.overlayTimers = [];
+
     // Latest decoded telemetry. Each entry carries its own `at` timestamp so a
     // reader can tell a live reading from a stale one — reporting a last-known
     // battery voltage as if it were current is worse than reporting nothing.
@@ -243,25 +251,6 @@ class PWMMavproxy {
       this.paramOverlayApplied = false;
       this.startHeartbeat();
 
-      // The parameter overlay — which writes RC_OVERRIDE_TIME, the flight
-      // controller's own stale-override failsafe — is gated behind a genuine
-      // autopilot heartbeat. That gate is correct, but a silent failure to meet it
-      // would leave ArduPilot's 3.0 s default standing instead of 0.2 s, a 15x
-      // longer window in which stale overrides persist. So say so, loudly, rather
-      // than letting the journal simply go quiet.
-      if (this.heartbeatWatch) clearTimeout(this.heartbeatWatch);
-      this.heartbeatWatch = setTimeout(() => {
-        this.heartbeatWatch = null;
-        if (!this.pixhawkHeartbeatSeen) {
-          console.error(
-            `MAVProxy: WARNING no autopilot heartbeat from sys=${this.target_system} ` +
-            `after ${this.heartbeatTimeoutMs} ms although the TCP link is up. ` +
-            `The parameter overlay has NOT been applied, so RC_OVERRIDE_TIME is ` +
-            `whatever the flight controller already had. Check SYSID_THISMAV and ` +
-            `mavproxy_target_system.`);
-        }
-      }, this.heartbeatTimeoutMs);
-
       // A reconnect must never inherit an armed vehicle. ArduPilot arm state
       // survives a picar restart, a crash, and a companion-computer reboot — this
       // flight controller has been observed sitting armed with no operator
@@ -269,6 +258,42 @@ class PWMMavproxy {
       // override stream, and make the operator re-arm deliberately.
       this.neutralizeAndDisarm();
       this.startLoop();
+
+      // The safety overlay is applied on CONNECT, not on the first autopilot
+      // heartbeat.
+      //
+      // Gating it behind the heartbeat was FAIL-OPEN. The overlay writes
+      // RC_OVERRIDE_TIME=0.2 — the flight controller's own stale-override
+      // failsafe — and outbound ARM and RC overrides work whether or not we can
+      // hear the autopilot. So a one-way return-path failure (wrong sysId, broken
+      // framing, a receive path that never delivers) left the vehicle drivable
+      // while ArduPilot silently kept its 3.0 s default: a 15x longer window in
+      // which a stale override persists. Nothing recovered from that — the
+      // watchdog below only logs, and app.js does not gate arming on it.
+      //
+      // Transmission does not depend on hearing anything, so neither does this.
+      // The genuine heartbeat is still required, but for VERIFICATION — read-back
+      // and reporting — which is what hearing the autopilot can actually prove.
+      if (this.applyParamOverlayOnConnect && !this.paramOverlayApplied) {
+        this.applyParamOverlay();
+        this.paramOverlayApplied = true;
+      }
+
+      // Still warn when the autopilot never identifies itself: the overlay has now
+      // been SENT, but nothing has confirmed it was accepted, so every read-back
+      // and every `verified` entry is missing rather than passing.
+      if (this.heartbeatWatch) clearTimeout(this.heartbeatWatch);
+      this.heartbeatWatch = setTimeout(() => {
+        this.heartbeatWatch = null;
+        if (!this.pixhawkHeartbeatSeen) {
+          console.error(
+            `MAVProxy: WARNING no autopilot heartbeat from sys=${this.target_system} ` +
+            `after ${this.heartbeatTimeoutMs} ms although the TCP link is up. ` +
+            `The parameter overlay was transmitted but NOTHING has confirmed it — ` +
+            `treat every critical parameter as unverified. Check SYSID_THISMAV and ` +
+            `mavproxy_target_system.`);
+        }
+      }, this.heartbeatTimeoutMs);
     });
 
     socket.on('data', (data) => {
@@ -293,6 +318,14 @@ class PWMMavproxy {
       console.log('MAVProxy: connection closed, retrying in 2s…');
       // Drop telemetry: with the link down these values are no longer facts.
       this.telemetry = { battery: null, power: null, radio: null, heartbeat: null };
+      // The smoothing window must go with them. Keeping it meant five stale 8.4 V
+      // samples could outvote a fresh 6.0 V reading after a reconnect — measured as
+      // "6.0 V, ~100%" — which does not merely look wrong, it CLEARS the
+      // low-battery warning for up to the full window.
+      this.batteryVoltHistory = [];
+      // Cancel any in-flight overlay: its remaining PARAM_SETs would write to a
+      // dead socket, and on reconnect a fresh chain starts anyway.
+      this.clearOverlayTimers();
       this.verifiedCriticalParams.clear();
       this.paramVerificationFailures.clear();
       if (this.heartbeatWatch) { clearTimeout(this.heartbeatWatch); this.heartbeatWatch = null; }
@@ -526,11 +559,21 @@ class PWMMavproxy {
     this.paramVerificationFailures.clear();
     console.log('MAVProxy: Applying minimal Pixhawk param overlay...');
 
+    // Every timer is tracked and cleared on the next overlay or on close. The
+    // overlay now runs on EVERY connect rather than once per first-heartbeat, so
+    // reconnect churn would otherwise stack overlapping PARAM_SET chains that
+    // nothing could cancel.
+    this.clearOverlayTimers();
     entries.forEach(([name, value], index) => {
-      setTimeout(() => {
+      this.overlayTimers.push(setTimeout(() => {
         console.log(`MAVProxy: PARAM_SET ${name}=${value}`);
-        this.sendPacket(this.buildParamSet(name, value));
-      }, index * 250);
+        // Report a write that never left. Silently ignoring it meant the overlay
+        // could claim to have been applied while nothing reached the link.
+        if (!this.sendPacket(this.buildParamSet(name, value))) {
+          console.error(`MAVProxy: WARNING PARAM_SET ${name}=${value} was NOT written — ` +
+            `the link went down mid-overlay. Treat every critical parameter as unverified.`);
+        }
+      }, index * 250));
     });
 
     // After all writes, read back critical params and warn loudly if
@@ -538,10 +581,16 @@ class PWMMavproxy {
     // throttle" class of failure on a fresh board.
     const writeWindowMs = entries.length * 250 + 500;
     Object.keys(EXPECTED_CRITICAL_PARAMS).forEach((name, index) => {
-      setTimeout(() => {
+      this.overlayTimers.push(setTimeout(() => {
         this.sendPacket(this.buildParamRequestRead(name));
-      }, writeWindowMs + index * 150);
+      }, writeWindowMs + index * 150));
     });
+  }
+
+  // Cancel any in-flight overlay. Bounded and idempotent.
+  clearOverlayTimers() {
+    for (const t of this.overlayTimers) clearTimeout(t);
+    this.overlayTimers = [];
   }
 
   // Build MAVLink v1 PARAM_REQUEST_READ (msg id 20)
@@ -580,8 +629,11 @@ class PWMMavproxy {
   // parser therefore receives nothing it can parse, and because the previous
   // version also did no CRC check, it would resync onto a chance 0xFE byte inside
   // a v2 payload, misread the following bytes as a header, and occasionally
-  // announce a "Pixhawk heartbeat" from pure garbage. Every frame is now CRC-
-  // verified before it is believed.
+  // announce a "Pixhawk heartbeat" from pure garbage. Every frame we DECODE is now
+  // CRC-verified and attributed to the configured target system before it is
+  // believed. Messages we do not decode cannot be CRC-verified — we have no
+  // CRC_EXTRA for them — so their declared length is only trusted when the byte
+  // past it looks like another frame start.
   parseIncoming(data) {
     this.rxBuf = this.rxBuf ? Buffer.concat([this.rxBuf, data]) : Buffer.from(data);
     // Bound the buffer: a desynchronised stream that never yields a valid frame
@@ -605,40 +657,112 @@ class PWMMavproxy {
       const payloadLen = this.rxBuf[1];
       if (this.rxBuf.length < headerLen + 2) return;   // need the header first
 
-      // v2 incompat flag bit 0 = signed, which appends a 13-byte signature.
-      const signatureLen = isV2 && (this.rxBuf[2] & 0x01) ? 13 : 0;
+      // MAVLink requires a receiver to DISCARD any frame carrying an
+      // incompatibility flag it does not understand, because such a flag can
+      // change the framing itself — decoding anyway means decoding a layout we do
+      // not know. Only bit 0 (signed) is understood here. Previously every other
+      // bit was ignored, so a CRC-valid HEARTBEAT with incompat_flags=0x02 was
+      // accepted as the autopilot.
+      const incompat = isV2 ? this.rxBuf[2] : 0;
+      if (incompat & ~0x01) {
+        this.rxBuf = this.rxBuf.subarray(1);
+        continue;
+      }
+
+      // Bit 0 = signed, which appends a 13-byte signature.
+      const signatureLen = (incompat & 0x01) ? 13 : 0;
       const frameLen = headerLen + payloadLen + 2 + signatureLen;
       if (this.rxBuf.length < frameLen) return;        // wait for the rest
 
       const msgId = isV2
         ? this.rxBuf[7] | (this.rxBuf[8] << 8) | (this.rxBuf[9] << 16)
         : this.rxBuf[5];
-      const sysId = isV2 ? this.rxBuf[5] : this.rxBuf[3];
+      const sysId  = isV2 ? this.rxBuf[5] : this.rxBuf[3];
+      const compId = isV2 ? this.rxBuf[6] : this.rxBuf[4];
 
       const crcExtra = MSG_CRC_EXTRA[msgId];
-      if (crcExtra !== undefined) {
-        let expected = PWMMavproxy.crc16(
-          this.rxBuf.subarray(1, headerLen + payloadLen),
-          headerLen - 1 + payloadLen,
-        );
-        expected = PWMMavproxy.crcAccumulate(crcExtra, expected);
-        if (this.rxBuf.readUInt16LE(headerLen + payloadLen) !== expected) {
-          // Almost always a false resync onto a payload byte, not corruption, so
-          // do not log per frame — that would be a log flood on a v2 stream.
-          this.rxBuf = this.rxBuf.subarray(1);
-          continue;
+
+      if (crcExtra === undefined) {
+        // A message we do not decode. We have no CRC_EXTRA for it, so we CANNOT
+        // verify it — which means we must not blindly trust its declared length
+        // either. Skipping `frameLen` unverified let a corrupted length consume the
+        // valid frame that followed it, and it is why the earlier claim that
+        // "every frame is CRC-verified" was not accurate.
+        //
+        // Only accept the declared length when the byte just past it actually
+        // looks like the start of another frame (or the buffer ends there).
+        // Otherwise treat this as garbage and resync a single byte.
+        if (frameLen >= this.rxBuf.length) {
+          // The claimed frame ends exactly at the data we have, so there is no
+          // following byte to corroborate it. Trusting it here was still lossy: a
+          // crafted length ending exactly after an appended valid frame consumed
+          // both. Wait for more instead — on a 4 Hz stream more always arrives, and
+          // MAX_RX_BUFFER bounds the wait.
+          return;
         }
-        // v2 zero-trims trailing zero bytes, so a 31-byte SYS_STATUS can arrive as
-        // 17. Reading fields at fixed offsets from a truncated payload yields
-        // garbage — measured: current_battery read as -25813 instead of 43, and
-        // POWER_STATUS.flags as 36901 instead of 37. Zero-extend to the declared
-        // length so every offset is valid and absent trailing fields read as 0.
-        const payload = PWMMavproxy.zeroExtend(
-          this.rxBuf.subarray(headerLen, headerLen + payloadLen),
-          MSG_PAYLOAD_LEN[msgId] ?? payloadLen,
-        );
-        this.handleMessage(msgId, payload, { sysId, mavlinkVersion: isV2 ? 2 : 1 });
+        const next = this.rxBuf[frameLen];
+        this.rxBuf = (next === 0xFE || next === 0xFD)
+          ? this.rxBuf.subarray(frameLen)
+          : this.rxBuf.subarray(1);
+        continue;
       }
+
+      let expected = PWMMavproxy.crc16(
+        this.rxBuf.subarray(1, headerLen + payloadLen),
+        headerLen - 1 + payloadLen,
+      );
+      expected = PWMMavproxy.crcAccumulate(crcExtra, expected);
+      if (this.rxBuf.readUInt16LE(headerLen + payloadLen) !== expected) {
+        // Almost always a false resync onto a payload byte, not corruption, so
+        // do not log per frame — that would be a log flood on a v2 stream.
+        this.rxBuf = this.rxBuf.subarray(1);
+        continue;
+      }
+
+      // v1 payload lengths are FIXED. Only v2 zero-trims, so a short v1 payload is
+      // malformed rather than truncated, and padding it would invent field values
+      // out of nothing — a CRC-valid 6-byte v1 HEARTBEAT was padded, accepted, and
+      // triggered the parameter overlay before this check existed.
+      if (!isV2 && payloadLen !== MSG_PAYLOAD_LEN[msgId]) {
+        this.rxBuf = this.rxBuf.subarray(1);
+        continue;
+      }
+
+      // Attribute EVERY decoded message to the configured target, not just
+      // HEARTBEAT. sysId was captured but only the heartbeat handler checked it, so
+      // SYS_STATUS, POWER_STATUS and especially PARAM_VALUE accepted data from any
+      // system sharing the link — meaning a foreign vehicle could supply battery
+      // readings or populate verifiedCriticalParams for our target. That matters
+      // more now the overlay is applied on connect and the heartbeat exists to
+      // VERIFY it: unattributed read-backs make the verification meaningless.
+      // RADIO_STATUS is exempt: it describes the LINK and is emitted by the radio
+      // itself, not the autopilot. SiK firmware sends it with source system 51
+      // (ASCII '3'), so a blanket target-system gate silently drops the very radio
+      // telemetry this driver exists to report — a regression introduced by the
+      // first version of this gate and caught only by review, because rover3 has
+      // no SiK radio fitted to notice.
+      //
+      // Everything else we decode is autopilot state, so it must come from the
+      // configured system AND component. compId was previously not checked at all:
+      // a CRC-valid PARAM_VALUE from sysId 1 / compId 99 added entries to
+      // verifiedCriticalParams, which would make the verification the overlay
+      // depends on trivially forgeable by anything else on the link.
+      if (msgId !== MSG_RADIO_STATUS
+          && (sysId !== this.target_system || compId !== this.target_component)) {
+        this.rxBuf = this.rxBuf.subarray(frameLen);
+        continue;
+      }
+
+      // v2 zero-trims trailing zero bytes, so a 31-byte SYS_STATUS can arrive as
+      // 17. Reading fields at fixed offsets from a truncated payload yields
+      // garbage — measured: current_battery read as -25813 instead of 43, and
+      // POWER_STATUS.flags as 36901 instead of 37. Zero-extend to the declared
+      // length so every offset is valid and absent trailing fields read as 0.
+      const payload = PWMMavproxy.zeroExtend(
+        this.rxBuf.subarray(headerLen, headerLen + payloadLen),
+        MSG_PAYLOAD_LEN[msgId],
+      );
+      this.handleMessage(msgId, payload, { sysId, compId, mavlinkVersion: isV2 ? 2 : 1 });
 
       this.rxBuf = this.rxBuf.subarray(frameLen);
     }
@@ -698,7 +822,10 @@ class PWMMavproxy {
       // -1 means not measured; ArduPilot also reports 0 when it is not
       // coulomb-counting, which is indistinguishable from a genuinely flat pack.
       // Treat both as unknown.
-      const fcPct = remaining > 0 ? remaining : null;
+      // A signed byte carries 1..127, but only 1..100 is a valid percentage. 127
+      // was being labelled 'flightcontroller' and rendered as 127%, which also
+      // cleared the low-battery warning.
+      const fcPct = (remaining > 0 && remaining <= 100) ? remaining : null;
 
       // Fall back to a voltage estimate only when the flight controller has
       // nothing usable, so a vehicle that DOES coulomb-count keeps its more
@@ -762,11 +889,11 @@ class PWMMavproxy {
         console.log('MAVProxy: Received first Pixhawk heartbeat ' +
           `(sys=${metadata.sysId ?? '?'} MAVLink ${metadata.mavlinkVersion ?? '?'})`);
         this.pixhawkHeartbeatSeen = true;
-        if (this.applyParamOverlayOnConnect && !this.paramOverlayApplied) {
-          this.applyParamOverlay();
-          this.paramOverlayApplied = true;
-        }
       }
+      // Deliberately does NOT trigger the parameter overlay — that happens on
+      // connect (see _connect). Making the overlay depend on hearing the autopilot
+      // was fail-open: a return path that never delivers left RC_OVERRIDE_TIME at
+      // the flight controller's 3.0 s default while the vehicle stayed drivable.
       return;
     }
 

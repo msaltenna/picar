@@ -520,3 +520,215 @@ test('the socket close handler itself clears telemetry', async () => {
     net.createConnection = realCreate;
   }
 });
+
+// ── The overlay must be applied on CONNECT, not gated behind the heartbeat ────
+//
+// This is the invariant-6 fail-open a Codex review found, and the test that was
+// missing. Gating applyParamOverlay() behind a genuine autopilot heartbeat meant
+// that if the RETURN path failed — wrong sysId, broken framing, a receive path
+// that never delivers — RC_OVERRIDE_TIME=0.2 was never transmitted, while
+// outbound ARM and RC overrides kept working. ArduPilot silently kept its 3.0 s
+// default: a 15x longer window in which a stale override persists, on a vehicle
+// that was still drivable. Nothing recovered from it; the watchdog only logs.
+//
+// The earlier heartbeat tests all pass `mavproxy_apply_param_overlay: false`, so
+// none of them could ever have caught this. Mutation confirmed it: deleting the
+// applyParamOverlay() call left the whole suite green.
+
+function withFakeConnect(run) {
+  const handlers = {};
+  const writes = [];
+  const fakeSocket = {
+    destroyed: false,
+    on(evt, fn) { handlers[evt] = fn; },
+    write(b) { writes.push(Buffer.from(b)); return true; },
+  };
+  const net = require('net');
+  const realCreate = net.createConnection;
+  net.createConnection = (_opts, onConnect) => { setImmediate(onConnect); return fakeSocket; };
+  return { handlers, writes, restore: () => { net.createConnection = realCreate; } };
+}
+
+function stopTimers(d) {
+  if (d.interval)          { clearInterval(d.interval);          d.interval = null; }
+  if (d.heartbeatInterval) { clearInterval(d.heartbeatInterval); d.heartbeatInterval = null; }
+  if (d.heartbeatWatch)    { clearTimeout(d.heartbeatWatch);     d.heartbeatWatch = null; }
+  if (d.armTimeout)        { clearTimeout(d.armTimeout);         d.armTimeout = null; }
+  d._connect = () => {};                       // neuter the close-handler retry
+  d.client = { destroyed: true, write: () => false };
+}
+
+test('connecting applies the parameter overlay without waiting for a heartbeat', async () => {
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false });
+    let overlayCalls = 0;
+    d.applyParamOverlay = () => { overlayCalls += 1; };
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(overlayCalls, 1,
+      'the overlay must be applied on connect — gating it on the heartbeat was fail-open');
+    assert.equal(d.pixhawkHeartbeatSeen, false,
+      'and it must NOT have required an autopilot heartbeat first');
+  } finally {
+    // Unconditional. With this after the assertions, a failing mutant leaked the
+    // driver's 20 Hz interval and `node --test` HUNG instead of reporting the
+    // failure — which reads exactly like a pass.
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('the overlay is applied even when no autopilot heartbeat ever arrives', async () => {
+  // The failure this exists to prevent: a one-way return path. We transmit fine and
+  // hear nothing back, so RC_OVERRIDE_TIME must still reach the wire.
+  //
+  // applyParamOverlay() spaces its PARAM_SETs 250 ms apart and then schedules
+  // read-backs, so the real chain runs for ~3 s AND its timers are untracked (a
+  // known P1). Waiting for it made this test slow and leaked handles into the
+  // runner. So run the chain synchronously by swapping setTimeout for an immediate
+  // executor: deterministic, fast, and nothing survives the test.
+  const h = withFakeConnect();
+  const realSetTimeout = global.setTimeout;
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false });
+    const params = [];
+    d.buildParamSet = (name, value) => { params.push([name, value]); return Buffer.alloc(0); };
+    d.buildParamRequestRead = () => Buffer.alloc(0);
+    d.sendPacket = () => true;
+
+    global.setTimeout = (fn) => { fn(); return { unref() {} }; };
+    d.applyParamOverlay();
+    global.setTimeout = realSetTimeout;
+
+    const names = params.map(([n]) => n);
+    assert.ok(names.includes('RC_OVERRIDE_TIME'),
+      `RC_OVERRIDE_TIME must be transmitted with no heartbeat at all (sent: ${names.join(',')})`);
+    assert.equal(params.find(([n]) => n === 'RC_OVERRIDE_TIME')[1], 0.2,
+      'and it must carry 0.2, not the flight controller default of 3.0');
+    assert.equal(d.pixhawkHeartbeatSeen, false, 'with no autopilot heartbeat received');
+  } finally {
+    global.setTimeout = realSetTimeout;
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('a heartbeat does not re-apply the overlay a second time', async () => {
+  // The heartbeat is now for VERIFICATION only. It must not re-trigger the overlay,
+  // or every reconnect-plus-heartbeat would stack overlapping PARAM_SET chains.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false });
+    let overlayCalls = 0;
+    d.applyParamOverlay = () => { overlayCalls += 1; };
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(overlayCalls, 1);
+
+    // A genuine autopilot heartbeat: autopilot != 8, sysId == target.
+    d.parseIncoming(frameV1(MSG.HEARTBEAT,
+      heartbeatPayload({ type: 11, autopilot: 3, base_mode: 129 })));
+    assert.equal(d.pixhawkHeartbeatSeen, true, 'the heartbeat is still recognised');
+    assert.equal(overlayCalls, 1, 'but it must not apply the overlay again');
+  } finally {
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('a reconnect discards the voltage smoothing window', async () => {
+  // Stale samples survived a reconnect, so an old high reading could outvote a
+  // fresh low one: five 8.4 V samples then a reconnect and a real 6.0 V reading
+  // reported "6.0 V, ~100%". That does not merely look wrong — it CLEARS the
+  // low-battery warning for up to the whole window.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({
+      mavproxy_autostart: false,
+      battery_empty_volts: 6.0,
+      battery_full_volts: 8.4,
+      battery_pct_median_samples: 5,
+    });
+    d.applyParamOverlay = () => {};
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+
+    for (let i = 0; i < 5; i++) {
+      d.parseIncoming(frameV1(MSG.SYS_STATUS,
+        sysStatusPayload({ voltage_mV: 8400, current_cA: 45, remaining: 0 })));
+    }
+    assert.equal(d.telemetry.battery.remainingPct, 100, 'precondition: reads full');
+
+    d._connect = () => {};
+    h.handlers.close();
+    assert.deepEqual(d.batteryVoltHistory, [],
+      'the smoothing window must be discarded with the rest of the telemetry');
+
+    // A fresh low reading after the reconnect must read low immediately.
+    d.parseIncoming(frameV1(MSG.SYS_STATUS,
+      sysStatusPayload({ voltage_mV: 6000, current_cA: 45, remaining: 0 })));
+    assert.equal(d.telemetry.battery.remainingPct, 0,
+      'a fresh 6.0 V reading must not be masked by pre-reconnect samples');
+  } finally {
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('RC_OVERRIDE_TIME is the FIRST parameter written, not the seventh', () => {
+  // It is the flight controller's own stale-override failsafe: until it lands,
+  // ArduPilot is on its 3.0 s default while picar is already streaming overrides.
+  // As the seventh entry it went out ~1500 ms after connect (250 ms spacing), so
+  // ordering here is a safety property, not cosmetics.
+  const d = new PWMMavproxy({ mavproxy_autostart: false });
+  const names = Object.keys(d.paramOverlay);
+  assert.equal(names[0], 'RC_OVERRIDE_TIME',
+    `RC_OVERRIDE_TIME must be written first (order: ${names.join(',')})`);
+  assert.equal(d.paramOverlay.RC_OVERRIDE_TIME, 0.2);
+});
+
+test('a reconnect cancels an in-flight overlay instead of stacking chains', () => {
+  // The overlay now runs on every connect, so without cancellation reconnect churn
+  // stacks overlapping PARAM_SET chains that nothing can stop.
+  const d = new PWMMavproxy({ mavproxy_autostart: false });
+  d.sendPacket = () => true;
+  d.applyParamOverlay();
+  const first = d.overlayTimers.length;
+  assert.ok(first > 0, 'the overlay must schedule tracked timers');
+
+  d.applyParamOverlay();
+  assert.equal(d.overlayTimers.length, first,
+    're-applying must cancel the previous chain, not add to it');
+
+  d.clearOverlayTimers();
+  assert.deepEqual(d.overlayTimers, [], 'and they must be cancellable');
+});
+
+test('a PARAM_SET that could not be written is reported, not silently dropped', () => {
+  // paramOverlayApplied becomes true before any write executes, so a link that dies
+  // mid-overlay must at least say so — otherwise the overlay claims to have been
+  // applied while nothing reached the flight controller.
+  const realSetTimeout = global.setTimeout;
+  const errs = [];
+  const realError = console.error;
+  try {
+    const d = new PWMMavproxy({ mavproxy_autostart: false });
+    d.sendPacket = () => false;                 // link down
+    d.buildParamSet = () => Buffer.alloc(0);
+    d.buildParamRequestRead = () => Buffer.alloc(0);
+    console.error = (m) => errs.push(String(m));
+    global.setTimeout = (fn) => { fn(); return { unref() {} }; };
+    d.applyParamOverlay();
+  } finally {
+    global.setTimeout = realSetTimeout;
+    console.error = realError;
+  }
+  assert.ok(errs.some((e) => e.includes('was NOT written')),
+    `a failed PARAM_SET must be reported (saw: ${errs.length} errors)`);
+});

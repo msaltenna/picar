@@ -147,6 +147,10 @@ const throttle_ramp_down = 0;
 const telemetry_interval_ms = Math.max(250, Number(config.telemetry_interval_ms) || 1000);
 const batteryWarnLevel      = config.batteryWarnLevel ?? 20;
 const batteryWarnVolts      = config.batteryWarnVolts ?? null;
+// Fail closed when the battery monitor reports nothing usable. Set false only
+// on a vehicle that genuinely has no battery monitor, where a permanent warning
+// would be noise rather than information.
+const batteryWarnOnNoReading = config.batteryWarnOnNoReading !== false;
 
 let wifiLink = null;
 
@@ -177,25 +181,23 @@ function currentTelemetry() {
   return { ...fc, wifi: wifiLink };
 }
 
-// A battery is "in trouble" when the flight controller reports a remaining
-// percentage at or below batteryWarnLevel, or a pack voltage at or below
-// batteryWarnVolts when that is configured. Remaining percentage is unreliable
-// unless BATT_CAPACITY is set on the flight controller — it reads 0 when unset —
-// so the driver reports null in that case and only voltage can raise the warning.
-function batteryTrouble(t) {
-  if (!t.battery) return false;
-  const { remainingPct, voltageV } = t.battery;
-  if (remainingPct !== null && remainingPct <= batteryWarnLevel) return true;
-  if (batteryWarnVolts !== null && voltageV !== null && voltageV <= batteryWarnVolts) return true;
-  return false;
-}
+// Extracted to battery-warning.js so the rule is testable — app.js binds both
+// HTTPS ports and the MAVProxy socket at require time, so nothing here is
+// reachable from a host test. A mutation reverting the fail-closed clause left
+// the entire suite green while it lived inline.
+const { batteryTrouble } = require('./battery-warning');
+const batteryWarnCfg = {
+  warnLevel:       batteryWarnLevel,
+  warnVolts:       batteryWarnVolts,
+  warnOnNoReading: batteryWarnOnNoReading,
+};
 
 setInterval(() => {
   refreshWifiLink();
   const t = currentTelemetry();
   // Bit 0 of the Fleet Manager status bitmask is "battery trouble". It was defined
   // and exported but never actually set by anything until now.
-  fleetClient.setStatusBit(0, batteryTrouble(t));
+  fleetClient.setStatusBit(0, batteryTrouble(t.battery, batteryWarnCfg));
   fleetClient.setTelemetry({
     batteryV:    t.battery ? t.battery.voltageV : null,
     batteryPct:  t.battery ? t.battery.remainingPct : null,
@@ -220,7 +222,7 @@ io.on('connection', (socket) => {
 
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
-  socket.emit('telemetryConfig', { batteryWarnLevel, batteryWarnVolts });
+  socket.emit('telemetryConfig', { batteryWarnLevel, batteryWarnVolts, batteryWarnOnNoReading });
   socket.emit('telemetry', currentTelemetry());
 
   socket.on('arm', () => {

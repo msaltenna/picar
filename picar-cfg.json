@@ -6,6 +6,8 @@
   "comment_telemetry": "Battery/power come from the flight controller (SYS_STATUS, POWER_STATUS). batteryWarnLevel is a remaining-percentage threshold; batteryWarnVolts is a voltage threshold that always works regardless of where the percentage comes from. Set batteryWarnVolts for your pack (e.g. 3.5V x cells).",
   "batteryWarnLevel": 20,
   "batteryWarnVolts": null,
+  "comment_battery_no_reading": "batteryWarnOnNoReading makes an unreadable battery monitor a WARNING rather than an all-clear. SYS_STATUS maps both 0 mV and 65535 mV to unknown, so without this a dead pack or a failed power module reported no trouble while 1% remaining did. Set false only on a vehicle with no battery monitor at all.",
+  "batteryWarnOnNoReading": true,
   "telemetry_interval_ms": 1000,
 
   "comment_battery_pct": "The flight controller's own battery percentage is only usable when it coulomb-counts, which needs BATT_MONITOR and BATT_CAPACITY set AND current_consumed actually reported. On rover3 it is NOT: BATT_CAPACITY=3300 and BATT_MONITOR=4 are set, yet 24169 BATTERY_STATUS frames carried current_consumed=-1 (not measured) and battery_remaining=0. So set battery_empty_volts/battery_full_volts for your pack and the percentage is interpolated linearly from voltage instead. Both must be set, finite, and full > empty, or the estimate stays off. Examples: 2S LiPo 6.0/8.4, 3S LiPo 9.0/12.6, 6-cell NiMH 6.0/8.4. Telemetry reports which source it used in battery.pctSource ('flightcontroller' or 'voltage'); a voltage estimate SAGS UNDER LOAD, so it is smoothed over battery_pct_median_samples readings and the UI marks it with a leading ~.",
