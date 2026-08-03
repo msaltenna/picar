@@ -66,6 +66,37 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   reject non-neutral commands until a neutral one has been seen since the last arm, and treat a
   non-neutral first command as a fail-safe stop rather than a clamp.
 
+- **DISARM does not disarm this flight controller — demonstrated on rover3, 2026-08-03** —
+  the fail-safe reports success and the vehicle stays armed. Evidence, from MAVProxy's own tlog
+  while rover3 ran `main`'s code at SHA `268561f`:
+  - picar transmitted exactly **one** `COMMAND_LONG` `MAV_CMD_COMPONENT_ARM_DISARM`
+    (`param1=0`, `param2=21196` force) at 17:53:32, present on the wire as a v1 frame.
+  - The flight controller — `sysid 1`, `autopilot 3` (ArduPilotMega), `type 11` (GROUND_ROVER) —
+    then sent **222 consecutive HEARTBEATs** over 3 m 40 s, *every one* with `base_mode 129`
+    (`SAFETY_ARMED | CUSTOM_MODE_ENABLED`). **Never once unarmed.**
+  - The FC sent **no `COMMAND_ACK` for command 400** at all. The only ACKs present are command
+    410 (`GET_HOME_POSITION`) with `result=FAILED`, repeating every 2 s (expected — GPS is
+    disabled).
+
+  Meanwhile `sendPacket()` returned `true`, `neutralizeAndDisarm()` returned
+  `{neutralSent: true, disarmSent: true}`, and `app.js:284` logged
+  `### FAIL-SAFE STOP (…) neutral=true disarm=true`. **Every layer reported success and the
+  vehicle remained armed.** This converts residual 1 of the fail-safe entry below from a
+  theoretical gap ("a successful `write()` is not proof of delivery") into a demonstrated
+  failure of the platform's core safety primitive.
+
+  Root cause not yet identified. Candidates: MAVProxy not forwarding picar's v1 `COMMAND_LONG`
+  to the serial link; the FC silently rejecting the frame; or a framing detail rejected without
+  ACK. ArduPilot normally ACKs every `COMMAND_LONG`, so the total absence of an ACK for 400
+  suggests the FC never accepted a valid frame. **Diagnosing this requires COMMAND_ACK parsing,
+  which requires the v2 parser** — so it is gated behind the telemetry-branch merge. Do that
+  first, then re-test.
+
+  Corollary, and it supersedes the older note that "`main` never disarms it": `main` *does* send
+  a disarm on connect (`pwm_mavproxy_servo.js:149`) — it simply does not work. **Assume any rover
+  may be armed at any time, including after a picar restart, a crash, or a reboot.** No actuation
+  was possible during this test; rover3's flight battery is disconnected.
+
 - **Two ways the input watchdog is defeated, both leaving throttle applied** —
   1. **Window blur latches held keys.** `socket.html:1514` is
      `document.addEventListener('keyup', …)`, so when focus moves to another window the `keyup`
@@ -326,7 +357,15 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   units active, verified 2026-08-03). It also lands the **MAVLink v2 (`0xFD`) parser** — its
   comment states MAVProxy on this platform forwards v2 exclusively — and proved param read-back
   works here: all seven `EXPECTED_CRITICAL_PARAMS` verified live, `missing: []`, journal showing
-  `Received first Pixhawk heartbeat (sys=1 MAVLink 2)`. **No rebase is needed** — `6675341`'s
+  `Received first Pixhawk heartbeat (sys=1 MAVLink 2)`. **Re-confirmed on rover3 2026-08-03** by
+  running both builds back to back: on `main`'s code `/status` has no telemetry and **zero** params
+  verify; on `a979b59` it returns
+  `"params":{"verified":[all 7],"missing":[],"mismatched":{}}`, `autopilotHeartbeat:true`, battery
+  7.986 V / 0.45 A, board 5.163 V, servo 6.017 V, wifi 70 % / −61 dBm, `radio:null` (no SiK radio
+  fitted — consistent with the tlog showing zero `RADIO_STATUS` frames).
+  Caveat: it "verifies" `FRAME_CLASS` against `EXPECTED_CRITICAL_PARAMS`, which still expects
+  **2 (Boat)** — so read-back confirms the wrong value, which is why the `FRAME_CLASS` P0 must be
+  fixed in the same change. **No rebase is needed** — `6675341`'s
   parent *is* current `main` (`4580209`), and `git rev-list 6675341..main` is empty. Before
   merging: obtain the **required** Codex review (see the re-review entry — this branch is gated by
   invariant 6, not merely owed a review), and if `FRAME_CLASS: 1` or the missing `armDelayMs`

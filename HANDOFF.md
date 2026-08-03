@@ -175,8 +175,50 @@ Codex could not run `npm test` itself (two video tests write YAML under `/tmp`, 
 `EROFS` in its read-only sandbox — an environment restriction, not a regression). Verified here
 instead: **46/46**.
 
-**Validation:** pending. Markdown-only — `git diff --name-only` returns five `.md` files and zero
-runtime files — so this cannot alter runtime behaviour.
+**Validation: PASS** — rover3, 2026-08-03 17:53–17:57 BST.
+**Validated SHA: `268561f0dd73dcc39b3737460103372d51b7b58c`** (deployed by git bundle).
+
+Markdown-only (`git diff --name-only main..268561f` → five `.md` files, zero runtime files), so
+this proves the rover is healthy on the deployed SHA rather than exercising new behaviour.
+
+- *Services:* `picar`, `mavproxy`, `mediamtx` all active, `NRestarts=0` after restart.
+- *Startup:* clean — `Applied local overrides…`, `Rover ID: 3`, MAVProxy driver at 20 Hz,
+  `Stream codec: webrtc`, web server up. No error or refusal lines.
+- *Host suite on-target:* **46/46** under the rover's Node **v20.19.2**.
+- *Endpoints:* `/status` → `{"status":"OK","throttle":0,"steering":0}`; `socket.html` 200;
+  `socket.io` polling 200; WHEP `:8889` 204.
+- *Wire:* `RC Override: ch1=1500 ch2=2000 ch3=1500` streaming — steering and throttle neutral,
+  ch2 at the configured `shift_default_us` (2000 = low gear, wiring reversed).
+- *No arming attempted. No actuation is possible — the flight battery is disconnected.*
+
+**Three findings came out of the wire capture, and they matter more than the doc change.** Because
+this branch runs `main`'s code, the capture is direct evidence about `main`:
+
+1. **Zero of nine `PARAM_SET` writes were ever verified** — confirming live that `main`'s v1-only
+   parser discards every reply. Nine `PARAM_SET` lines, zero `verified`, zero `WARNING`.
+2. **`main`'s "Received first Pixhawk heartbeat" is picar seeing its OWN heartbeat echoed back.**
+   Parsing MAVProxy's tlog by protocol version: **8391 v2 (`0xFD`) frames vs 2003 v1 (`0xFE`)**, and
+   1907 of the v1 are picar's own outbound `RC_CHANNELS_OVERRIDE`. Heartbeats break down as
+   `v1 sysid 255 comp 0 type 6 autopilot 8` (exactly what `buildHeartbeat()` emits — picar's own),
+   `v2 sysid 255 comp 230 autopilot 8` (MAVProxy's GCS heartbeat) and
+   `v2 sysid 1 comp 1 type 11 autopilot 3` (the real Pixhawk). Since `main` accepts only v1, the
+   *only* v1 heartbeat it can see is its own. This is sharper than the previous note in this file,
+   which guessed it was MAVProxy's.
+3. 🔴 **DISARM does not disarm this vehicle.** One `COMMAND_LONG ARM_DISARM` (`param1=0`,
+   `param2=21196`) went out at 17:53:32 and reached the wire; the flight controller then sent
+   **222 consecutive HEARTBEATs, all `base_mode 129` (`SAFETY_ARMED`), never once unarmed**, and
+   never ACKed command 400. Every software layer reported success. Filed as a new P0 in `TASKS.md`;
+   diagnosing it needs COMMAND_ACK parsing, so it is gated behind the telemetry-branch merge.
+   **Assume any rover may be armed at any time.**
+
+Finally, restoring rover3 to `a979b59` produced a clean A/B on the same hardware minutes apart:
+`main` verifies **0** critical params and exposes no telemetry, while the telemetry branch returns
+all **7** verified with `missing: []` plus live battery, board/servo rail and WiFi figures. That is
+the strongest argument yet for landing that branch — subject to the Codex review its own commit
+body requires.
+
+**Rover left on `feature/battery-and-radio-telemetry` @ `a979b59`** — the state it was found in —
+clean tree, all three services active, `NRestarts=0`, `/status` responding.
 
 ### 2026-07-31 — `perf/bound-video-latency` — **MERGED** at `4580209`
 
