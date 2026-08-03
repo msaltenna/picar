@@ -100,10 +100,20 @@ test('a drivetrain channel refuses every non-endpoint value, including 0', () =>
 });
 
 test('a refused gear command never lands mid-travel', () => {
-  for (const value of [[], null, 0]) {
+  // Assert the channel HELD its previous position, not merely that it is not
+  // 1500. The constructor default is shift_default_us (2000), so a bare
+  // `notEqual(…, 1500)` was already satisfied before the refused call ran and
+  // would pass even if setServoPWM moved the fork anywhere else.
+  for (const value of [[], null, 0, 0.5, 'abc']) {
     const d = new PWMMavproxy({ mavproxy_autostart: false });
-    d.setServoPWM('shift', value);
-    assert.notEqual(wireChannel(d, SHIFT_CH), 1500);
+    d.setServoPWM('shift', -1);                       // a real, valid endpoint
+    const held = wireChannel(d, SHIFT_CH);
+    assert.equal(held, 1000, 'precondition: the fork is at a known endpoint');
+
+    assert.equal(d.setServoPWM('shift', value), false);
+    assert.equal(wireChannel(d, SHIFT_CH), held,
+      `the fork moved after refusing ${JSON.stringify(value) ?? 'undefined'}`);
+    assert.notEqual(wireChannel(d, SHIFT_CH), 1500, 'and it is certainly not mid-travel');
   }
 });
 
@@ -124,10 +134,14 @@ test('throttle and steering remain continuous, unlike the drivetrain channels', 
 });
 
 test('setServoPWM reports applied/dropped rather than returning undefined', () => {
+  // Assert the VALUES, not just the type. `typeof … === 'boolean'` is satisfied
+  // by a setter that unconditionally returns false — which would report every
+  // legitimate command as dropped and still pass.
   const d = new PWMMavproxy({ mavproxy_autostart: false });
-  assert.equal(typeof d.setServoPWM('shift', 1), 'boolean');
-  assert.equal(typeof d.setServoPWM('shift', 'x'), 'boolean');
-  assert.equal(d.setServoPWM('nonexistent', 1), false);
+  assert.equal(d.setServoPWM('shift', 1), true,       'an applied command reports true');
+  assert.equal(d.setServoPWM('throttle', 0.4), true,  'a continuous command reports true');
+  assert.equal(d.setServoPWM('shift', 'x'), false,    'a dropped command reports false');
+  assert.equal(d.setServoPWM('nonexistent', 1), false, 'an unknown channel reports false');
 });
 
 // ── Fail-safe ORDER on the wire, not in call order ───────────────────────────
@@ -224,9 +238,17 @@ test('disarm reports failure when the write fails, and neutralizeAndDisarm propa
     'a failed DISARM write must not be reported as sent');
 });
 
-test('disarm returns a boolean rather than undefined', () => {
-  const { d } = driverWithRecorder();
-  assert.equal(typeof d.disarm(), 'boolean');
+test('disarm reports whether the DISARM actually reached the socket', () => {
+  // Assert both directions. The previous version checked only
+  // `typeof d.disarm() === 'boolean'`, which a stub returning a constant
+  // satisfies — so it pinned the type while leaving the property invariant 10
+  // cares about (does the value reflect reality?) unverified.
+  const up = driverWithRecorder({ connected: true });
+  assert.equal(up.d.disarm(), true, 'a delivered DISARM reports true');
+
+  const down = driverWithRecorder({ connected: false });
+  assert.equal(down.d.disarm(), false,
+    'a DISARM that could not be written must not be reported as sent');
 });
 
 // ── Reconnect must not inherit an armed vehicle ──────────────────────────────

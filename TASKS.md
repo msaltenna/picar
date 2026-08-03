@@ -303,24 +303,58 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
-- **`app.js` has no test file, and 8 of 23 mutations survive the suite** — measured 2026-08-03
-  against `main` @ `4580209` (46/46 green baseline, tree restored clean afterwards). Surviving
-  mutants, each a real safety regression the suite does not notice:
-  1. Delete the input watchdog **entirely** (`app.js:265-271`) — invariant 5.
-  2. Degrade `failSafeStop` (`app.js:277-287`) back to `setServoPWM`-then-`disarm`, which sends
-     DISARM before neutral — invariant 6, the exact defect `c6043d7` was written to fix.
-  3. Delete `neutralizeAndDisarm()` from `_connect()` (`pwm_mavproxy_servo.js:149`) — proves
-     `test/drivetrain-safety.test.js:234` is vacuous; it never calls `_connect()`.
-  4. Remove the `drivetrainBusy` interlock from the `arm` handler (`app.js:137-141`).
-  5. `setDrivetrain` skips the fail-safe result check (`app.js:197`).
-  6. Drop throttle validation/clamping in `fromclient` (`app.js:238`).
-  7. Remove both `Number.isFinite` guards in `setServoPWM` (`:243` and `:259`).
-  8. Remove the raw-input guard alone (`:243`).
+- **`app.js` has no test file at all, and five safety mutants survive because of it** — measured
+  2026-08-03. `grep` over `test/` finds no coverage of `io.on`, `socket.on`, `setDrivetrain` or
+  `failSafeStop`, so every Socket.IO handler is unverified. Each of these can be applied to `main`
+  with the suite still fully green:
+  1. Delete the input watchdog **entirely** (`app.js:265-271`) — invariant 5. The single most
+     safety-critical timer in the repo.
+  2. Degrade `failSafeStop` (`app.js:277-287`) back to `setServoPWM`-then-`disarm`, which puts
+     DISARM on the wire before neutral — invariant 6, the exact defect `c6043d7` was written to
+     fix. The driver primitive is pinned by a test; the `app.js` call site is not.
+  3. Remove the `drivetrainBusy` interlock from the `arm` handler (`app.js:137-141`).
+  4. `setDrivetrain` skips the fail-safe result check (`app.js:197`), actuating a gear against a
+     vehicle whose disarm was never confirmed.
+  5. Drop throttle validation and clamping in `fromclient` (`app.js:238`).
 
-  Also vacuous: `test/drivetrain-safety.test.js:227` and `:126` assert only `typeof === 'boolean'`
-  (a stub returning `false` always passes), and `:102` asserts `notEqual(…, 1500)` on a channel
-  whose constructor default is already 2000. Fix: a `test/app-safety.test.js` driving the real
-  Socket.IO handlers, and make the `_connect()` test actually call `_connect()`.
+  Fix: a `test/app-safety.test.js` driving the real handlers. `app.js` currently binds both HTTPS
+  ports and connects to MAVProxy at require time, so it is not loadable under test — this needs the
+  handler wiring extracted into an exported factory with injected dependencies. Note the suite must
+  keep working under `npm ci --omit=dev` on the rover, so **no new test dependency** (no
+  `socket.io-client`); use Node built-ins and a fake socket.
+
+  *(The three driver-side survivors from the same pass — both `Number.isFinite` guards and
+  `neutralizeAndDisarm()` in `_connect()` — were closed by `test/driver-safety-gaps`, along with
+  four vacuous assertions and the whole `close`/reconnect lifecycle. See `HANDOFF.md`.)*
+
+- **A corrupt PWM range releases the override on both motion channels and makes the fail-safe
+  unable to centre them** — found 2026-08-03 while writing the config test in
+  `test/driver-safety-gaps.test.js`.
+  `pwm_mavproxy_servo.js:66-68` computes `this.neutral = Math.round((this.min_us + this.max_us) / 2)`.
+  A `pwm_min_us`/`pwm_max_us` that is truthy but non-numeric (`'x'`, `{}`) survives the
+  `config.pwm_max_us || 2000` idiom, so `this.neutral` becomes `NaN`. The channel initialisers at
+  `:92-96` that fall back to `this.neutral` then store `NaN`, which a `Uint16Array` coerces to
+  **0**, and `buildRCOverride:346` maps 0 to the **65535 "ignore this channel" sentinel**.
+
+  Measured, not assumed — the effect is channel-specific, because only some initialisers use
+  `this.neutral`:
+  - `pwm_max_us: 'x'` → buffer `[0,0,0,0,1000,0,0,0]`, wire
+    `[65535,65535,65535,65535,1000,65535,65535,65535]`
+  - `pwm_min_us: 'x'` → buffer `[0,2000,0,2000,0,0,0,0]`, wire
+    `[65535,2000,65535,2000,65535,65535,65535,65535]`
+
+  Either way **steering (ch1) and throttle (ch3) both go to 65535**, and
+  `channelNeutralUs` becomes `{steering: 0, throttle: 0}` — so
+  `neutralizeAndDisarm()` transmits 65535 on exactly the two channels it exists to centre. **The
+  fail-safe releases the motion overrides instead of neutralising them** (invariant 6).
+  `setServoPWM` correctly refuses every command in this state, so the vehicle is simultaneously
+  uncontrollable and un-neutralisable.
+
+  Reachable with no review via `picar-cfg.local.json` — a concrete mechanism for the
+  config-overlay P0 above. Two scope limits, both verified: `NaN` is harmless (falsy, so the `||`
+  default rescues it), and `Infinity` is **not reachable from a JSON config** at all, so the
+  practical vector is a truthy non-numeric value. Fix: validate the range at construction and
+  refuse to start on a non-finite one.
 
 - **No CI runs the test suite** — `.github/workflows/claude.yml` and
   `.github/workflows/claude-code-review.yml` only invoke Claude review; neither runs `npm test`.
