@@ -3,10 +3,15 @@
   "comment_fleetManagerUrl": "'auto' = discover the Fleet Manager on the LAN (OS-agnostic, no IP/hostname needed). Or set an explicit http://host:port. Empty disables.",
   "fleetManagerUrl": "auto",
   "fleet_heartbeat_interval_s": 5,
-  "comment_telemetry": "Battery/power come from the flight controller (SYS_STATUS, POWER_STATUS). batteryWarnLevel is a remaining-percentage threshold and only works if BATT_CAPACITY is set on the flight controller - it reports 0 when unset, which is why batteryWarnVolts exists as a voltage threshold that always works. Set batteryWarnVolts for your pack (e.g. 3.5V x cells).",
+  "comment_telemetry": "Battery/power come from the flight controller (SYS_STATUS, POWER_STATUS). batteryWarnLevel is a remaining-percentage threshold; batteryWarnVolts is a voltage threshold that always works regardless of where the percentage comes from. Set batteryWarnVolts for your pack (e.g. 3.5V x cells).",
   "batteryWarnLevel": 20,
   "batteryWarnVolts": null,
   "telemetry_interval_ms": 1000,
+
+  "comment_battery_pct": "The flight controller's own battery percentage is only usable when it coulomb-counts, which needs BATT_MONITOR and BATT_CAPACITY set AND current_consumed actually reported. On rover3 it is NOT: BATT_CAPACITY=3300 and BATT_MONITOR=4 are set, yet 24169 BATTERY_STATUS frames carried current_consumed=-1 (not measured) and battery_remaining=0. So set battery_empty_volts/battery_full_volts for your pack and the percentage is interpolated linearly from voltage instead. Both must be set, finite, and full > empty, or the estimate stays off. Examples: 2S LiPo 6.0/8.4, 3S LiPo 9.0/12.6, 6-cell NiMH 6.0/8.4. Telemetry reports which source it used in battery.pctSource ('flightcontroller' or 'voltage'); a voltage estimate SAGS UNDER LOAD, so it is smoothed over battery_pct_median_samples readings and the UI marks it with a leading ~.",
+  "battery_empty_volts": null,
+  "battery_full_volts": null,
+  "battery_pct_median_samples": 5,
 
   "comment1": "pigpion is for the native picpio lib in C",
   "comment2": "mavproxy is backend for mavproxy to talk w/ pixhawk, push pwm there ",

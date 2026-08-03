@@ -199,6 +199,10 @@ setInterval(() => {
   fleetClient.setTelemetry({
     batteryV:    t.battery ? t.battery.voltageV : null,
     batteryPct:  t.battery ? t.battery.remainingPct : null,
+    // Forwarded so the dashboard can mark an estimate, exactly as the rover UI
+    // does. Without it the Fleet Manager would present a voltage-derived
+    // percentage as if the flight controller had measured it.
+    batteryPctSource: t.battery ? t.battery.pctSource : null,
     batteryA:    t.battery ? t.battery.currentA : null,
     radioRssi:   t.radio ? t.radio.rssi : null,
     boardV:      t.power ? t.power.boardV : null,

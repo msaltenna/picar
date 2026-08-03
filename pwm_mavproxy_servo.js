@@ -132,6 +132,46 @@ class PWMMavproxy {
     this.applyParamOverlayOnConnect = config.mavproxy_apply_param_overlay !== false;
 
     this.seq = 0;
+
+    // ── Voltage-derived battery percentage ───────────────────────────────────
+    //
+    // The flight controller's own battery_remaining is only usable when it
+    // coulomb-counts. On this vehicle it does not: BATT_CAPACITY=3300 and
+    // BATT_MONITOR=4 are both set, yet 24169 BATTERY_STATUS frames carried
+    // current_consumed = -1 (not measured) and battery_remaining = 0. So when a
+    // pack range is configured we interpolate a percentage from voltage instead,
+    // and always report which source was used.
+    //
+    // Validated as a pair, because a half-configured or inverted range would
+    // produce a confidently wrong number on a display an operator trusts. Any
+    // rejection disables the estimate rather than guessing a default: there is no
+    // safe default for a pack whose chemistry and cell count we do not know.
+    const emptyV = config.battery_empty_volts;
+    const fullV  = config.battery_full_volts;
+    this.batteryRange = null;
+    if (emptyV !== null && emptyV !== undefined && fullV !== null && fullV !== undefined) {
+      if (!Number.isFinite(emptyV) || !Number.isFinite(fullV)) {
+        console.error('Battery percentage disabled: battery_empty_volts / battery_full_volts ' +
+          `must both be finite numbers (got ${JSON.stringify(emptyV)} / ${JSON.stringify(fullV)})`);
+      } else if (emptyV < 0 || fullV <= emptyV) {
+        console.error('Battery percentage disabled: need 0 <= battery_empty_volts < ' +
+          `battery_full_volts (got ${emptyV} / ${fullV})`);
+      } else {
+        this.batteryRange = { emptyV, fullV };
+        console.log(`Battery percentage from voltage: ${emptyV}V = 0%, ${fullV}V = 100%`);
+      }
+    }
+
+    // A voltage estimate sags under throttle, so smooth it with a rolling MEDIAN
+    // rather than a mean — a median ignores a brief current spike outright, where
+    // a mean drags the whole reading down with it. Bounded by construction, and
+    // clamped to a sane window: this array is written on every SYS_STATUS frame.
+    const requestedSamples = config.battery_pct_median_samples;
+    this.batteryPctSamples = Number.isFinite(requestedSamples)
+      ? Math.max(1, Math.min(31, Math.round(requestedSamples)))
+      : 5;
+    this.batteryVoltHistory = [];
+
     // Latest decoded telemetry. Each entry carries its own `at` timestamp so a
     // reader can tell a live reading from a stale one — reporting a last-known
     // battery voltage as if it were current is worse than reporting nothing.
@@ -604,6 +644,35 @@ class PWMMavproxy {
     }
   }
 
+  // Record a voltage reading and return the median of the recent window, or null
+  // if there is nothing usable. Kept separate from the mapping so the smoothing is
+  // testable on its own — a smoothing bug that only shows up through the
+  // percentage is hard to attribute.
+  smoothedBatteryVolts(voltageV) {
+    if (!Number.isFinite(voltageV)) return null;
+    this.batteryVoltHistory.push(voltageV);
+    // Bound the window. This runs on every SYS_STATUS frame (~4 Hz, indefinitely),
+    // so an unbounded history is a slow leak on a process that must stay up for
+    // days.
+    while (this.batteryVoltHistory.length > this.batteryPctSamples) {
+      this.batteryVoltHistory.shift();
+    }
+    const sorted = [...this.batteryVoltHistory].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  }
+
+  // Linear interpolation between the configured empty and full voltages, clamped
+  // to 0..100. Deliberately NOT a chemistry curve: a curve implies knowledge of
+  // the pack we do not have, and a wrong curve is more misleading than an honest
+  // straight line between two numbers the operator supplied.
+  batteryPctFromVolts(voltageV) {
+    if (!this.batteryRange || !Number.isFinite(voltageV)) return null;
+    const { emptyV, fullV } = this.batteryRange;
+    const pct = ((voltageV - emptyV) / (fullV - emptyV)) * 100;
+    return Math.max(0, Math.min(100, Math.round(pct)));
+  }
+
   // Pad a zero-trimmed v2 payload back to its declared length.
   static zeroExtend(payload, expectedLen) {
     if (payload.length >= expectedLen) return payload;
@@ -620,17 +689,32 @@ class PWMMavproxy {
       const voltage_mV  = payload.readUInt16LE(14);
       const current_cA  = payload.readInt16LE(16);
       const remaining   = payload.readInt8(30);
+      // 65535 means "not measured" per the spec. 0 means the same thing in
+      // practice: ArduPilot sends 0 when BATT_MONITOR is unset. Reporting that as
+      // "0.0 V" would be indistinguishable from a dead pack on the operator's
+      // display, and would permanently latch any batteryWarnVolts alarm.
+      const voltageV = (voltage_mV === 0 || voltage_mV === 0xFFFF) ? null : voltage_mV / 1000;
+
+      // -1 means not measured; ArduPilot also reports 0 when it is not
+      // coulomb-counting, which is indistinguishable from a genuinely flat pack.
+      // Treat both as unknown.
+      const fcPct = remaining > 0 ? remaining : null;
+
+      // Fall back to a voltage estimate only when the flight controller has
+      // nothing usable, so a vehicle that DOES coulomb-count keeps its more
+      // accurate reading. pctSource tells the operator which they are looking at:
+      // an estimate sags under load and must not be presented as a fuel gauge.
+      const smoothedV    = voltageV === null ? null : this.smoothedBatteryVolts(voltageV);
+      const estimatedPct = fcPct === null ? this.batteryPctFromVolts(smoothedV) : null;
+
       this.telemetry.battery = {
-        // 65535 means "not measured" per the spec. 0 means the same thing in
-        // practice: ArduPilot sends 0 when BATT_MONITOR is unset. Reporting that as
-        // "0.0 V" would be indistinguishable from a dead pack on the operator's
-        // display, and would permanently latch any batteryWarnVolts alarm.
-        voltageV:   (voltage_mV === 0 || voltage_mV === 0xFFFF) ? null : voltage_mV / 1000,
+        voltageV,
         currentA:   current_cA === -1 ? null : current_cA / 100,
-        // -1 means not measured; ArduPilot also reports 0 when BATT_CAPACITY is
-        // unset, which is indistinguishable from a genuinely flat pack, so treat
-        // both as unknown and let voltage be the trustworthy signal.
-        remainingPct: remaining > 0 ? remaining : null,
+        remainingPct: fcPct !== null ? fcPct : estimatedPct,
+        // 'flightcontroller' = coulomb-counted and trustworthy.
+        // 'voltage'          = interpolated from the configured pack range, smoothed.
+        // null               = no percentage available at all.
+        pctSource: fcPct !== null ? 'flightcontroller' : (estimatedPct !== null ? 'voltage' : null),
         at: Date.now(),
       };
       return;

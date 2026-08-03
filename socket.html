@@ -639,9 +639,13 @@
       if (!b) return 'Batt: --';
       const parts = [];
       if (b.voltageV !== null && b.voltageV !== undefined) parts.push(`${b.voltageV.toFixed(1)}V`);
-      // remainingPct is null unless BATT_CAPACITY is configured on the flight
-      // controller, so voltage is the field to trust.
-      if (b.remainingPct !== null && b.remainingPct !== undefined) parts.push(`${b.remainingPct}%`);
+      // A leading ~ marks a percentage interpolated from voltage rather than
+      // coulomb-counted by the flight controller. It is not decoration: a
+      // voltage estimate sags under throttle, so an unmarked number would read as
+      // a fuel gauge and a hard acceleration would look like a failing pack.
+      if (b.remainingPct !== null && b.remainingPct !== undefined) {
+        parts.push(`${b.pctSource === 'voltage' ? '~' : ''}${b.remainingPct}%`);
+      }
       if (b.currentA !== null && b.currentA !== undefined) parts.push(`${b.currentA.toFixed(1)}A`);
       const text = parts.length ? parts.join(' ') : '--';
       const lowPct = b.remainingPct !== null && b.remainingPct !== undefined

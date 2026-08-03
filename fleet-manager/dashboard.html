@@ -163,7 +163,12 @@
           const bv = num(t.batteryV), bp = num(t.batteryPct), ba = num(t.batteryA);
           if (bv !== null) {
             let b = `${bv.toFixed(1)}V`;
-            if (bp !== null) b += ` ${bp}%`;
+            // A leading ~ marks a percentage interpolated from voltage rather than
+            // coulomb-counted by the flight controller, matching the rover UI. An
+            // estimate sags under load, so presenting it unmarked would read as a
+            // fuel gauge. Still routed through esc() — batteryPctSource arrives in
+            // the same unauthenticated heartbeat body as everything else here.
+            if (bp !== null) b += ` ${t.batteryPctSource === 'voltage' ? '~' : ''}${bp}%`;
             if (ba !== null) b += ` ${ba.toFixed(1)}A`;
             tele.push(`<span class="tele">🔋 ${esc(b)}</span>`);
           }
