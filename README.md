@@ -1,23 +1,46 @@
 # picar
 
 ## Overview
-This is a modernized web-controlled RC car platform running on a Raspberry Pi 5 with Bookworm OS and Node.js v18.19.0. It allows real-time control of an RC car via a browser, supporting both desktop and mobile control interfaces. The mobile interface uses the device's IMU for tilt-based control.
 
-The car is equipped with:
+A web-controlled rover platform: real-time control from a browser, on desktop or mobile (the
+mobile interface can use the device IMU for tilt-based control).
+
+> **Read `CLAUDE.md` before changing anything.** It carries the engineering directive, the ten
+> safety invariants, a table of which of those actually hold today, and the mandatory
+> review-and-validation pipeline. `TASKS.md` is the open-work list; `HANDOFF.md` is the state and
+> history. This README covers setup and the electrical build only.
+
+**Verified platform (rover3, 2026-08-03):** Raspberry Pi **Compute Module 4 Rev 1.1**, Debian 13
+(trixie), Node **v20.19.2**. Earlier revisions of this file claimed Pi 5 / Bookworm / Node
+v18.19.0 — that was wrong. **The fleet is not homogeneous**: check the target board rather than
+assuming, and do not rely on Node 22 APIs.
+
+The vehicle is equipped with:
 - A Raspberry Pi camera for low-latency WebRTC video streaming
-- Throttle and steering servos controlled via PWM
-- A local HTTPS server that hosts the UI and control API
+- Throttle, steering and drivetrain servos driven over MAVLink through a **Pixhawk 6C mini**
+  running ArduPilot (`pwm_method: "mavproxy"`, the default). The GPIO/PWM drivers described in the
+  Electrical sections below are legacy and not used on the current rovers
+- A local HTTPS server that hosts the UI and control API on `:8443`
+
+> ⚠️ **Security status.** The control plane is **unauthenticated** — any device that can reach
+> `:8443` can arm and drive the vehicle — and there are open P0 defects allowing remote code
+> execution and cross-origin access. Do not put a rover on an untrusted network. See `TASKS.md`.
 
 Originally derived from the original Pi RC car project by [lawsonkeith](https://github.com/XXX/picar), this version:
-- Replaces `pi-blaster` with an interface allowing direct `sysfs` or `libgpiod` control for PWM, soon to be mavlink and ardupilot
+- Replaced `pi-blaster` first with direct `sysfs`/`libgpiod` PWM, and then with MAVLink to an
+  ArduPilot flight controller — which is what the rovers run today
 - Uses current node.js and npm practices
 - Supports modern mobile orientation APIs
 
 ## Hardware Setup
-- **Platform**: Raspberry Pi 5 or 4B+
-- **Servos**: Controlled via GPIO PWM usinglsusb sysfs (soon to be replaced with `libgpiod`)
-- **Camera**: USB webcam accessible via `/dev/video0`
-- **Network**: Typically configured to use smartphone hotspot for local control
+- **Platform**: Raspberry Pi Compute Module 4 (rover3); Pi 4B+ / Pi 5 also supported
+- **Flight controller**: Pixhawk 6C mini running ArduPilot (ArduRover), reached over MAVLink via
+  `mavproxy.service` on `/dev/ttyACM0`
+- **Servos**: driven by the flight controller from `RC_CHANNELS_OVERRIDE` at 20 Hz. The legacy
+  direct-GPIO drivers (`sysfs`, `libgpiod`, `pigpio`) still exist but are not used
+- **Camera**: Raspberry Pi camera via MediaMTX (`rpiCamera`); a USB webcam on `/dev/video0` works
+  with the `h264`/`mjpeg` fallbacks
+- **Network**: Typically a smartphone hotspot or shared LAN for local control
 
 ## Electrical
 This project is based on [shaunuk/picar] but replaces the servo board with a soft PWM driver on the Pi’s GPIO pins. I've provided the option to use either an isolated supply for the Pi or to use the supply off the ESC. The latter is the most elegant solution but has issues with the motor pulling the battery voltage down and causing the Pi to reset.
@@ -85,29 +108,42 @@ If you opt for this approach the wiring is much simpler; also there's a lot more
 
 ## Software Setup
 
-### Install Node.js and Dependencies
-Node.js and npm are available through the official Raspberry Pi OS Bookworm repository:
+### Install
+
+**Use `install.sh`.** It is the supported path and handles Node packages, the Python venv for
+MAVProxy, the MediaMTX binary, the systemd units (templating the run user and repo path), and the
+polkit rule that lets the non-root service restart MediaMTX.
 
 ```bash
-sudo apt update
-sudo apt install nodejs npm ffmpeg
+# The repo lives at /opt/picar on every rover — this is the standing convention,
+# and the tracked systemd units carry /opt/picar paths.
+sudo git clone <your-fork-url> /opt/picar
+cd /opt/picar
+sudo ./install.sh --picar     # or --fleet for the Fleet Manager
 ```
 
-### Get the App
-Clone the project into your working directory:
-```bash
-cd /home/pi
-mkdir picar && cd picar
-# Replace with your fork or repo URL
-git clone https://github.com/XXX/picar .
-```
+It prompts for the run user, the rover ID, whether to use MAVProxy, and the camera type.
 
-### Install Required Node Packages
-```bash
-npm install socket.io node-static
-```
+Dependencies come from `package.json` via `npm ci --omit=dev` — do **not** hand-install a subset
+(an earlier revision of this file said `npm install socket.io node-static`, which omits `ws` and
+leaves the h264 stream broken).
 
-### PWM Support for Raspberry Pi 5
+> **Two known installer defects** (`TASKS.md`, P1): re-running `install.sh` rewrites the *tracked*
+> `picar-cfg.json`, leaving a permanently dirty tree; and it uses `systemctl enable --now`, which
+> does **not** restart an already-running unit — so a re-run after `git pull` will not deploy the
+> new code. Restart explicitly:
+> ```bash
+> sudo systemctl restart picar mavproxy mediamtx
+> ```
+
+### PWM Support for Raspberry Pi 5 — *legacy, not used on the current rovers*
+
+> Everything in this section applies only to `pwm_method` values of `sysfs`, `libgpiod`,
+> `pigpion` or `pigpiod`. The rovers run `pwm_method: "mavproxy"`, where the flight controller
+> drives the servos and none of this is needed. **These drivers also have open defects**
+> (`TASKS.md`): none implements the fail-safe primitive, so on a GPIO rover every fail-safe path
+> is a silent no-op; `libgpiod` spawns ~200 `execSync` calls per second; and `pigpiod` is
+> non-functional. Do not switch a vehicle to a GPIO driver without reading those entries first.
 
 To allow non-root users to access PWM devices via sysfs, create a udev rules file at `/etc/udev/rules.d/99-pwm-permissions.rules`:
 
@@ -181,11 +217,25 @@ The repo keeps the older streams as diagnostics:
 - `stream_codec: "h264"`: raw H.264 over WebSocket; works best in Chrome/Edge.
 - `stream_codec: "mjpeg"`: simple MJPEG fallback; high bandwidth and prone to stalls during motion.
 
-The MediaMTX config lives at `mediamtx.yml`. The default is a stability-first `480x360@20fps`, 350 kbps H.264 baseline, IDR every 10 frames. If fast motion still freezes the feed, reduce `rpiCameraBitrate` further or switch `rpiCameraCodec` from `hardwareH264` to `softwareH264` for a test run.
+**`mediamtx.yml` is generated, not edited.** `streams/webrtc.js` regenerates it from
+`picar-cfg.json` at every startup, and it is `.gitignore`d — hand edits are silently overwritten on
+the next restart. Change the `webrtc_*` keys in `picar-cfg.json` instead.
+
+The default is a stability-first `480x360@20fps`, 350 kbps H.264 baseline, IDR every 10 frames
+(`webrtc_width`, `webrtc_height`, `webrtc_fps`, `webrtc_bitrate_kbps`, `webrtc_idr_period`). If
+fast motion still freezes the feed, lower `webrtc_bitrate_kbps` or switch `webrtc_codec` from
+`hardwareH264` to `softwareH264` for a test run.
 
 ### HTTPS Certificates
 
-The app runs on HTTPS, which browsers require before they will allow camera access, WebSockets, and WebRTC. Out of the box the repo ships no certificates — you must generate them once per Pi.
+The app runs on HTTPS, which browsers require before they will allow camera access, WebSockets, and WebRTC.
+
+> 🔴 **The repo currently ships a CA and server certificate — including both private keys**
+> (`certs/ca.key`, `certs/key.pem` are tracked). **Treat them as compromised.** Anyone with repo
+> read access can mint a certificate that every device trusting this CA will accept. Generate your
+> own with `setup-certs.sh` below and never rely on the committed pair. Rotating the CA and
+> untracking the keys is an open P0 in `TASKS.md`; note that `install.sh` does not yet provision
+> certs, so they cannot simply be deleted.
 
 The `certs/setup-certs.sh` script creates:
 - a **local CA** (`ca.crt`) that you install on your devices once
@@ -256,10 +306,20 @@ sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keyc
 ---
 
 ### Running the Application
+
+`install.sh` installs and enables the services, so on a provisioned rover picar is already
+running and starts at boot. To operate it:
+
 ```bash
-sudo systemctl start mediamtx
-sudo node app.js
+sudo systemctl restart picar          # picar.service — UI + control on :8443
+sudo systemctl status picar mavproxy mediamtx
+journalctl -u picar -f                # follow the log
 ```
+
+Do **not** run `sudo node app.js` by hand: it bypasses the systemd unit and runs as the wrong user.
+It is also easy to lose the shutdown fail-safe — `app.js` handles only `SIGINT`, so while Ctrl-C
+does run the handler, anything that stops it with `SIGTERM` (`kill`, a supervisor, a script)
+**skips the neutral + DISARM entirely**. The unit avoids this with `KillSignal=SIGINT`.
 Open a browser and go to:
 ```
 https://<raspberry-pi-ip>:8443/socket.html
@@ -274,35 +334,25 @@ To view the legacy MJPEG stream when `stream_codec` is set to `mjpeg`:
 https://<raspberry-pi-ip>:8081/stream.mjpg
 ```
 
-### Configure Pi to Run App on Boot
-Create a systemd service file `/etc/systemd/system/picar.service`:
+### Running on Boot
 
-```ini
-[Unit]
-Description=PiCar Control Server
-After=network.target
+Nothing to write by hand — the units are **tracked in `systemd/`** and installed by `install.sh`,
+which templates `User=` and rewrites the `/opt/picar` placeholder to the real repo path:
 
-[Service]
-ExecStart=/usr/bin/node /home/pi/picar/app.js
-WorkingDirectory=/home/pi/picar
-StandardOutput=inherit
-StandardError=inherit
-Restart=always
-User=pi
-Environment=NODE_ENV=production
+| Unit | Role |
+| --- | --- |
+| `picar.service` | UI + control server (`:8443`) and stream server (`:8081`) |
+| `mavproxy.service` | MAVProxy bridging `/dev/ttyACM0` to TCP `:5760` |
+| `mediamtx.service` | WebRTC/WHEP video (`:8889`) |
+| `fleet-manager.service` | Fleet Manager dashboard (`:3000`, `--fleet` installs only) |
 
-[Install]
-WantedBy=multi-user.target
-```
+Edit the files in `systemd/` and re-run `install.sh` rather than editing
+`/lib/systemd/system/*.service` directly, or your change will be overwritten.
 
-Then enable it:
-```bash
-sudo systemctl daemon-reexec
-sudo systemctl enable picar
-sudo systemctl start picar
-```
-
-The web server and stream will now automatically start when the Pi boots.
+> `picar.service` sets `KillSignal=SIGINT` with `TimeoutStopSec=5` so `app.js` can flush a final
+> neutral + DISARM before exiting. **Do not change that without re-validating shutdown behaviour**
+> — `app.js` handles only `SIGINT`, so switching to the default `SIGTERM` silently removes the
+> shutdown fail-safe.
 
 ## Fleet Manager
 

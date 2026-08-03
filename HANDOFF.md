@@ -6,7 +6,7 @@ here. Read `CLAUDE.md` first for the directive and pipeline.
 ## Current state
 
 picar is a working teleoperated rover platform: a Raspberry Pi companion computer (rover3 is
-a **Compute Module 4**, not the Pi 5 the README claims) driving a **Pixhawk 6C mini** over
+a **Compute Module 4**) driving a **Pixhawk 6C mini** over
 MAVLink, controlled from a browser over HTTPS. The direction of
 travel is a drone platform on the same flight-controller hardware, evolving toward a custom
 software stack. A custom flight controller is **not** in scope, and the vehicle profile is
@@ -16,10 +16,17 @@ software stack. A custom flight controller is **not** in scope, and the vehicle 
 >
 > **`main` has no control-safety layer, and the branch that had one has been shelved.**
 >
-> On `main` today, `app.js:125` is `socket.on('arm', () => pwm.arm())`: any socket that
-> reaches `:8443` can arm and drive the vehicle, with no lease, session token, sequence
-> number, staleness check, or watchdog, and `pwm_mavproxy_servo.js` has no `isSafetyReady()`
-> gate on arming. That is the live state of every rover.
+> On `main` today the `arm` handler is `app.js:133-144`: any socket that reaches `:8443` can arm
+> and drive the vehicle, with no lease, session token, sequence number, or staleness check, and
+> `pwm_mavproxy_servo.js` has no `isSafetyReady()` gate. There *is* an input watchdog
+> (`app.js:265`) — an earlier revision of this file said there was none. That is the live state of
+> every rover.
+>
+> **Escalation, 2026-08-03:** three unauthenticated defects were found that are worse than
+> "anyone can arm", because they need no physical proximity at all — a proven remote code
+> execution via `setVideoParams`, a missing Origin check that makes the whole control plane
+> reachable from any web page the operator visits, and stored XSS in the Fleet Manager dashboard.
+> All three are P0s in `TASKS.md` and are Phase 1 of the agreed plan.
 >
 > The safety work — `control-safety.js`, `client-control-safety.js`, the 24-test `test/`
 > suite, hardened arm-gating, MAVLink v2 parsing, the autopilot-heartbeat filter, and the
@@ -46,9 +53,15 @@ What works today **on `main`**:
   `GET /api/fleet-id`, then heartbeat to it — no IP, hostname, or per-rover setup, and it
   survives the Fleet Manager moving hosts. Per-rover identity lives in untracked
   `picar-cfg.local.json` so the tracked config stays git-pullable.
-- **Install.** `install.sh --picar|--fleet` is idempotent and installs in place, templating
-  the run user and repo path into the systemd units and installing a unit-scoped polkit
-  rule so the non-root service can restart MediaMTX.
+- **Install.** `install.sh --picar|--fleet` installs in place, templating the run user and repo
+  path into the systemd units and installing a unit-scoped polkit rule so the non-root service can
+  restart MediaMTX. **It is *not* idempotent** — it rewrites the tracked `picar-cfg.json`, and
+  `systemctl enable --now` does not restart an already-running unit, so a re-run after `git pull`
+  does not deploy the new code. Both are P1s in `TASKS.md`.
+- **Bounded video latency** (merged at `4580209`). `h264` sheds delta frames while keeping
+  keyframes so a client can resync, `mjpeg` skips whole frames, both parse buffers are bounded and
+  resync, the mediamtx restart is async and coalesced, and failed Fleet Manager discovery sweeps
+  back off 5 s → 5 min. The h264 drop path is hardware-verified; the mjpeg one is host-tested only.
 
 What the **archived** branch adds, should it ever be revived: the single-owner control lease,
 token + sequence + timestamp *integrity checking* of every command, the NTP-midpoint
@@ -64,20 +77,112 @@ Two things that branch does **not** do, contrary to earlier claims here and in `
   later on the next 20 Hz tick. The existing tests assert method-call order against a mock
   and cannot see this.
 
-Weakest points beyond that, in priority order: no operator authentication anywhere; the
-untracked config overlay can silently disable the arm-verification gate; a video-parameter
-change synchronously blocks the event loop and can freeze the fail-safe watchdog while
-armed; and the CA and server private keys are committed to the repository. These are the top
-`P0` entries in `TASKS.md`.
+Weakest points beyond that, in priority order: the three unauthenticated-network defects above
+(RCE, missing Origin check, dashboard XSS); no operator authentication anywhere; the CA and server
+private keys committed to the repository; the channel buffer being pre-loadable while disarmed;
+two ways the input watchdog is defeated; and every fail-safe being a no-op on non-mavproxy
+drivers. These are the top `P0` entries in `TASKS.md`.
+
+Note the `setVideoParams` handler still does a synchronous `writeFileSync` on the event loop, but
+the *restart* it triggers is now asynchronous — an earlier revision of this section claimed the
+whole path blocked "for seconds", which was measured wrong by ~2 orders of magnitude and corrected
+in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
 Newest first.
 
-### 2026-07-31 — `perf/bound-video-latency` — NOT MERGED
+### 2026-08-03 — `chore/reconcile-tracking-docs`
 
-Bounds video latency and stops the video path from starving the control path. Four focused
-commits on the branch, tip `781d56a00e48c176ec2e704c88afe0ff5e7dcc8d`.
+Documentation only — zero runtime files. Reconciles the tracking documents against a full
+verified read of `main` @ `4580209`. No behaviour changes.
+
+The tracking documents had drifted far enough to actively mislead, which matters because the
+pipeline uses them as its map. What was wrong:
+
+- **~20 line-number citations in `TASKS.md` pointed at the wrong code.** `pwm_mavproxy_servo.js:602`
+  is past EOF (the file is 577 lines); `control-safety.js:94` and `:160` name a file that does not
+  exist on `main`; `app.js:113`/`:136`, `fleetmgr-client.js:139`, `fleet-manager/server.js:96`,
+  `socket.html:1409` and others were simply off. Every citation in the rewritten file was
+  re-verified by opening the line.
+- **Four entries described the archived branch, not `main`**, and two were refuted outright — the
+  "500 ms window where the safety layer believes it is armed" (no `controlEnabled` exists on
+  `main`) and "command rejections are never reported" (no `handleCommand` exists). Deleted.
+- **Three entries were already done** — the `/24` discovery sweep (fixed by `SweepBackoff`), the
+  h264 frame-drop hardware validation, and "prove MAVLink read-back works on this Pixhawk"
+  (answered by the telemetry branch). Deleted per `TASKS.md`'s own contract; their record is here.
+- **`CLAUDE.md` contradicted itself and the code**: it said `main` had no `test/` suite (it has
+  46 tests), stated `FRAME_CLASS=1` while the code pushes `2` in three places, listed
+  `control-safety.js` in the topology diagram and module table as if it were on `main`, described
+  `isSafetyReady()` as existing, and named config keys (`mavproxy_allow_unverified_arm`,
+  `max_command_*`) that exist nowhere on `main`.
+- **`HANDOFF.md` headed a merged branch "NOT MERGED"** and carried two contradictory validation
+  records in one section, the superseded one left below its own "Superseded" line.
+- **`README.md`** was wrong about board, OS, Node version, install command, run command, and
+  systemd unit, and described a generated file as editable.
+
+Added, because they were missing entirely: a table in `CLAUDE.md` recording **which of the ten
+safety invariants actually hold on `main`** — **five not implemented** (1, 2, 4, 7, 8), **one
+violated** (3), **four partial** (5, 6, 9, 10), and **none fully holding** — and the fact that
+**no CI runs `npm test`**.
+
+`.claude/skills/auditor/SKILL.md` had adopted two of the bad citations as its worked example of a
+well-formed finding, so the audit tooling was propagating them — corrected.
+
+**New defects found while verifying, now filed in `TASKS.md`:** a proven unauthenticated RCE via
+`setVideoParams` YAML injection, a missing Socket.IO Origin check that makes the control plane
+drive-by reachable, stored XSS in the Fleet Manager dashboard, a pre-loadable channel buffer that
+lunges on arm, two ways the input watchdog is defeated (window blur latching held keys, and the
+hidden-tab timer clamp tying `input_timeout_ms`), every fail-safe being a silent no-op on
+non-mavproxy drivers, `arm()` force-arming with `21196`, and `install.sh` being destructive on
+re-run. Also recorded: **8 of 23 mutations survive the test suite**, because `app.js` has no test
+file at all.
+
+**Reviewer: `codex`** (codex-cli 0.146.0, `model_reasoning_effort=high`, read-only sandbox).
+Returned "must go back for correction" with **6 blocking findings, all real, all fixed before
+commit**:
+
+1. `TASKS.md` cited `README.md:188` for the "ships no certificates" claim — but this very diff
+   rewrote that section, so the citation was stale on arrival. **The change invalidated its own
+   citation**, which is precisely the defect the branch exists to fix.
+2. `pwm_sysfs_servo.js:54` supported only half its sentence; the ignored channel configuration is
+   established at `:20`/`:30`/`:49`.
+3. The Codex re-review entry claimed none of the three fallback-reviewed branches touches an
+   invariant. **False and dangerous** — `6675341`'s own commit body says its `RC_OVERRIDE_TIME`
+   overlay write *is* fail-safe timing, touches invariant 6, and "must not merge until Codex
+   reviews it". As written, the entry could have authorised exactly the merge that commit forbids.
+4. Two archive defects were deleted as "refuted" when they are **real on the archive branch** and
+   only mis-scoped to `main` — the ~500 ms armed-but-dropping window (archive
+   `pwm_mavproxy_servo.js:83`/`:602-607` vs `control-safety.js:160`) and the discarded
+   `handleCommand()` result (archive `app.js:136-138`). Since these documents now advise
+   cherry-picking from that branch, deleting the warnings lost real information. Restored as
+   cherry-pick prerequisites.
+5. Fixing `README.md` left three other documents asserting that `README.md` is wrong about the
+   board — a **new** cross-document contradiction created by the fix itself.
+6. The summary count of the new invariant table was wrong (it is five not-implemented, one
+   violated, four partial, none holding — not "4/5/1").
+
+Accepted non-blocking corrections: the telemetry branch needs **no rebase** (`6675341`'s parent
+*is* `4580209`, and `git rev-list 6675341..main` is empty — my "four merges have landed since" was
+wrong); `pwm_libgpiod` spawns **~200** `execSync`/s, not 400 (50 Hz × 2 channels × 2 edges);
+`pigpiod` has no latched output to leave behind because it never applies a command at all; the
+dashboard `href` *is* quoted (still exploitable, since the value is unescaped); Ctrl-C on a manual
+`node app.js` does deliver `SIGINT`, so the shutdown claim was overstated; and "the only thing
+satisfying the heartbeat branch" was too absolute, since the CRC-less parser can synthesise a bogus
+msgid-0 frame from any `0xFE`-aligned bytes.
+
+Codex could not run `npm test` itself (two video tests write YAML under `/tmp`, which fails
+`EROFS` in its read-only sandbox — an environment restriction, not a regression). Verified here
+instead: **46/46**.
+
+**Validation:** pending. Markdown-only — `git diff --name-only` returns five `.md` files and zero
+runtime files — so this cannot alter runtime behaviour.
+
+### 2026-07-31 — `perf/bound-video-latency` — **MERGED** at `4580209`
+
+Bounds video latency and stops the video path from starving the control path. Merged to `main` as
+merge commit `4580209`, which is `main`'s current tip. (This header read "NOT MERGED" until
+2026-08-03; the branch had already landed. `git branch --merged main -a` lists it.)
 
 - `fleetmgr-client.js`: failed Fleet Manager discovery sweeps now back off exponentially from
   the tick interval to a 5-minute ceiling.
@@ -138,33 +243,19 @@ recorded as. The P0 has been removed rather than reworded, because it was wrong.
   timestamp instead of a byte count.
 - *Not tested:* the mjpeg path on hardware (host tests only, including split-at-every-boundary).
 
-Superseded: the earlier partial validation of `781d56a`.
+The earlier partial validation of `781d56a` that used to sit here has been **deleted** — it was
+left in place below its own "Superseded" line, so this entry carried two contradictory validation
+records at once, one of them for a SHA that is not an ancestor of `main`. Two facts from it are
+worth preserving:
 
-- *Blocking reason:* the mandatory Second Opinion stage could not run — the Codex workspace is
-  out of credits ("Your workspace is out of credits"). `CLAUDE.md` requires an adversarial
-  review before deploy, and this change touches the video hot path and a fail-safe-adjacent
-  timing property. It is deployed for measurement only and must not merge until reviewed.
-- *Services:* all active, `NRestarts=0`, `/status` OK, 31/31 host tests pass under the rover's
-  Node v20.19.2.
-- *Fleet backoff, measured:* progression observed as 5→10→20→40→80→160→300 s, capping correctly
-  and resetting on discovery. Idle CPU **6.90% → 3.47% of one core, a 2.0x reduction** (60–90 s
-  sampling windows, no client, no viewer).
-- *Superseded figure:* commit `bc1cd71`'s body quotes `/status`-gap numbers (121 ms vs 61 ms) as
-  its central measurement. **Those are withdrawn** — see the next bullet. The real figure is the
-  direct `execSync` timing: 85 ms mean, 100 ms max over five trials. Anyone reading `git log`
-  without this file would otherwise take the discredited number as fact.
-- *C2 responsiveness:* the /status-gap probe could NOT distinguish the two builds — 121 ms on
-  `main` versus 61 ms and 106 ms on two runs of the fix, with the worst gap on one fix run
-  landing 11 s after the restart fired. That metric is dominated by ordinary event-loop jitter,
-  so it is not evidence either way. The direct `execSync` timing above is the real measurement.
-- *NOT validated:* the frame-dropping paths themselves. rover3 runs `webrtc`, where picar never
-  touches a frame, so neither the h264 nor the mjpeg drop path executed at all on hardware.
-  Host tests cover the logic; on-target proof needs a rover on `h264`/`mjpeg` with a slow client.
+- *A withdrawn figure.* Commit `bc1cd71`'s body quotes `/status`-gap numbers (121 ms vs 61 ms) as
+  its central measurement. **Those are withdrawn** — the probe could not distinguish the two
+  builds and is dominated by ordinary event-loop jitter. The real figure is the direct `execSync`
+  timing: 85 ms mean, 100 ms max over five trials. Anyone reading `git log` without this file
+  would otherwise take the discredited number as fact.
 - *Parser benchmark* (workstation, not rover): large access units 2.1x faster at 64 kB, 4.7x at
   256 kB, 8.9x at 1 MB. Real access units are a few kB, so the practical win is on large
   keyframes, not typical frames.
-
-Rover was returned to `main` afterwards.
 ### 2026-07-31 — `chore/adversarial-review-fallback`
 
 Adds the operator-requested rule: when Codex cannot run, adversarial review falls back to
@@ -343,8 +434,8 @@ via `origin`; `git status` clean at that SHA on the rover).
   markdown-only change, but the suite must exist before any runtime change is validated.
   Tracked in `TASKS.md`.
 
-Rover returned to `main` @ `8271d14` after the merge — clean tree, `NRestarts=0`, all three
-services active, `/status` responding. This is the current rover3 baseline.
+Rover returned to `main` @ `8271d14` after this merge. *(No longer the current baseline — see
+`## Environment` for rover3's verified state as of 2026-08-03.)*
 
 **Next session must know:**
 
@@ -380,10 +471,10 @@ command path up to the flight controller and never imply mechanical motion was o
 **The repo lives at `/opt/picar` on every rover** — standing convention, and the reason the
 tracked systemd units carry `/opt/picar` paths.
 
-**rover3 hardware (verified 2026-07-30).** Raspberry Pi **Compute Module 4 Rev 1.1**,
-Debian 13 (trixie), Node **v20.19.2**. `README.md` still claims Pi 5 / Bookworm / Node
-18.19.0 — it is wrong. Do not assume Pi 5 behavior or Node 22 APIs, and check the target
-before assuming the fleet is homogeneous.
+**rover3 hardware (verified 2026-07-30, re-verified 2026-08-03).** Raspberry Pi **Compute Module 4
+Rev 1.1**, Debian 13 (trixie), Node **v20.19.2**. Do not assume Pi 5 behavior or Node 22 APIs, and
+check the target before assuming the fleet is homogeneous. (`README.md` claimed Pi 5 / Bookworm /
+Node 18.19.0 until 2026-08-03; it is now correct.)
 
 **Access.** `ssh saltenna@rover3` — key-based, hostname resolves over mDNS (it also
 appears as `rover3.Saltenna.local`). The dev workstation and the rovers share
@@ -391,12 +482,28 @@ appears as `rover3.Saltenna.local`). The dev workstation and the rovers share
 rover's `authorized_keys`; ask the operator to run `ssh-copy-id` in a real terminal — from a
 non-TTY shell it fails on a missing `ssh-askpass`, and it needs `sudo`.
 
-**rover3 checkout state — RECONCILED to `main` on 2026-07-30.** It now sits on branch
-`main` @ `acd3540`, clean, with identity restored the modern way via untracked
-`picar-cfg.local.json` = `{"rover_id": 3}` (the startup log confirms
-`Applied local overrides…` / `Rover ID: 3`). Services restarted cleanly, `NRestarts=0`,
-all three active, MAVProxy TCP link up, RC_CHANNELS_OVERRIDE streaming neutral at 20 Hz.
-The `fleet_enabled` flag from the abandoned `d816a7d` is gone; no code on `main` reads it.
+**rover3 checkout state — verified 2026-08-03: it is NOT on `main`.**
+
+```
+branch  feature/battery-and-radio-telemetry
+HEAD    a979b599e17cd4091ac1050fd7df6a8f21bae9e8
+dirty   (clean)
+units   picar active · mavproxy active · mediamtx active
+model   Raspberry Pi Compute Module 4 Rev 1.1 · Debian 13 (trixie) · Node v20.19.2
+config  pwm_method mavproxy · stream_codec webrtc · picar-cfg.local.json {"rover_id": 3}
+```
+
+So the dev rover has been running **unmerged** code — the finished-but-unlanded telemetry branch
+— and earlier notes in this file claiming it was "returned to `main` @ `8271d14`" are stale. This
+matters twice over: any future validation must state which SHA the rover actually ran, and
+deploying a new branch to rover3 will move it off `a979b59`, so note the branch it came from
+before switching. Identity is via untracked `picar-cfg.local.json` and survives checkouts. The
+`fleet_enabled` flag from the abandoned `d816a7d` is gone; no code on `main` reads it.
+
+**rover1 and rover2 are not reachable from this workstation (2026-08-03).** `rover1` does not
+resolve (mDNS), `rover2` refuses SSH `publickey`. Both hold the high/low gearbox, so the
+gear/throttle P0 has no validation path until that is fixed — ask the operator to run `ssh-copy-id`
+in a real terminal (from a non-TTY shell it fails on a missing `ssh-askpass`, and it needs `sudo`).
 
 Rollback point, if ever needed: branch `fleet-manager` @
 `cdf4ae16dc9e105acf4cd711b33c416f52ae7739`, with the pre-change working-tree diff and the
