@@ -92,6 +92,43 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-03 — `feature/light-control` — hardware-verified
+
+Web control for a light module on **Pixhawk output 6**, driven by RC channel 6
+passthrough (`SERVO6_FUNCTION: 1`) from a Light button in the controller UI.
+
+**Verified on rover3 at SHA `45a9e0b`, on the MAVLink wire:**
+
+| | `RC_OVERRIDE` ch6 (commanded) | `SERVO_OUTPUT_RAW` servo6 (flight controller) |
+| --- | --- | --- |
+| Light ON | 2000 | **2000** |
+| Light OFF | 1000 | **1000** |
+
+Throughout both toggles `servo1` (steering) held 1500 and `servo3` (throttle) held
+1500 — switching the light never perturbed a motion output. The full Socket.IO path
+was exercised as the browser uses it (EIO=4 over WebSocket): the server pushed the
+initial `lightState` on connect, broadcast it on each change, logged `Light: ON` /
+`Light: OFF`, and **rejected a non-boolean** with no state change and no broadcast.
+
+**Not reviewed by Codex**, on explicit operator instruction — this was a
+does-it-work check on new hardware. Recorded plainly rather than with a
+`Reviewed-by` trailer, since the trailer is the only durable record of whether the
+gate ran.
+
+Design notes for whoever touches this next: the light is its own socket event rather
+than a `fromclient` field (so it cannot be combined with motion in one packet, or
+replayed at 20 Hz); it does **not** go through the drivetrain neutral+disarm
+transaction, because a light is not a mechanical actuator working against the
+driveline; and a fail-safe deliberately **leaves it on**, because an operator who has
+just lost control wants the vehicle to stay visible. That last one is pinned by test.
+
+**A diagnostic trap worth knowing.** `SERVO_OUTPUT_RAW` orders its fields by
+DESCENDING SIZE, so `port` is the **last** byte, not the second field — `servo6_raw`
+is at offset 14, and `servoN_raw` at `4 + (N-1)*2`. Reading it as though `port`
+followed `time_usec` put every servo one byte out and reported servo6 as `3`/`7`.
+That looked exactly like "the light does not work". Same rule the telemetry branch's
+field-offset comments exist for.
+
 ### 2026-08-03 — `test/driver-safety-gaps`
 
 Closes the driver half of the coverage gap the 2026-08-03 mutation pass exposed. Tests only —
