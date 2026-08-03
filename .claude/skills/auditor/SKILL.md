@@ -43,8 +43,22 @@ full audit, when starting a session cold, or when `HANDOFF.md` looks stale relat
 
 Every finding must cite `file:line` and state the concrete failure — the inputs or sequence
 of events, and the resulting wrong behavior. "This could be racy" is not a finding.
-"`close` at `pwm_mavproxy_servo.js:157` clears only `armTimeout`, so the twelve overlay
-timers scheduled at `:368` keep firing after a reconnect and stack overlapping passes" is.
+"The `close` handler at `pwm_mavproxy_servo.js:164-170` clears `interval` and
+`heartbeatInterval` but not the 9 `PARAM_SET` timers at `:394-399` or the 7 read-back timers at
+`:405-409`, so reconnect churn stacks overlapping overlay passes" is.
+
+**Open the line before you cite it.** A 2026-08-03 audit found ~20 citations in `TASKS.md`
+pointing at the wrong code, including one past end-of-file and two naming a file that exists only
+on an archived branch — and the previous version of the example above was itself two of them.
+A wrong citation is worse than no citation: it sends the next reader to code that does not exist,
+and it gets quoted forward as established fact. Verify with `sed -n 'Np' <file>`, and re-verify
+any citation you inherit rather than copying it.
+
+Distinguish **`main`** from the archived `origin/archive/control-failsafe-2026-07-30`. Findings
+about `control-safety.js`, `client-control-safety.js`, `isSafetyReady()`, `getSafetyStatus()`,
+`controlEnabled`, `mavproxy_allow_unverified_arm` or any `max_command_*` key are about the
+archive branch — none of those exist on `main`. `CLAUDE.md` carries a table of which safety
+invariants actually hold today; check it before asserting one is implemented.
 
 If you cannot demonstrate the failure, either verify it on rover3 or record it as a question
 rather than a task. Do not pad the list. A short list of real defects is worth more than a
