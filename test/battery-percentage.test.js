@@ -194,3 +194,52 @@ test('getTelemetry exposes pctSource alongside the percentage', () => {
   assert.equal(t.battery.pctSource, 'voltage');
   assert.equal(typeof t.battery.ageMs, 'number');
 });
+
+// ── A PAUSED stream, not just a closed socket ────────────────────────────────
+
+test('a gap in the SYS_STATUS stream discards the smoothing window', () => {
+  // The case that matters most and the one the first fix missed. Clearing the window
+  // only in the socket-close handler left a Pixhawk reboot — or any paused
+  // SYS_STATUS stream — with MAVProxy still connected: five stale 8.4 V samples then
+  // outvoted a fresh 6.0 V reading and reported ~100%, which does not merely look
+  // wrong, it CLEARS the low-battery warning.
+  //
+  // `now` is injected rather than faked globally so this is deterministic.
+  const d = driver({ ...PACK, battery_pct_median_samples: 5 });
+  const t0 = 1_000_000;
+  for (let i = 0; i < 5; i++) d.smoothedBatteryVolts(8.4, t0 + i * 250);
+  assert.equal(d.batteryPctFromVolts(d.smoothedBatteryVolts(8.4, t0 + 1250)), 100);
+
+  // A gap longer than the staleness window, then a genuine low reading.
+  const afterGap = d.smoothedBatteryVolts(6.0, t0 + 60_000);
+  assert.equal(afterGap, 6.0, 'the window must contain only the fresh sample');
+  assert.equal(d.batteryPctFromVolts(afterGap), 0,
+    'a fresh 6.0 V reading must not be masked by pre-gap samples');
+  assert.equal(d.batteryVoltHistory.length, 1);
+});
+
+test('a normal 4 Hz stream is NOT treated as a gap', () => {
+  // The other direction: smoothing must still smooth. If the gap threshold were too
+  // tight, every sample would reset the window and the feature would do nothing.
+  const d = driver({ ...PACK, battery_pct_median_samples: 5 });
+  const t0 = 2_000_000;
+  for (let i = 0; i < 5; i++) d.smoothedBatteryVolts(7.8, t0 + i * 250);   // 4 Hz
+  assert.equal(d.batteryVoltHistory.length, 5, 'a live stream must accumulate');
+
+  // One sag inside a live stream must still be outvoted.
+  const sagged = d.smoothedBatteryVolts(6.6, t0 + 1250);
+  assert.equal(d.batteryPctFromVolts(sagged), 75, 'the median must still reject a spike');
+});
+
+test('the gap check works through the real SYS_STATUS path, not just the helper', () => {
+  // Drive handleMessage so the wiring is covered, not only smoothedBatteryVolts.
+  const d = driver(PACK);
+  for (let i = 0; i < 5; i++) d.handleMessage(MSG_SYS_STATUS, sysStatus(8400));
+  assert.equal(d.telemetry.battery.remainingPct, 100);
+
+  // Age every retained sample past the staleness window, as a paused stream would.
+  for (const e of d.batteryVoltHistory) e.at -= 60_000;
+  d.handleMessage(MSG_SYS_STATUS, sysStatus(6000));
+  assert.equal(d.telemetry.battery.remainingPct, 0,
+    'the live path must discard stale samples too');
+});

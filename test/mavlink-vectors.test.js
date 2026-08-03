@@ -434,33 +434,49 @@ test('a valid flight-controller percentage at the boundaries is still accepted',
 
 // ── Unknown-length recovery must not consume a valid frame at EOF ─────────────
 
-test('an unknown frame whose false length ends at the buffer end does not consume it', () => {
-  // The lossy case review found: the declared length was trusted whenever it
-  // reached the end of the buffer, because there was no following byte to check.
-  // A crafted length ending exactly after an appended valid frame therefore ate
-  // both. Waiting is the safe answer — on a 4 Hz stream more data always arrives.
+test('an unverifiable frame can never consume a valid one, at any boundary', () => {
+  // Three attempts were needed here and the first two were lossy:
+  //   1. skipping the declared length wholesale — a corrupted length ate the next frame
+  //   2. corroborating the length with a lookahead — the FOLLOWING frame's own magic
+  //      byte corroborates a false length just as well as a true one
+  // So an unknown frame now advances exactly one byte. We hold no CRC_EXTRA for it,
+  // so its declared length is not evidence of anything.
+  //
+  // Two distinct outcomes, and asserting the wrong one is how the previous two
+  // versions of this test passed vacuously:
+  //   - a claimed length that FITS the buffer is rejected immediately, so the
+  //     embedded valid frame decodes on the same feed;
+  //   - a claimed length LARGER than the buffer makes the parser wait at the earlier
+  //     "not enough data" check. Nothing is consumed, but nothing decodes until more
+  //     arrives. That wait is bounded by the largest possible frame.
   const good = Buffer.from(VECTORS.v2.power_status, 'hex');
-  // Unknown msgId 30, with a length chosen so header+payload+crc lands exactly at
-  // the end of the appended valid frame.
-  // The length must make the claimed frame end EXACTLY at the buffer end, or the
-  // parser returns at the earlier "not enough data yet" check and never reaches the
-  // unknown-message branch at all. A first draft used good.length + 2 and was
-  // therefore vacuous — it exercised a path that already existed.
-  const claimed = good.length;         // header(10) + payload(14) + crc(2) == 26 == buffer
-  const bogus = Buffer.concat([
-    Buffer.from([0xFD, claimed, 0, 0, 0, 1, 1, 30, 0, 0]),
+  const build = (claimed) => Buffer.concat([
+    Buffer.from([0xFD, claimed & 0xFF, 0, 0, 0, 1, 1, 30, 0, 0]),
     good,
     Buffer.from([0xAA, 0xBB]),
   ]);
-  assert.equal(bogus.length, 10 + claimed + 2,
-    'precondition: the claimed frame must end exactly at the buffer end');
-  const d = driver();
-  feed(d, bogus.toString('hex'));
-  assert.equal(d.telemetry.power, null, 'nothing decoded yet — the parser must wait');
 
-  // Once more data arrives the bogus length is testable and the parser recovers.
-  feed(d, VECTORS.v2.power_status);
-  assert.notEqual(d.telemetry.power, null,
-    'the valid frame must survive rather than being consumed by a bogus length');
-  assert.equal(d.telemetry.power.flags, ENCODED.power_status.flags);
+  for (const claimed of [good.length - 2, good.length]) {
+    const buf = build(claimed);
+    assert.ok(10 + claimed + 2 <= buf.length, `precondition: ${claimed} must fit`);
+    const d = driver();
+    feed(d, buf.toString('hex'));
+    assert.notEqual(d.telemetry.power, null,
+      `claimed length ${claimed} fits, so the embedded frame must decode at once`);
+    assert.equal(d.telemetry.power.flags, ENCODED.power_status.flags);
+  }
+
+  for (const claimed of [good.length + 2, 60, 200]) {
+    const buf = build(claimed);
+    assert.ok(10 + claimed + 2 > buf.length, `precondition: ${claimed} must overrun`);
+    const d = driver();
+    feed(d, buf.toString('hex'));
+    assert.equal(d.telemetry.power, null,
+      `claimed length ${claimed} overruns, so the parser must wait rather than guess`);
+    // ...and the valid frame must survive the wait, not be consumed by it.
+    feed(d, VECTORS.v2.power_status + '00'.repeat(260));
+    assert.notEqual(d.telemetry.power, null,
+      `claimed length ${claimed} must still recover once more data arrives`);
+    assert.equal(d.telemetry.power.flags, ENCODED.power_status.flags);
+  }
 });

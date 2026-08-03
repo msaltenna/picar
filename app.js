@@ -144,7 +144,10 @@ const throttle_ramp_down = 0;
 // Clamped, not just defaulted. This key is reachable through the untracked
 // picar-cfg.local.json overlay, so a rover-local 0 or a typo would otherwise become
 // setInterval(fn, 1) — measured at ~10% of a core from the /proc read alone.
-const telemetry_interval_ms = Math.max(250, Number(config.telemetry_interval_ms) || 1000);
+// Clamped at BOTH ends — see config-bounds.js for why the upper bound is not
+// cosmetic. Extracted there so the bound is testable; inline it survived a mutation.
+const { clampTelemetryInterval } = require('./config-bounds');
+const telemetry_interval_ms = clampTelemetryInterval(config.telemetry_interval_ms);
 const batteryWarnLevel      = config.batteryWarnLevel ?? 20;
 const batteryWarnVolts      = config.batteryWarnVolts ?? null;
 // Fail closed when the battery monitor reports nothing usable. Set false only
@@ -197,7 +200,8 @@ setInterval(() => {
   const t = currentTelemetry();
   // Bit 0 of the Fleet Manager status bitmask is "battery trouble". It was defined
   // and exported but never actually set by anything until now.
-  fleetClient.setStatusBit(0, batteryTrouble(t.battery, batteryWarnCfg));
+  fleetClient.setStatusBit(0, batteryTrouble(t.battery, batteryWarnCfg,
+    { linkUp: t.linkUp, autopilotHeartbeat: t.autopilotHeartbeat }));
   fleetClient.setTelemetry({
     batteryV:    t.battery ? t.battery.voltageV : null,
     batteryPct:  t.battery ? t.battery.remainingPct : null,
@@ -212,6 +216,9 @@ setInterval(() => {
     wifiPct:     t.wifi ? t.wifi.qualityPct : null,
     wifiDbm:     t.wifi ? t.wifi.signalDbm : null,
     linkUp:      !!t.linkUp,
+    // Forwarded because linkUp only reflects the local MAVProxy TCP socket. A
+    // silent Pixhawk with MAVProxy still connected looked healthy without this.
+    autopilotHeartbeat: !!t.autopilotHeartbeat,
   });
   io.emit('telemetry', t);
 }, telemetry_interval_ms);

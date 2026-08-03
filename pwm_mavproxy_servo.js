@@ -179,6 +179,16 @@ class PWMMavproxy {
 
     // Handles for the param-overlay's timer chain, so it can be cancelled.
     this.overlayTimers = [];
+    // Reassert-until-verified state. The window must exceed one full overlay
+    // chain (9 writes at 250 ms plus the read-back window) or a reassert would
+    // fire before the previous attempt could possibly have been confirmed.
+    // null = accept RADIO_STATUS from any system (see the parser for why).
+    this.radioSystem = Number.isFinite(config.mavproxy_radio_system)
+      ? config.mavproxy_radio_system : null;
+    this.overlayReassertTimer = null;
+    this.overlayAttempts = 0;
+    this.overlayReassertMs = Math.max(3000, Number(config.mavproxy_overlay_reassert_ms) || 5000);
+    this.maxOverlayAttempts = Math.max(1, Number(config.mavproxy_overlay_max_attempts) || 4);
 
     // Latest decoded telemetry. Each entry carries its own `at` timestamp so a
     // reader can tell a live reading from a stale one — reporting a last-known
@@ -274,9 +284,9 @@ class PWMMavproxy {
       // Transmission does not depend on hearing anything, so neither does this.
       // The genuine heartbeat is still required, but for VERIFICATION — read-back
       // and reporting — which is what hearing the autopilot can actually prove.
-      if (this.applyParamOverlayOnConnect && !this.paramOverlayApplied) {
+      if (this.applyParamOverlayOnConnect) {
         this.applyParamOverlay();
-        this.paramOverlayApplied = true;
+        this.startOverlayReassertWatch();
       }
 
       // Still warn when the autopilot never identifies itself: the overlay has now
@@ -326,6 +336,11 @@ class PWMMavproxy {
       // Cancel any in-flight overlay: its remaining PARAM_SETs would write to a
       // dead socket, and on reconnect a fresh chain starts anyway.
       this.clearOverlayTimers();
+      if (this.overlayReassertTimer) {
+        clearTimeout(this.overlayReassertTimer);
+        this.overlayReassertTimer = null;
+      }
+      this.paramOverlayApplied = false;
       this.verifiedCriticalParams.clear();
       this.paramVerificationFailures.clear();
       if (this.heartbeatWatch) { clearTimeout(this.heartbeatWatch); this.heartbeatWatch = null; }
@@ -593,6 +608,47 @@ class PWMMavproxy {
     this.overlayTimers = [];
   }
 
+  // Keep reasserting the overlay until read-back CONFIRMS every critical parameter.
+  //
+  // A TCP connection to MAVProxy is not proof that its /dev/ttyACM0 master is
+  // usable, and sendPacket() only proves bytes reached the local socket. So the
+  // first attempt can be lost in its entirety — RC_OVERRIDE_TIME included — while
+  // arming and the override stream carry on regardless. Applying on connect removed
+  // the heartbeat dependency but not this: nothing retried a lost overlay, and the
+  // later heartbeat deliberately does not.
+  //
+  // Bounded: it stops on success, after maxOverlayAttempts, or on close. Each attempt
+  // cancels the previous chain, so attempts cannot overlap.
+  startOverlayReassertWatch() {
+    this.overlayAttempts = 1;
+    const check = () => {
+      this.overlayReassertTimer = null;
+      if (!this.client || this.client.destroyed) return;      // close handler owns this
+      const missing = Object.keys(EXPECTED_CRITICAL_PARAMS)
+        .filter((n) => !this.verifiedCriticalParams.has(n));
+      if (missing.length === 0) {
+        this.paramOverlayApplied = true;                      // only NOW is it true
+        console.log('MAVProxy: parameter overlay confirmed by read-back');
+        return;
+      }
+      if (this.overlayAttempts >= this.maxOverlayAttempts) {
+        console.error(
+          `MAVProxy: WARNING gave up reasserting the parameter overlay after ` +
+          `${this.overlayAttempts} attempts. Still unconfirmed: ${missing.join(', ')}. ` +
+          `RC_OVERRIDE_TIME may be at the flight controller's 3.0 s default — treat ` +
+          `every critical parameter as unverified.`);
+        return;
+      }
+      this.overlayAttempts += 1;
+      console.error(`MAVProxy: overlay unconfirmed (${missing.join(', ')}) — ` +
+        `reasserting, attempt ${this.overlayAttempts}/${this.maxOverlayAttempts}`);
+      this.applyParamOverlay();
+      this.overlayReassertTimer = setTimeout(check, this.overlayReassertMs);
+    };
+    if (this.overlayReassertTimer) clearTimeout(this.overlayReassertTimer);
+    this.overlayReassertTimer = setTimeout(check, this.overlayReassertMs);
+  }
+
   // Build MAVLink v1 PARAM_REQUEST_READ (msg id 20)
   // Payload: target_system(uint8), target_component(uint8), param_id(char[16]), param_index(int16) = 20 bytes
   // Wire order: param_index(int16), target_system(uint8), target_component(uint8), param_id(char[16])
@@ -692,18 +748,18 @@ class PWMMavproxy {
         // Only accept the declared length when the byte just past it actually
         // looks like the start of another frame (or the buffer ends there).
         // Otherwise treat this as garbage and resync a single byte.
-        if (frameLen >= this.rxBuf.length) {
-          // The claimed frame ends exactly at the data we have, so there is no
-          // following byte to corroborate it. Trusting it here was still lossy: a
-          // crafted length ending exactly after an appended valid frame consumed
-          // both. Wait for more instead — on a 4 Hz stream more always arrives, and
-          // MAX_RX_BUFFER bounds the wait.
-          return;
-        }
-        const next = this.rxBuf[frameLen];
-        this.rxBuf = (next === 0xFE || next === 0xFD)
-          ? this.rxBuf.subarray(frameLen)
-          : this.rxBuf.subarray(1);
+        // We hold no CRC_EXTRA for this message, so we cannot verify it — and
+        // therefore cannot trust its declared LENGTH either. Two earlier attempts to
+        // salvage the length were both lossy: skipping it wholesale let a corrupted
+        // length eat the next valid frame, and corroborating it with a lookahead
+        // still failed, because the following frame's own magic byte corroborates a
+        // false length just as well as a true one.
+        //
+        // So advance a single byte and rescan. The cost is scanning the bytes of
+        // messages we do not decode — at 4 Hz over ~14 message types that is a few
+        // thousand comparisons a second, which is nothing — and in exchange a frame
+        // we cannot verify can never consume one we can.
+        this.rxBuf = this.rxBuf.subarray(1);
         continue;
       }
 
@@ -747,8 +803,24 @@ class PWMMavproxy {
       // a CRC-valid PARAM_VALUE from sysId 1 / compId 99 added entries to
       // verifiedCriticalParams, which would make the verification the overlay
       // depends on trivially forgeable by anything else on the link.
-      if (msgId !== MSG_RADIO_STATUS
-          && (sysId !== this.target_system || compId !== this.target_component)) {
+      const isRadio = msgId === MSG_RADIO_STATUS;
+      if (isRadio) {
+        // RADIO_STATUS comes from the RADIO, not the autopilot — SiK emits source
+        // system 51 (ASCII '3'), so gating it on target_system silently drops the
+        // radio telemetry this driver exists to report.
+        //
+        // The default accepts any source because a SiK's sysId varies with firmware
+        // and configuration, and there is no way to know it in advance. That IS a
+        // hole: anything able to inject on this link can spoof the displayed link
+        // quality and suppress the Wi-Fi fallback. It is bounded by the fact that
+        // radio telemetry is display-only — it feeds no status bit, no arming
+        // decision and no control path — and it is closable by setting
+        // mavproxy_radio_system once the fitted radio's sysId is known.
+        if (this.radioSystem !== null && sysId !== this.radioSystem) {
+          this.rxBuf = this.rxBuf.subarray(frameLen);
+          continue;
+        }
+      } else if (sysId !== this.target_system || compId !== this.target_component) {
         this.rxBuf = this.rxBuf.subarray(frameLen);
         continue;
       }
@@ -772,16 +844,29 @@ class PWMMavproxy {
   // if there is nothing usable. Kept separate from the mapping so the smoothing is
   // testable on its own — a smoothing bug that only shows up through the
   // percentage is hard to attribute.
-  smoothedBatteryVolts(voltageV) {
+  smoothedBatteryVolts(voltageV, now = Date.now()) {
     if (!Number.isFinite(voltageV)) return null;
-    this.batteryVoltHistory.push(voltageV);
+
+    // Discard the window when the stream has been INTERRUPTED, not just when the
+    // socket closed. Clearing on close alone missed the case that matters most: a
+    // Pixhawk reboot or a paused SYS_STATUS stream leaves MAVProxy connected, so
+    // five stale 8.4 V samples outvoted a fresh 6.0 V reading and reported ~100% —
+    // which does not merely look wrong, it CLEARS the low-battery warning.
+    const last = this.batteryVoltHistory.length
+      ? this.batteryVoltHistory[this.batteryVoltHistory.length - 1].at
+      : null;
+    if (last !== null && (now - last) > TELEMETRY_STALE_MS) {
+      this.batteryVoltHistory = [];
+    }
+
+    this.batteryVoltHistory.push({ v: voltageV, at: now });
     // Bound the window. This runs on every SYS_STATUS frame (~4 Hz, indefinitely),
     // so an unbounded history is a slow leak on a process that must stay up for
     // days.
     while (this.batteryVoltHistory.length > this.batteryPctSamples) {
       this.batteryVoltHistory.shift();
     }
-    const sorted = [...this.batteryVoltHistory].sort((a, b) => a - b);
+    const sorted = this.batteryVoltHistory.map((e) => e.v).sort((a, b) => a - b);
     const mid = Math.floor(sorted.length / 2);
     return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
   }
@@ -861,11 +946,15 @@ class PWMMavproxy {
     if (msgId === MSG_RADIO_STATUS) {
       // Wire order: rxerrors(uint16), fixed(uint16), rssi, remrssi, txbuf, noise,
       // remnoise (uint8). SiK reports rssi/noise in raw radio units, not dBm.
+      // UINT8_MAX means "invalid / not measured" for these fields, so reporting 255
+      // renders as a plausible-looking link quality when there is no measurement at
+      // all — and it also suppressed the Wi-Fi fallback, which IS measured.
+      const rssiOrNull = (v) => (v === 255 ? null : v);
       this.telemetry.radio = {
-        rssi:     payload.readUInt8(4),
-        remRssi:  payload.readUInt8(5),
-        noise:    payload.readUInt8(7),
-        remNoise: payload.readUInt8(8),
+        rssi:     rssiOrNull(payload.readUInt8(4)),
+        remRssi:  rssiOrNull(payload.readUInt8(5)),
+        noise:    rssiOrNull(payload.readUInt8(7)),
+        remNoise: rssiOrNull(payload.readUInt8(8)),
         rxErrors: payload.readUInt16LE(0),
         fixed:    payload.readUInt16LE(2),
         txbuf:    payload.readUInt8(6),

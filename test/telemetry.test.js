@@ -732,3 +732,113 @@ test('a PARAM_SET that could not be written is reported, not silently dropped', 
   assert.ok(errs.some((e) => e.includes('was NOT written')),
     `a failed PARAM_SET must be reported (saw: ${errs.length} errors)`);
 });
+
+// ── The overlay is reasserted until read-back confirms it ─────────────────────
+
+test('the overlay is reasserted when read-back does not confirm it', async () => {
+  // A TCP connection to MAVProxy is not proof its serial master is usable, and
+  // sendPacket only proves bytes reached the local socket — so the first overlay can
+  // be lost in its entirety, RC_OVERRIDE_TIME included, while arming and the override
+  // stream carry on. Nothing retried it.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({
+      mavproxy_autostart: false,
+      mavproxy_overlay_reassert_ms: 3000,   // clamped floor
+      mavproxy_overlay_max_attempts: 3,
+    });
+    let attempts = 0;
+    d.applyParamOverlay = () => { attempts += 1; };
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(attempts, 1, 'the first attempt happens on connect');
+    // Assert the WIRING, not just the mechanism: _connect must arm the watch itself.
+    // Calling startOverlayReassertWatch() by hand below would pass even if _connect
+    // never armed it — which is exactly how the first version of this test was
+    // vacuous, and mutation proved it.
+    assert.notEqual(d.overlayReassertTimer, null,
+      '_connect must arm the reassert watch, or a lost overlay is never retried');
+
+    // Nothing verified: the watch must fire another attempt.
+    d.overlayReassertMs = 1;
+    d.startOverlayReassertWatch();
+    await new Promise((r) => setTimeout(r, 40));
+    assert.ok(attempts >= 2, `an unconfirmed overlay must be reasserted (attempts=${attempts})`);
+    assert.equal(d.paramOverlayApplied, false,
+      'and it must NOT be marked applied while still unconfirmed');
+  } finally {
+    if (d) { if (d.overlayReassertTimer) clearTimeout(d.overlayReassertTimer); stopTimers(d); }
+    h.restore();
+  }
+});
+
+test('reasserting stops once read-back confirms every critical parameter', async () => {
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false });
+    let attempts = 0;
+    d.applyParamOverlay = () => { attempts += 1; };
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+
+    // Mark everything verified, as a successful read-back would.
+    for (const n of Object.keys(require('../pwm_mavproxy_servo.js').EXPECTED_CRITICAL_PARAMS
+      || {})) d.verifiedCriticalParams.add(n);
+    if (d.verifiedCriticalParams.size === 0) {
+      for (const n of ['SERVO1_FUNCTION','SERVO2_FUNCTION','SERVO3_FUNCTION',
+                       'SERVO4_FUNCTION','SERVO5_FUNCTION','SERVO6_FUNCTION',
+                       'FRAME_CLASS','RC_OVERRIDE_TIME']) d.verifiedCriticalParams.add(n);
+    }
+    const before = attempts;
+    d.overlayReassertMs = 1;
+    d.startOverlayReassertWatch();
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(attempts, before, 'a confirmed overlay must not be reasserted');
+    assert.equal(d.paramOverlayApplied, true, 'and only now is it marked applied');
+  } finally {
+    if (d) { if (d.overlayReassertTimer) clearTimeout(d.overlayReassertTimer); stopTimers(d); }
+    h.restore();
+  }
+});
+
+test('a close cancels the overlay timer chain', async () => {
+  // Removing clearOverlayTimers() from the close handler previously survived the
+  // whole suite: the test named "a reconnect cancels..." only called
+  // applyParamOverlay twice and then cancelled by hand.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false });
+    d.sendPacket = () => true;
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+    assert.ok(d.overlayTimers.length > 0, 'precondition: a chain is in flight');
+
+    d._connect = () => {};
+    h.handlers.close();
+    assert.deepEqual(d.overlayTimers, [],
+      'the close handler must cancel the overlay chain, not leave it writing to a dead socket');
+    assert.equal(d.overlayReassertTimer, null, 'and the reassert watch too');
+    assert.equal(d.paramOverlayApplied, false, 'and it is no longer considered applied');
+  } finally {
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('RADIO_STATUS 255 sentinels are reported as unknown, not as signal', () => {
+  // UINT8_MAX is "invalid" for these fields. Reporting 255 rendered as a plausible
+  // link quality and suppressed the Wi-Fi fallback, which IS measured.
+  const d = driver({ mavproxy_apply_param_overlay: false });
+  d.parseIncoming(frameV1(MSG.RADIO_STATUS, radioStatusPayload({
+    rssi: 255, remrssi: 255, noise: 255, remnoise: 255, rxerrors: 0, fixed: 0, txbuf: 100,
+  })));
+  const r = d.getTelemetry().radio;
+  assert.notEqual(r, null, 'the frame is still decoded');
+  assert.equal(r.rssi, null, '255 rssi must be unknown');
+  assert.equal(r.remRssi, null);
+  assert.equal(r.noise, null);
+  assert.equal(r.remNoise, null);
+});

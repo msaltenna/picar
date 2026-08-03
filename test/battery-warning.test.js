@@ -77,3 +77,27 @@ test('no battery entry at all is a link problem, not battery trouble', () => {
   assert.equal(batteryTrouble(null, CFG), false);
   assert.equal(batteryTrouble(undefined, CFG), false);
 });
+
+// ── Fail closed when something IS talking but not about the pack ──────────────
+
+test('a silent flight controller on a live link is battery TROUBLE', () => {
+  // The fail-open review found: returning false for a missing battery entry let a
+  // silent Pixhawk with MAVProxy still connected read as battery-clear on both the
+  // rover UI and the fleet dashboard. linkUp only reflects the local TCP socket.
+  assert.equal(batteryTrouble(null, CFG, { linkUp: true, autopilotHeartbeat: false }), true,
+    'link up but nothing reporting the pack must warn');
+  assert.equal(batteryTrouble(null, CFG, { linkUp: true, autopilotHeartbeat: true }), true,
+    'even a heartbeating FC that sends no SYS_STATUS must warn');
+});
+
+test('a DOWN link is a link fault, not battery trouble', () => {
+  // The other half. Warning on every link blip would make the flag meaningless, and
+  // the link state is surfaced separately.
+  assert.equal(batteryTrouble(null, CFG, { linkUp: false, autopilotHeartbeat: false }), false);
+  assert.equal(batteryTrouble(null, CFG, {}), false, 'no link info means no claim');
+});
+
+test('the silent-FC warning respects the opt-out', () => {
+  const off = { ...CFG, warnOnNoReading: false };
+  assert.equal(batteryTrouble(null, off, { linkUp: true, autopilotHeartbeat: true }), false);
+});

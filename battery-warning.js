@@ -16,8 +16,23 @@
 // `battery` is telemetry.battery (or null when there is no SYS_STATUS at all).
 // A missing battery entry means the MAVLink link is down, which is a link problem
 // reported elsewhere — not a claim about the pack — so it is not battery trouble.
-function batteryTrouble(battery, { warnLevel = 20, warnVolts = null, warnOnNoReading = true } = {}) {
-  if (!battery) return false;
+// `link` carries { linkUp, autopilotHeartbeat } so this can tell "the pack is fine"
+// apart from "nobody is telling me about the pack".
+function batteryTrouble(battery, { warnLevel = 20, warnVolts = null, warnOnNoReading = true } = {},
+                        link = {}) {
+  if (!battery) {
+    // A missing battery entry is NOT automatically fine. Two different situations
+    // reach here and only one of them is benign:
+    //
+    //   - the MAVLink link is down: that is a link fault, surfaced separately as
+    //     linkUp, and claiming battery trouble for it would make this flag
+    //     meaningless every time the link blips.
+    //   - the link is UP and the flight controller is even sending heartbeats, but
+    //     no SYS_STATUS has arrived or it has gone stale. Something IS talking and
+    //     it is not telling us about the pack. Returning false there let a silent
+    //     Pixhawk read as battery-clear on both the UI and the fleet dashboard.
+    return !!(warnOnNoReading && link.linkUp);
+  }
   const { remainingPct, voltageV } = battery;
   if (remainingPct !== null && remainingPct !== undefined && remainingPct <= warnLevel) return true;
   if (warnVolts !== null && voltageV !== null && voltageV !== undefined && voltageV <= warnVolts) {
