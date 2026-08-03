@@ -92,6 +92,38 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-03 — MAVProxy wedged and took the control path with it
+
+Not a code change — an incident worth recording, because it cost an hour of misdirected
+diagnosis and it will look like a software regression when it recurs.
+
+Steering and throttle stopped responding. They were **not** broken by any picar change: the
+identical failure reproduced on `main`, which contains none of the light work — picar commanded
+`ch1=1200` and the flight controller held `servo1` at 1500 in both cases.
+
+The cause was **MAVProxy wedging**. It was `active` with `NRestarts=0` and had simply stopped
+reading its socket: 113 KB backed up on picar's live connection, 2.1 MB stranded in a
+`CLOSE-WAIT` socket it never reaped, and `/tmp/mav.tlog` frozen for 70 minutes. Overrides were
+being written into a dead socket. A reboot of the Pi cleared it.
+
+**Two lessons worth more than the fix.**
+
+*Every layer claimed success.* `sendPacket()` returned true, the 20 Hz loop logged normal
+override values with `client=true`, no fail-safe fired, `/status` was healthy. picar cannot
+currently tell "the vehicle is following my commands" from "I am writing to a socket nobody
+reads". Filed as a P0.
+
+*A frozen tlog reads exactly like live data.* Every `SERVO_OUTPUT_RAW` value examined during the
+first hour was a stale snapshot from 22:03, which is why successive tests contradicted each other
+and why one apparently showed the light not responding. Any tlog analysis must first confirm the
+file is still growing — check `stat -c %s` twice, or mark the offset before the test and parse
+only bytes written after it. That marking technique is what finally exposed the problem: a test
+that wrote **zero** new bytes.
+
+The operator also suspected a short after wiring a relay, which was a reasonable read given the
+timing. It was not — but the safe order (power down, unplug the new hardware, meter the rail
+before re-powering) is the right response to that suspicion regardless.
+
 ### 2026-08-03 — `feature/light-control` — BLOCKED ON HARDWARE, software complete
 
 > **The fitted light module cannot be switched by any signal, so this feature cannot
