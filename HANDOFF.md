@@ -188,6 +188,32 @@ substitution had silently **not applied** — a `grep -F` pattern matched the co
 patch and a surviving mutant produce identical output. Mutations are now applied by line number and
 the mutated line is echoed back for confirmation.
 
+**Validation: PASS** — rover3, 2026-08-03 18:2x BST.
+**Validated SHA: `d59b32ba` (`test/driver-safety-gaps`).**
+
+Validated **without changing rover3's checkout**, on operator instruction that the rover stay on
+`feature/battery-and-radio-telemetry`. Because the branch touches zero runtime files, the entire
+substance of it is whether the suite passes under the rover's Node, so the tests were copied to
+`~/picar-testrun` on rover3 and run there against a symlinked `node_modules`. No service was
+restarted, no branch was checked out, and the directory was removed afterwards.
+
+- *On-target result:* **27/27** driver tests under the rover's Node **v20.19.2**, run twice — once
+  against rover3's live `feature/battery-and-radio-telemetry` driver and once against `main`'s
+  driver (sha256 `3bbb52a41c58d6a7…`). Identical.
+- *Host suite:* 58/58 on the workstation (Node v22.22.1).
+- *rover3 after:* branch `feature/battery-and-radio-telemetry` @ `a979b59`, clean tree, `picar` /
+  `mavproxy` / `mediamtx` all active with `NRestarts=0`, `/status` reporting battery 7.934 V and 7
+  params verified. Unchanged throughout.
+- *Not done, deliberately:* no MAVLink wire capture, no WebUI drive, no fail-safe trip. There is no
+  new runtime behaviour to exercise — `git diff --name-only main..d59b32b` is two test files and the
+  two tracking documents. No arming attempted; no actuation is possible with the flight battery
+  disconnected.
+
+**The same run answered a merge question.** All 27 tests pass unchanged against the telemetry
+branch's driver — verified first in a throwaway local worktree, then on the rover itself. So these
+tests survive the eventual `feature/battery-and-radio-telemetry` merge and do not depend on `main`'s
+driver shape.
+
 **New defect found while writing the config test**, filed as P1 in `TASKS.md`: a truthy-but-invalid
 `pwm_min_us`/`pwm_max_us` makes `this.neutral` `NaN`, so the channels that fall back to it
 initialise to 0 and the wire carries the 65535 release sentinel. The effect is channel-specific,
