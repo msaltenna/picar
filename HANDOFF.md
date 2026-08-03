@@ -92,6 +92,146 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-03 — `test/driver-safety-gaps`
+
+Closes the driver half of the coverage gap the 2026-08-03 mutation pass exposed. Tests only —
+no runtime file is touched. Suite goes **46 → 58**.
+
+Adds `test/driver-safety-gaps.test.js` and strengthens three tests in
+`test/drivetrain-safety.test.js` that were passing vacuously:
+
+- **`setServoPWM`'s `Number.isFinite` guards were only ever exercised through `shift`.** The raw
+  guard at `pwm_mavproxy_servo.js:243` runs *first*, but the `DISCRETE_CHANNELS` endpoint check at
+  `:251` is a **fallback** that also rejects every non-endpoint value — so deleting the guard left
+  the shift tests green. A continuous channel has no such fallback: it stores `NaN`, which a
+  `Uint16Array` coerces to 0 and `buildRCOverride:346` encodes as the 65535 *release-override*
+  sentinel. Now covered on `throttle` and `steering` directly.
+- **Nothing invoked `_connect()`, and nothing drove the `close` handler.** The old reconnect test
+  hand-wrote the sequence it claimed to verify — *including* the `this.client = null` that
+  production does — so both could be deleted with the suite green. Now the real `_connect()` runs
+  against fake sockets and the real `close` handler is driven by emitting `'close'`, covering all
+  four things that handler owns and the automatic 2 s retry.
+- **Four vacuous assertions replaced:** `typeof … === 'boolean'` on `setServoPWM` and `disarm` (a
+  stub returning a constant satisfied both); `notEqual(shift, 1500)` where the constructor default
+  is already 2000, so it held *before* the refused call ran; and `sendPacket`'s destroyed-socket
+  guard, which was only reachable through a fake whose `write()` threw, letting the `try/catch`
+  stand in for the guard.
+
+**Verified by mutation — 13 mutants, each applied individually with the tree restored after every
+run, all now caught.** Counts are the observed `not ok` totals from *these* patches; a differently
+shaped patch for the same intent yields different counts, so treat the kill as the result and the
+number as provenance:
+
+| Mutant | Failures |
+| --- | --: |
+| remove raw `isFinite` guard (`:243`) | 2 |
+| remove post-scale `isFinite` guard (`:259`) | 1 |
+| remove **both** guards | 2 |
+| disable `DISCRETE_CHANNELS` endpoint check (`:251`) | 2 |
+| delete `sendPacket`'s destroyed/missing-client guard (`:176`) | 2 |
+| `_connect`: no `neutralizeAndDisarm()` (`:149`) | 2 |
+| `_connect`: no `startLoop()` (`:150`) | 2 |
+| `_connect` callback throws (must fail, not hang) | 4 |
+| `close`: client not released (`:166`) | 2 |
+| `close`: override loop not stopped (`:167`) | 1 |
+| `close`: heartbeat not stopped (`:168`) | 1 |
+| `close`: retry not scheduled (`:169`) | 1 |
+| `setServoPWM` constant-`false` stub | 4 |
+
+**Three process notes, each a real trap:**
+
+1. The first `net.createConnection` stub invoked the connect callback **synchronously**, hitting the
+   temporal dead zone on `_connect()`'s `const socket = …` and throwing `ReferenceError`. Real
+   sockets fire `connect` on a later tick, so the stub defers via `setImmediate`.
+2. That deferred callback must settle its promise **even when it throws**. With a bare
+   `onConnect(); resolve();` a throwing callback left the promise pending, `await settle()` never
+   returned, and the suite **hung instead of failing** — indistinguishable from a pass unless you
+   check the exit code. It now rejects.
+3. The `close` handler's retry is a bare `setTimeout(…, 2000)` that **nothing tracks**, so a test
+   driving `close` cannot cancel it. If it fires after the helper restores the real `net` module it
+   opens a genuine socket to `127.0.0.1:5760`, and the resulting `ECONNREFUSED` → close → retry
+   loop hangs the runner forever. Cleanup now parks a truthy `d.client` so `_connect()`'s
+   existing-client guard swallows any escaped retry. This was found the hard way: mutating away the
+   close handler's interval-clearing made the run hang rather than report its failure.
+
+Every mutation run is wrapped in a hard `timeout` that reports `HANG` distinctly from a failure
+count, because the two are otherwise indistinguishable and a hang reads as success.
+
+**Reviewer: `codex`, two rounds.**
+
+*Round 1 returned NEEDS-CORRECTION with 6 findings, 2 HIGH, all accepted and fixed.* The important
+one is finding 1: it applied a mutant this session had not thought to try — deleting
+`this.client = null` from the close handler — and **all 55 tests stayed green**, because the
+then-current "reconnect" test performed that assignment *itself* instead of letting the close
+handler run. The test was verifying its own scaffolding. It also found that a throwing connect
+callback hung the suite rather than failing it, that the corrupt-range prose overstated the channel
+state, that `TASKS.md` still listed the survivors this branch fixes as open work, that three
+recorded mutation counts were wrong, and that the guard-order explanation was backwards.
+
+*Round 2 verified every substantive fix independently* — reproduced 2/1/1/1 on the close-handler
+lines with no hangs, 4 failures on the throwing callback with no hang, both corrupt-range buffer and
+wire arrays exactly, `channelNeutralUs = {steering: 0, throttle: 0}`, that JSON rejects non-finite
+literals, that all five remaining `app.js` mutants still pass 58/58, that the new `sendPacket` tests
+are behavioural rather than tautological, and that the parked-sentinel cleanup masks nothing and no
+test asserts against it. It reproduced 12 of the 13 recorded counts exactly; the thirteenth
+(removing both finite guards) gave 5 rather than 2 under its own patch shape, which the recorded
+caveat covers — the mutant is killed either way.
+
+*Round 2's two remaining findings were documentation accuracy only* — `HANDOFF.md` abbreviated the
+measurement arrays that `TASKS.md` quoted in full, and this entry contradicted itself on the suite
+total (46 → 55 versus 46 → 58; it is 58). Both fixed above and re-verified mechanically. No third
+round: neither touched code or a substantive claim, and both are checkable by reading the file.
+
+Two honest process notes. Twice during this work a mutation was reported as "0 failures" when the
+substitution had silently **not applied** — a `grep -F` pattern matched the constructor's
+`this.client = null` rather than the close handler's, and another had wrong indentation. A no-op
+patch and a surviving mutant produce identical output. Mutations are now applied by line number and
+the mutated line is echoed back for confirmation.
+
+**Validation: PASS** — rover3, 2026-08-03 18:2x BST.
+**Validated SHA: `d59b32ba` (`test/driver-safety-gaps`).**
+
+Validated **without changing rover3's checkout**, on operator instruction that the rover stay on
+`feature/battery-and-radio-telemetry`. Because the branch touches zero runtime files, the entire
+substance of it is whether the suite passes under the rover's Node, so the tests were copied to
+`~/picar-testrun` on rover3 and run there against a symlinked `node_modules`. No service was
+restarted, no branch was checked out, and the directory was removed afterwards.
+
+- *On-target result:* **27/27** driver tests under the rover's Node **v20.19.2**, run twice — once
+  against rover3's live `feature/battery-and-radio-telemetry` driver and once against `main`'s
+  driver (sha256 `3bbb52a41c58d6a7…`). Identical.
+- *Host suite:* 58/58 on the workstation (Node v22.22.1).
+- *rover3 after:* branch `feature/battery-and-radio-telemetry` @ `a979b59`, clean tree, `picar` /
+  `mavproxy` / `mediamtx` all active with `NRestarts=0`, `/status` reporting battery 7.934 V and 7
+  params verified. Unchanged throughout.
+- *Not done, deliberately:* no MAVLink wire capture, no WebUI drive, no fail-safe trip. There is no
+  new runtime behaviour to exercise — `git diff --name-only main..d59b32b` is two test files and the
+  two tracking documents. No arming attempted; no actuation is possible with the flight battery
+  disconnected.
+
+**The same run answered a merge question.** All 27 tests pass unchanged against the telemetry
+branch's driver — verified first in a throwaway local worktree, then on the rover itself. So these
+tests survive the eventual `feature/battery-and-radio-telemetry` merge and do not depend on `main`'s
+driver shape.
+
+**New defect found while writing the config test**, filed as P1 in `TASKS.md`: a truthy-but-invalid
+`pwm_min_us`/`pwm_max_us` makes `this.neutral` `NaN`, so the channels that fall back to it
+initialise to 0 and the wire carries the 65535 release sentinel. The effect is channel-specific,
+because only some initialisers fall back to `this.neutral`. Measured in full:
+
+```
+pwm_max_us: 'x'   buffer [0,0,0,0,1000,0,0,0]
+                  wire   [65535,65535,65535,65535,1000,65535,65535,65535]
+pwm_min_us: 'x'   buffer [0,2000,0,2000,0,0,0,0]
+                  wire   [65535,2000,65535,2000,65535,65535,65535,65535]
+both cases        channelNeutralUs = {steering: 0, throttle: 0}
+```
+
+**Both motion channels go to 65535 either way**, and because `channelNeutralUs` is
+`{steering: 0, throttle: 0}`, `neutralizeAndDisarm()` transmits the release sentinel on exactly the
+two channels it exists to centre. `NaN` is harmless because the `|| default` idiom rescues it, and
+`Infinity` is not expressible in a JSON config, so the practical vector is a truthy non-numeric.
+
 ### 2026-08-03 — `chore/reconcile-tracking-docs`
 
 Documentation only — zero runtime files. Reconciles the tracking documents against a full
