@@ -301,6 +301,18 @@ Open work only. Completed tasks are **deleted** from this file — their record 
      rover. Acknowledge or emit the rejection. *(This is a different defect from the `failSafeStop`
      notification gap on `main`, filed separately under P1.)*
 
+- **Light module cannot be switched as wired — needs a switching component** — the
+  fitted module is a **Traxxas 8028**, a regulated 3 V LED supply with **no control
+  input**, connected power-only to the Pixhawk servo rail. Nothing is attached to
+  output 6, so the software control (`feature/light-control`, verified driving
+  `SERVO_OUTPUT_RAW` servo6 between 1000 and 2000 µs) has nothing listening to it.
+  Switching it requires switching its POWER: either an RC PWM switch module reading
+  MAIN 6 (no software change needed) or a relay/MOSFET on a GPIO pin driven by
+  `MAV_CMD_DO_SET_RELAY` (`SERVO6_FUNCTION = -1`, which changes the control
+  mechanism). Do **not** wire the module's power lead to a servo signal pin. Also
+  unquantified: the 8028's input current draw against a servo rail that also feeds
+  the steering servo.
+
 ### P1 — correctness and robustness
 
 - **`app.js` has no test file at all, and five safety mutants survive because of it** — measured

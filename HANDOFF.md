@@ -92,12 +92,44 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
-### 2026-08-03 — `feature/light-control` — hardware-verified
+### 2026-08-03 — `feature/light-control` — BLOCKED ON HARDWARE, software complete
+
+> **The fitted light module cannot be switched by any signal, so this feature cannot
+> work as wired.** The module is a **Traxxas 8028 "Regulated 3-Volt LED Light Power
+> Supply"** — a pure voltage regulator with **no control input**. Traxxas: it "plugs
+> directly into the accessory tap on the XL-5 HV speed control to provide a regulated
+> 3-Volt output for LED lights." Energise it and the LEDs are on; there is no channel
+> to listen to. It is connected power-only to the Pixhawk servo rail, so nothing is
+> attached to output 6 at all.
+>
+> **To switch it, its POWER must be switched**, which needs a component between the
+> rail and its power lead. The Pixhawk cannot do this directly — a servo output's
+> signal pin sources a few mA at 3.3 V, and wiring the module's power lead to a
+> signal pin risks the flight controller. Two options:
+>
+> - **An RC PWM switch module** reading MAIN 6 and switching the rail feed. **No
+>   software change** — the existing 1000/2000 µs swing is what such a module expects,
+>   and `light_on_us` / `light_off_us` are configurable if it wants a different pair.
+> - **A relay/MOSFET board on a GPIO**: `SERVO6_FUNCTION = -1`, a relay defined on
+>   that pin, driven by `MAV_CMD_DO_SET_RELAY` rather than an RC override. The
+>   supported ArduPilot path for on/off loads, but it changes the control mechanism,
+>   so both the driver and the handler change.
+>
+> Also worth checking: Traxxas publish no input current figure for the 8028, and it
+> now draws from the servo rail that also feeds the steering servo.
+
+### 2026-08-03 — `feature/light-control` — command path verified to the flight controller
 
 Web control for a light module on **Pixhawk output 6**, driven by RC channel 6
 passthrough (`SERVO6_FUNCTION: 1`) from a Light button in the controller UI.
 
-**Verified on rover3 at SHA `45a9e0b`, on the MAVLink wire:**
+**Verified on rover3 at SHA `45a9e0b`, on the MAVLink wire — to the flight controller
+output only.** An earlier version of this entry, and the session summary, said "it
+works". That overstated it: what was verified is the command path up to output 6.
+The lamp itself was never observed and could not be, which is exactly the distinction
+`CLAUDE.md`'s validation rules exist to keep straight. The light did **not** in fact
+turn on — see the blocker above.
+
 
 | | `RC_OVERRIDE` ch6 (commanded) | `SERVO_OUTPUT_RAW` servo6 (flight controller) |
 | --- | --- | --- |
