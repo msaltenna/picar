@@ -272,6 +272,7 @@
     }
     #btnStrip #shiftBtn.high    { background: rgba(0,160,80,0.8);  color: white; border-color: #0a6; }
     #btnStrip .tlock-btn.locked { background: rgba(200,120,0,0.8); color: white; border-color: #c80; }
+    #btnStrip #lightBtn.lit     { background: rgba(240,200,40,0.9); color: #222;  border-color: #fc0; }
     @media (orientation: landscape) and (max-height: 500px) {
       #btnStrip { bottom: 8px; }
       #btnStrip button { padding: 4px 8px; font-size: 10px; }
@@ -381,6 +382,7 @@
     <button id="tlockFrontBtn" class="tlock-btn" style="display:none;">F.Diff: Open</button>
     <button id="shiftBtn" style="display:none;">Gear: LOW</button>
     <button id="tlockRearBtn" class="tlock-btn" style="display:none;">R.Diff: Open</button>
+    <button id="lightBtn" style="display:none;">Light: OFF</button>
   </div>
 
   <!-- Stream cert overlay -->
@@ -433,6 +435,7 @@
         <label><input type="checkbox" id="cfgBtnGear"> Gear</label>
         <label><input type="checkbox" id="cfgBtnFrontDiff"> Front diff</label>
         <label><input type="checkbox" id="cfgBtnRearDiff"> Rear diff</label>
+        <label><input type="checkbox" id="cfgBtnLight"> Light</label>
       </div>
 
       <div class="config-close-row">
@@ -520,6 +523,7 @@
       showBtnGear:     false,
       showBtnFrontDiff:false,
       showBtnRearDiff: false,
+      showBtnLight:    true,
       showKeyboardHint:true,
     };
 
@@ -547,6 +551,7 @@
       cfgBtnGear:      'showBtnGear',
       cfgBtnFrontDiff: 'showBtnFrontDiff',
       cfgBtnRearDiff:  'showBtnRearDiff',
+      cfgBtnLight:     'showBtnLight',
       cfgKeyboardHint: 'showKeyboardHint',
     };
 
@@ -575,6 +580,7 @@
       document.getElementById('shiftBtn').style.display      = uiCfg.showBtnGear     ? '' : 'none';
       document.getElementById('tlockFrontBtn').style.display = uiCfg.showBtnFrontDiff ? '' : 'none';
       document.getElementById('tlockRearBtn').style.display  = uiCfg.showBtnRearDiff  ? '' : 'none';
+      document.getElementById('lightBtn').style.display      = uiCfg.showBtnLight    ? '' : 'none';
     }
 
     function applyKeyboardHintVisibility() {
@@ -1273,6 +1279,49 @@
       });
     }
 
+    // ── Light module (Pixhawk output 6) ───────────────────────────────────────
+    //
+    // Unlike the gear and diff buttons this does NOT go through
+    // requestDrivetrain(): a light is not a mechanical actuator working against the
+    // driveline, so there is nothing to stop for and forcing a disarm to switch a
+    // light on would make the vehicle less usable for no safety gain.
+    //
+    // The button reflects the SERVER's state, not the click. It updates only when
+    // the server acknowledges or broadcasts lightState, so a refused command cannot
+    // leave the button claiming ON while the output is off — the same mistake the
+    // gear button used to make with its optimistic toggle.
+    let lightOn = false;
+
+    function renderLight() {
+      const btn = document.getElementById('lightBtn');
+      if (!btn) return;
+      btn.textContent = `Light: ${lightOn ? 'ON' : 'OFF'}`;
+      btn.classList.toggle('lit', lightOn);
+    }
+
+    function toggleLight() {
+      if (!isConnected) { showLightError('not connected'); return; }
+      const want = !lightOn;
+      socket.emit('setLight', want, (result) => {
+        if (result && result.ok) { lightOn = result.on; renderLight(); }
+        else showLightError(result && result.error ? result.error : 'refused');
+      });
+    }
+
+    function showLightError(message) {
+      const btn = document.getElementById('lightBtn');
+      if (btn) btn.textContent = 'Light: ⚠';
+      console.warn('Light command failed:', message);
+    }
+
+    // Broadcast, so a second tab or a reconnect shows the real state rather than a
+    // stale one.
+    socket.on('lightState', (s) => {
+      if (!s || typeof s.on !== 'boolean') return;
+      lightOn = s.on;
+      renderLight();
+    });
+
     function addButtonHandlers(id, toggleFn) {
       const el = document.getElementById(id);
       el.addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); toggleFn(); }, { passive: false });
@@ -1281,6 +1330,7 @@
     addButtonHandlers('shiftBtn',      toggleShift);
     addButtonHandlers('tlockFrontBtn', toggleTlockFront);
     addButtonHandlers('tlockRearBtn',  toggleTlockRear);
+    addButtonHandlers('lightBtn',      toggleLight);
 
     function activateControlMode(mode) {
       deactivateAllControls();
@@ -1538,6 +1588,7 @@
       requestWakeLock();
       applyButtonVisibility();
       activateControlMode(controlMode);
+      renderLight();
       renderStatusBar();
     });
 

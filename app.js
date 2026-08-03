@@ -129,6 +129,7 @@ io.on('connection', (socket) => {
 
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
+  if (typeof pwm.lightIsOn === 'function') socket.emit('lightState', { on: pwm.lightIsOn() });
 
   socket.on('arm', () => {
     // Refuse to arm while a drivetrain change is settling. Otherwise an arm
@@ -224,6 +225,39 @@ io.on('connection', (socket) => {
         `${JSON.stringify(requested)}`);
       reply({ ok: Object.values(applied).every(Boolean), applied });
     }, drivetrain_settle_ms);
+  });
+
+  // ── Light module on Pixhawk output 6 ────────────────────────────────────────
+  //
+  // Deliberately its OWN event, not a field on the continuous 'fromclient' stream.
+  // The drivetrain fields were removed from that stream because a single packet
+  // could combine motion with an actuator change; the same reasoning applies here,
+  // and it also means a light toggle cannot be replayed 20 times a second.
+  //
+  // It does NOT go through the drivetrain neutral+disarm transaction. A light is not
+  // a mechanical actuator working against the driveline — there is nothing to jam,
+  // nothing to shift under load — so forcing a disarm to turn a light on would make
+  // the vehicle less usable for no safety gain. It is also deliberately NOT touched
+  // by failSafeStop: an operator who has just lost control wants the vehicle to stay
+  // visible, so a fail-safe leaves the light exactly as it was.
+  socket.on('setLight', (on, acknowledge) => {
+    const reply = (result) => {
+      if (typeof acknowledge === 'function') acknowledge(result);
+      return result;
+    };
+    if (typeof on !== 'boolean') {
+      return reply({ ok: false, error: 'light state must be true or false' });
+    }
+    if (typeof pwm.setLight !== 'function') {
+      // A GPIO driver has no light channel. Say so rather than reporting success.
+      return reply({ ok: false, error: 'this driver has no light channel' });
+    }
+    const applied = pwm.setLight(on);
+    if (!applied) return reply({ ok: false, error: 'driver refused the light command' });
+    console.log(`Light: ${on ? 'ON' : 'OFF'}`);
+    // Tell every client, so a second tab does not show a stale button.
+    io.emit('lightState', { on });
+    return reply({ ok: true, on });
   });
 
   socket.on('setVideoParams', (params) => {
