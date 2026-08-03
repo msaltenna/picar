@@ -28,6 +28,10 @@
   "tlock_front_default_us": 2000,
   "tlock_rear_default_us": 1000,
 
+  "comment_light": "Light module on Pixhawk output 6, driven by RC channel 6 passthrough (SERVO6_FUNCTION=1). On/off only, not dimmable. Its own endpoint pair so the module can be trimmed without touching the motion channels PWM range. The light is NOT reset by a fail-safe: an operator who has just lost control wants the vehicle to stay visible.",
+  "light_on_us": 2000,
+  "light_off_us": 1000,
+
   "comment3": "stream_codec: 'webrtc' uses MediaMTX (https://host:8889/cam). Fallbacks: 'h264' or 'mjpeg'.",
   "stream_codec": "webrtc",
 

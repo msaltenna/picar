@@ -92,6 +92,107 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-03 — MAVProxy wedged and took the control path with it
+
+Not a code change — an incident worth recording, because it cost an hour of misdirected
+diagnosis and it will look like a software regression when it recurs.
+
+Steering and throttle stopped responding. They were **not** broken by any picar change: the
+identical failure reproduced on `main`, which contains none of the light work — picar commanded
+`ch1=1200` and the flight controller held `servo1` at 1500 in both cases.
+
+The cause was **MAVProxy wedging**. It was `active` with `NRestarts=0` and had simply stopped
+reading its socket: 113 KB backed up on picar's live connection, 2.1 MB stranded in a
+`CLOSE-WAIT` socket it never reaped, and `/tmp/mav.tlog` frozen for 70 minutes. Overrides were
+being written into a dead socket. A reboot of the Pi cleared it.
+
+**Two lessons worth more than the fix.**
+
+*Every layer claimed success.* `sendPacket()` returned true, the 20 Hz loop logged normal
+override values with `client=true`, no fail-safe fired, `/status` was healthy. picar cannot
+currently tell "the vehicle is following my commands" from "I am writing to a socket nobody
+reads". Filed as a P0.
+
+*A frozen tlog reads exactly like live data.* Every `SERVO_OUTPUT_RAW` value examined during the
+first hour was a stale snapshot from 22:03, which is why successive tests contradicted each other
+and why one apparently showed the light not responding. Any tlog analysis must first confirm the
+file is still growing — check `stat -c %s` twice, or mark the offset before the test and parse
+only bytes written after it. That marking technique is what finally exposed the problem: a test
+that wrote **zero** new bytes.
+
+The operator also suspected a short after wiring a relay, which was a reasonable read given the
+timing. It was not — but the safe order (power down, unplug the new hardware, meter the rail
+before re-powering) is the right response to that suspicion regardless.
+
+### 2026-08-03 — `feature/light-control` — BLOCKED ON HARDWARE, software complete
+
+> **The fitted light module cannot be switched by any signal, so this feature cannot
+> work as wired.** The module is a **Traxxas 8028 "Regulated 3-Volt LED Light Power
+> Supply"** — a pure voltage regulator with **no control input**. Traxxas: it "plugs
+> directly into the accessory tap on the XL-5 HV speed control to provide a regulated
+> 3-Volt output for LED lights." Energise it and the LEDs are on; there is no channel
+> to listen to. It is connected power-only to the Pixhawk servo rail, so nothing is
+> attached to output 6 at all.
+>
+> **To switch it, its POWER must be switched**, which needs a component between the
+> rail and its power lead. The Pixhawk cannot do this directly — a servo output's
+> signal pin sources a few mA at 3.3 V, and wiring the module's power lead to a
+> signal pin risks the flight controller. Two options:
+>
+> - **An RC PWM switch module** reading MAIN 6 and switching the rail feed. **No
+>   software change** — the existing 1000/2000 µs swing is what such a module expects,
+>   and `light_on_us` / `light_off_us` are configurable if it wants a different pair.
+> - **A relay/MOSFET board on a GPIO**: `SERVO6_FUNCTION = -1`, a relay defined on
+>   that pin, driven by `MAV_CMD_DO_SET_RELAY` rather than an RC override. The
+>   supported ArduPilot path for on/off loads, but it changes the control mechanism,
+>   so both the driver and the handler change.
+>
+> Also worth checking: Traxxas publish no input current figure for the 8028, and it
+> now draws from the servo rail that also feeds the steering servo.
+
+### 2026-08-03 — `feature/light-control` — command path verified to the flight controller
+
+Web control for a light module on **Pixhawk output 6**, driven by RC channel 6
+passthrough (`SERVO6_FUNCTION: 1`) from a Light button in the controller UI.
+
+**Verified on rover3 at SHA `45a9e0b`, on the MAVLink wire — to the flight controller
+output only.** An earlier version of this entry, and the session summary, said "it
+works". That overstated it: what was verified is the command path up to output 6.
+The lamp itself was never observed and could not be, which is exactly the distinction
+`CLAUDE.md`'s validation rules exist to keep straight. The light did **not** in fact
+turn on — see the blocker above.
+
+
+| | `RC_OVERRIDE` ch6 (commanded) | `SERVO_OUTPUT_RAW` servo6 (flight controller) |
+| --- | --- | --- |
+| Light ON | 2000 | **2000** |
+| Light OFF | 1000 | **1000** |
+
+Throughout both toggles `servo1` (steering) held 1500 and `servo3` (throttle) held
+1500 — switching the light never perturbed a motion output. The full Socket.IO path
+was exercised as the browser uses it (EIO=4 over WebSocket): the server pushed the
+initial `lightState` on connect, broadcast it on each change, logged `Light: ON` /
+`Light: OFF`, and **rejected a non-boolean** with no state change and no broadcast.
+
+**Not reviewed by Codex**, on explicit operator instruction — this was a
+does-it-work check on new hardware. Recorded plainly rather than with a
+`Reviewed-by` trailer, since the trailer is the only durable record of whether the
+gate ran.
+
+Design notes for whoever touches this next: the light is its own socket event rather
+than a `fromclient` field (so it cannot be combined with motion in one packet, or
+replayed at 20 Hz); it does **not** go through the drivetrain neutral+disarm
+transaction, because a light is not a mechanical actuator working against the
+driveline; and a fail-safe deliberately **leaves it on**, because an operator who has
+just lost control wants the vehicle to stay visible. That last one is pinned by test.
+
+**A diagnostic trap worth knowing.** `SERVO_OUTPUT_RAW` orders its fields by
+DESCENDING SIZE, so `port` is the **last** byte, not the second field — `servo6_raw`
+is at offset 14, and `servoN_raw` at `4 + (N-1)*2`. Reading it as though `port`
+followed `time_usec` put every servo one byte out and reported servo6 as `3`/`7`.
+That looked exactly like "the light does not work". Same rule the telemetry branch's
+field-offset comments exist for.
+
 ### 2026-08-03 — `test/driver-safety-gaps`
 
 Closes the driver half of the coverage gap the 2026-08-03 mutation pass exposed. Tests only —
