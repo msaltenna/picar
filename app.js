@@ -152,39 +152,24 @@ const throttle_ramp_down = 0;
 // reachable through the untracked picar-cfg.local.json overlay, so a rover-local 0
 // or a typo would otherwise become setInterval(fn, 1) — measured at ~10% of a core
 // from the /proc read alone — and 1e400 is valid JSON that Node coerces to 1 ms.
-const { startTelemetryLoop } = require('./telemetry-loop');
+const { startTelemetryLoop, buildTelemetryWiring, batteryWarnCfgFrom,
+        batteryWarnabilityWarning } = require('./telemetry-loop');
 
-const batteryWarnLevel      = config.batteryWarnLevel ?? 20;
-const batteryWarnVolts      = config.batteryWarnVolts ?? null;
-// Fail closed when the battery monitor reports nothing usable. Set false only
-// on a vehicle that genuinely has no battery monitor, where a permanent warning
-// would be noise rather than information.
-const batteryWarnOnNoReading = config.batteryWarnOnNoReading !== false;
+// Derived in ONE place, shared by the loop and by the config pushed to the UI, so
+// the operator's warning threshold and the fleet status bit cannot disagree.
+const batteryWarnCfg = batteryWarnCfgFrom(config);
 
-// A voltage with no threshold to compare it against cannot ever raise a warning:
-// the percentage branch has no percentage, the voltage branch has no threshold, and
-// the fail-closed branch requires the voltage to be missing too. Silence here reads
-// as "pack healthy" when it means "nothing is watching the pack", so say so once,
-// loudly, at startup.
-if (batteryWarnVolts === null && config.battery_empty_volts == null) {
-  console.error('picar: no batteryWarnVolts and no battery_empty_volts/battery_full_volts — ' +
-                'a flight controller that reports voltage but no usable percentage (the ' +
-                'default on this fleet) can NEVER raise a battery warning. Set ' +
-                'batteryWarnVolts for this pack.');
-}
+// The rule lives in telemetry-loop.js so it is testable; this is the one line that
+// applies it. Silence about an unwatchable pack reads as "pack healthy" when it means
+// "nothing is watching the pack", so it is said once, loudly, at startup.
+const warnability = batteryWarnabilityWarning(config, pwm.batteryRange);
+if (warnability) console.error(warnability);
 
-const telemetryLoop = startTelemetryLoop({
-  getFcTelemetry: () => (typeof pwm.getTelemetry === 'function' ? pwm.getTelemetry() : {}),
-  fleetClient,
-  emit:     (event, payload) => io.emit(event, payload),
-  readWifi: (path, enc) => fs.promises.readFile(path, enc),
-  config,
-  batteryWarnCfg: {
-    warnLevel:       batteryWarnLevel,
-    warnVolts:       batteryWarnVolts,
-    warnOnNoReading: batteryWarnOnNoReading,
-  },
-});
+// One call, and every lambda it used to inline is now covered by
+// telemetry-loop.test.js. See buildTelemetryWiring() for the two mutations that
+// survived while those lambdas lived here.
+const telemetryLoop = startTelemetryLoop(
+  buildTelemetryWiring({ pwm, io, fleetClient, fs, config }));
 const currentTelemetry = telemetryLoop.current;
 
 io.on('connection', (socket) => {
@@ -192,7 +177,9 @@ io.on('connection', (socket) => {
 
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
-  socket.emit('telemetryConfig', { batteryWarnLevel, batteryWarnVolts, batteryWarnOnNoReading,
+  socket.emit('telemetryConfig', { batteryWarnLevel:       batteryWarnCfg.warnLevel,
+    batteryWarnVolts:        batteryWarnCfg.warnVolts,
+    batteryWarnOnNoReading:  batteryWarnCfg.warnOnNoReading,
     // The UI derives its staleness window from this rather than hard-coding one,
     // so a deliberately slow rover does not blank its own status bar.
     telemetryIntervalMs: telemetryLoop.intervalMs });

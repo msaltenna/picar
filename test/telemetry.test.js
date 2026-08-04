@@ -929,3 +929,63 @@ test('a maximally zero-trimmed frame of every known type never throws', () => {
       `${name} (msgId ${msg.id}) threw on a fully zero-trimmed payload`);
   }
 });
+
+test('a reassert does not blank the already-verified parameter list', () => {
+  // The status bar flipped 'FC: ok' -> 'FC: 8 param unverified' -> 'FC: ok' up to four
+  // times per connect, because applyParamOverlay() cleared verifiedCriticalParams on
+  // entry and each chain takes ~4 s to re-confirm. Churn on the one indicator this
+  // branch added to be trusted teaches an operator to ignore it. Verification state is
+  // invalidated by a CLOSE (a possibly different flight controller), not by a retry.
+  const d = driver();
+  d.sendPacket = () => true;
+  for (const n of Object.keys(PWMMavproxy.EXPECTED_CRITICAL_PARAMS)) {
+    d.verifiedCriticalParams.add(n);
+  }
+  assert.deepEqual(d.getTelemetry().params.missing, [], 'precondition: all verified');
+
+  d.applyParamOverlay();
+  d.clearOverlayTimers();
+  assert.deepEqual(d.getTelemetry().params.missing, [],
+    'a reassert must not report every critical parameter as unverified again');
+});
+
+test('a recorded mismatch survives a reassert until read-back contradicts it', () => {
+  // The fail-CLOSED direction: if a reassert's read-backs are all lost, the warning
+  // must stay up rather than being cleared by the attempt itself.
+  const d = driver();
+  d.sendPacket = () => true;
+  d.paramVerificationFailures.set('FRAME_CLASS', { actual: 2, expected: 1 });
+  d.applyParamOverlay();
+  d.clearOverlayTimers();
+  assert.ok(d.getTelemetry().params.mismatched.FRAME_CLASS,
+    'a retry must not clear the evidence of a mismatch it has not yet disproved');
+});
+
+test('a half-configured pack range is reported, not silently ignored', () => {
+  // Setting only battery_empty_volts is the natural half-finished edit for the config
+  // comment that reads "Examples: 2S LiPo 6.0/8.4". It fell straight through the
+  // range-validation block: no range, no message — and app.js's startup guard only
+  // checked battery_empty_volts, so it was suppressed too. The result was a rover
+  // with no percentage, no voltage threshold, and no complaint about either, where a
+  // deeply over-discharged pack raises nothing at all.
+  const captured = [];
+  const realError = console.error;
+  console.error = (...a) => captured.push(a.join(' '));
+  let d1, d2, d3;
+  try {
+    d1 = driver({ battery_empty_volts: 6.0 });                            // full missing
+    d2 = driver({ battery_full_volts: 8.4 });                             // empty missing
+    d3 = driver({ battery_empty_volts: 6.0, battery_full_volts: 8.4 });   // complete
+  } finally {
+    console.error = realError;
+  }
+  assert.equal(d1.batteryRange, null, 'a half range must not enable the estimate');
+  assert.equal(d2.batteryRange, null);
+  assert.deepEqual(d3.batteryRange, { emptyV: 6.0, fullV: 8.4 },
+    'and a complete range must still work');
+
+  const halfMsgs = captured.filter((m) => /must BOTH be set/.test(m));
+  assert.equal(halfMsgs.length, 2,
+    `both half-configured drivers must complain (got ${captured.length} messages: ` +
+    `${JSON.stringify(captured)})`);
+});

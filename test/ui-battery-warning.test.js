@@ -280,6 +280,67 @@ test('telemetry that stopped arriving expires instead of being shown as live', (
     'already-cleared telemetry must not re-trigger a render every second');
 });
 
+test('the expiry WATCH actually clears telemetry and re-renders', () => {
+  // Both reviewers deleted the setInterval block that called telemetryExpired and got
+  // 222/222 green; one deleted it together with the disconnect clear and fully
+  // restored the round-7 defect with no red test. The rule was tested, its caller was
+  // an anonymous arrow inside a timer, and nothing reached it.
+  //
+  // So drive the real caller. The generated scope declares the page's telemetry state
+  // and a renderStatusBar that records what `telemetry` held when it was called, so
+  // this observes the assignment rather than inferring it.
+  const grab = (name) => {
+    const at = html.indexOf(`function ${name}(`);
+    assert.notEqual(at, -1, `${name}() not found in socket.html — renamed?`);
+    return html.slice(at, html.indexOf('\n    }', at) + 6);
+  };
+  const run = (ageMs) => new Function(`
+    let telemetry = { linkUp: true, battery: { voltageV: 7.9 } };
+    let telemetryAt = 10000;
+    let telemetryStaleMs = 3000;
+    const renders = [];
+    function renderStatusBar() { renders.push(telemetry); }
+    ${grab('telemetryExpired')}
+    ${grab('telemetryExpiryTick')}
+    ${grab('startTelemetryExpiryWatch')}
+    let registered = null, registeredDelay = null;
+    startTelemetryExpiryWatch((fn, ms) => { registered = fn; registeredDelay = ms; return 1; });
+    if (typeof registered !== 'function') return { error: 'the watch scheduled no callback' };
+    const nowStub = 10000 + ${ageMs};
+    const origNow = Date.now;
+    Date.now = () => nowStub;
+    try { registered(); } finally { Date.now = origNow; }
+    return { renders, after: telemetry, registeredDelay };
+  `)();
+
+  const stale = run(9000);
+  assert.equal(stale.error, undefined, stale.error);
+  assert.ok(stale.registeredDelay <= 1000,
+    `the watch must poll at least once a second, got ${stale.registeredDelay}`);
+  assert.equal(stale.after, null,
+    'the scheduled callback must CLEAR telemetry — otherwise a dead link keeps ' +
+    'rendering its last frame, and the last frame said linkUp:true');
+  assert.equal(stale.renders.length, 1, 'and it must re-render the bar');
+  assert.equal(stale.renders[0], null, 'the re-render must see the cleared value');
+
+  const fresh = run(500);
+  assert.equal(fresh.renders.length, 0, 'a fresh frame must not be cleared or re-rendered');
+  assert.notEqual(fresh.after, null);
+});
+
+test('the expiry watch is actually started at page scope', () => {
+  // The behavioural test above proves the watch works and the tick clears telemetry.
+  // Deleting the one line that STARTS it survived all of that, which restores the
+  // defect for any page that stays open past a publish gap.
+  //
+  // socket.html has no module boundary, so this asserts on source. That is weaker
+  // than executing it and cannot survive a rename — but a rename is already covered:
+  // the behavioural test grabs these functions BY NAME and fails if they move. What
+  // this catches is the deletion, which is the regression that actually happened.
+  assert.match(html, /^\s*startTelemetryExpiryWatch\(setInterval\);\s*$/m,
+    'nothing starts the telemetry expiry watch — stale telemetry will render as live');
+});
+
 test('an expired bar reports no link and warns about the pack', () => {
   // The consequence of expiry, through the real render path: not merely blank, but
   // actively flagged. 'FC: --' and a battery warning are both honest; 'FC: ok' with a
@@ -287,4 +348,12 @@ test('an expired bar reports no link and warns about the pack', () => {
   const out = renderStatusBarWith({ uiCfg: { showBattery: true }, telemetry: null });
   assert.ok(out.includes('FC: --'), `an expired bar must not claim a link: ${out}`);
   assert.ok(out.includes('Batt: --'), out);
+});
+
+test('a vehicle with no flight controller shows n/a, and a dead link still shows DOWN', () => {
+  const f = loadFn('formatFcLink');
+  assert.equal(f({ fcSupported: false }, CFG), 'FC: n/a');
+  // The fail-open to guard against: 'n/a' must not swallow a real link failure.
+  const down = f({ linkUp: false }, CFG);
+  assert.ok(down.includes('DOWN') && down.includes('⚠'), down);
 });

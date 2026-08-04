@@ -614,17 +614,41 @@
     // Staleness is checked on a timer, not only cleared by the disconnect handler.
     // Relying on the handler alone covers one of the two ways telemetry stops
     // arriving: it catches a dropped socket and misses a socket that stays up while
-    // the server's publish loop dies. That second shape is exactly the 2026-08-03
-    // wedge, where picar streamed overrides into a dead MAVProxy socket for over an
-    // hour and this screen looked healthy — and it is worse than a blank bar,
-    // because the last frame carried linkUp:true, so a disconnected UI rendered
-    // 'FC: ok' next to a plausible battery voltage.
+    // the server's publish loop dies. The second shape is worse than a blank bar,
+    // because the last frame carried linkUp:true — so the UI renders 'FC: ok' beside
+    // a plausible battery voltage for as long as the page stays open.
+    //
+    // To be accurate about which incident this does and does not cover: it is NOT the
+    // 2026-08-03 MAVProxy wedge. There, picar's publish loop kept running and kept
+    // emitting fresh frames whose heartbeat was stale, so 'FC: silent ⚠' is what
+    // covers that one. This covers picar's own loop or event loop dying, which is
+    // reachable today given the synchronous-work violations of invariant 9 still on
+    // main. An earlier version of this comment claimed the wedge outright and was
+    // wrong.
     //
     // Pure and argument-taking so it can be tested; the window is derived from the
     // server's own publish interval so a deliberately slow rover does not blank its
     // own bar.
     function telemetryExpired(t, at, staleMs, now) {
       return t !== null && (now - at) > staleMs;
+    }
+
+    // The rule above was pure and tested; its CALLER was an anonymous arrow inside a
+    // setInterval, and deleting that whole block left the suite green — so both
+    // reviewers were able to restore the original defect (a dead link rendering
+    // 'FC: ok' beside an hours-old voltage, permanently) with nothing turning red.
+    // A tested rule with an untestable caller is this branch's signature defect, and
+    // it appeared in the commit written to eliminate it. Named and argument-taking so
+    // the caller is a unit too.
+    function telemetryExpiryTick(now) {
+      if (!telemetryExpired(telemetry, telemetryAt, telemetryStaleMs, now)) return false;
+      telemetry = null;
+      renderStatusBar();
+      return true;
+    }
+
+    function startTelemetryExpiryWatch(setIntervalFn) {
+      return setIntervalFn(() => telemetryExpiryTick(Date.now()), 1000);
     }
 
     function renderStatusBar() {
@@ -733,6 +757,11 @@
     //                             itself, so nothing has been confirmed by read-back.
     function formatFcLink() {
       if (!telemetry) return 'FC: --';
+      // A driver that has no flight controller at all is not a flight controller that
+      // has gone away. The four GPIO drivers report fcSupported:false and used to
+      // render a permanent 'FC: DOWN ⚠' — a standing warning about a link the vehicle
+      // was never built with, which trains the operator to ignore the indicator.
+      if (telemetry.fcSupported === false) return 'FC: n/a';
       if (!telemetry.linkUp) return 'FC: DOWN ⚠';
       if (telemetry.awaitingAutopilot) return 'FC: no autopilot ⚠';
       if (telemetry.autopilotHeartbeat === false) return 'FC: silent ⚠';
@@ -1743,12 +1772,7 @@
         telemetryStaleMs = Math.max(3000, c.telemetryIntervalMs * 3);
       }
     });
-    setInterval(() => {
-      if (telemetryExpired(telemetry, telemetryAt, telemetryStaleMs, Date.now())) {
-        telemetry = null;
-        renderStatusBar();
-      }
-    }, 1000);
+    startTelemetryExpiryWatch(setInterval);
     socket.on('connect',    () => { isConnected = true;  renderStatusBar(); });
     socket.on('disconnect', () => {
       isConnected = false;

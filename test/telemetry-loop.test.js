@@ -212,8 +212,175 @@ test('parseWirelessProc reports null for an unparseable field, not NaN', () => {
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
+test('the interval is scheduled with tick, not with a no-op', () => {
+  // Surviving mutation found by the red team: setIntervalFn(() => {}, intervalMs).
+  // The harness asserted the interval COUNT and its DELAY but never invoked the
+  // function argument — every other test drives loop.tick() through its own
+  // reference. In production that mutation means one telemetry frame at connect and
+  // then silence: the fleet battery-trouble bit never updates again, wifi stays at
+  // the boot sample, and the dashboard presents boot-time values as live.
+  const h = harness({ fc: { linkUp: true, battery: { voltageV: 7.9, remainingPct: 80 } } });
+  assert.equal(h.calls.intervals.length, 1);
+  const scheduled = h.calls.intervals[0][0];
+  assert.equal(typeof scheduled, 'function', 'a function must be scheduled');
+
+  const emitsBefore = h.calls.emits.length;
+  const bitsBefore  = h.calls.statusBits.length;
+  scheduled();
+  assert.equal(h.calls.emits.length, emitsBefore + 1,
+    'invoking what was scheduled must broadcast telemetry — it is not the real tick');
+  assert.equal(h.calls.statusBits.length, bitsBefore + 1,
+    'and it must refresh the fleet battery-trouble bit');
+});
+
 test('stop() clears the interval it created', () => {
   const h = harness();
   h.loop.stop();
   assert.equal(h.calls.cleared.length, 1, 'the interval must be cleared, not leaked');
+});
+
+// ── The wiring app.js used to inline ─────────────────────────────────────────
+//
+// Every test below exists because a round-8 review mutated one of these lambdas
+// while it lived in app.js and the suite stayed green at 222/222. Extracting the
+// loop had moved the untested boundary, not removed it, and one of the survivors was
+// a fail-open on a safety indicator.
+
+const { buildTelemetryWiring, batteryWarnCfgFrom } = require('../telemetry-loop');
+
+test('the wiring forwards a broadcast to the real emitter', () => {
+  // Surviving mutation: emit: () => {}. The operator UI never receives a telemetry
+  // frame; every indicator sits at '--' / 'FC: --' forever. The commit that
+  // extracted the loop claimed this mutation was dead. It was not.
+  const emitted = [];
+  const w = buildTelemetryWiring({
+    pwm: {}, fleetClient: {}, config: {}, fs: { promises: { readFile: async () => '' } },
+    io: { emit: (event, payload) => emitted.push([event, payload]) },
+  });
+  w.emit('telemetry', { battery: { voltageV: 7.9 } });
+  assert.equal(emitted.length, 1, 'the broadcast must reach io.emit');
+  assert.deepEqual(emitted[0], ['telemetry', { battery: { voltageV: 7.9 } }]);
+});
+
+test('the wiring reads /proc asynchronously and never synchronously', async () => {
+  // Surviving mutation: readWifi: (p, e) => Promise.resolve(fs.readFileSync(p, e)).
+  // It satisfies the promise contract while still blocking the control event loop at
+  // the telemetry rate (invariant 9). Asserting readFileSync is NOT called is what
+  // closes the gap the extraction commit could only admit to.
+  let syncCalls = 0;
+  let asyncCalls = 0;
+  const w = buildTelemetryWiring({
+    pwm: {}, fleetClient: {}, io: { emit() {} }, config: {},
+    fs: {
+      promises: { readFile: async (p) => { asyncCalls += 1; return `read:${p}`; } },
+      readFileSync: () => { syncCalls += 1; return ''; },
+    },
+  });
+  const out = await w.readWifi('/proc/net/wireless', 'utf8');
+  assert.equal(out, 'read:/proc/net/wireless');
+  assert.equal(asyncCalls, 1, 'must go through fs.promises.readFile');
+  assert.equal(syncCalls, 0,
+    'fs.readFileSync must never be called — a synchronous /proc read on the control ' +
+    'event loop freezes the fail-safe (invariant 9)');
+});
+
+test('the wiring derives the battery warning config, and fails closed', () => {
+  // Surviving mutation: warnOnNoReading: false, hardwired. An unreadable battery
+  // monitor on a live link then raises NEITHER the UI warning NOR the Fleet Manager
+  // battery-trouble bit — and battery-warning.js and formatBattery() both implement
+  // fail-closed correctly, so neither is ever reached. A one-token change to a
+  // safety indicator's call site that no test could see.
+  const w = buildTelemetryWiring({
+    pwm: {}, fleetClient: {}, io: { emit() {} },
+    fs: { promises: { readFile: async () => '' } },
+    config: { batteryWarnLevel: 15, batteryWarnVolts: 6.6 },
+  });
+  assert.deepEqual(w.batteryWarnCfg, { warnLevel: 15, warnVolts: 6.6, warnOnNoReading: true });
+
+  // Fail closed on every shape of "not explicitly disabled".
+  for (const raw of [undefined, null, true, 1, 'yes']) {
+    assert.equal(batteryWarnCfgFrom({ batteryWarnOnNoReading: raw }).warnOnNoReading, true,
+      `batteryWarnOnNoReading=${JSON.stringify(raw)} must still warn`);
+  }
+  assert.equal(batteryWarnCfgFrom({ batteryWarnOnNoReading: false }).warnOnNoReading, false,
+    'and only an explicit false opts out');
+  assert.deepEqual(batteryWarnCfgFrom({}), { warnLevel: 20, warnVolts: null, warnOnNoReading: true });
+});
+
+test('the wiring passes the real config through, so bounds are applied to it', () => {
+  // Surviving mutation: config: {}. telemetry_interval_ms silently ignored. Benign
+  // in isolation (it defaults) but it is the same hole as the others.
+  const w = buildTelemetryWiring({
+    pwm: {}, fleetClient: {}, io: { emit() {} },
+    fs: { promises: { readFile: async () => '' } },
+    config: { telemetry_interval_ms: 250, rover_id: 3 },
+  });
+  assert.equal(w.config.telemetry_interval_ms, 250);
+  const loop = startTelemetryLoop({ ...w, setIntervalFn: () => ({}), clearIntervalFn: () => {} });
+  assert.equal(loop.intervalMs, 250, 'the configured interval must reach the loop');
+});
+
+test('a driver with no telemetry support yields an empty snapshot, not a throw', () => {
+  // Four of the five drivers are GPIO and have no getTelemetry at all.
+  const w = buildTelemetryWiring({
+    pwm: {}, fleetClient: {}, io: { emit() {} }, config: {},
+    fs: { promises: { readFile: async () => '' } },
+  });
+  // fcSupported:false rather than {} — see the 'no flight controller' test below for
+  // why an empty snapshot was not good enough.
+  assert.deepEqual(w.getFcTelemetry(), { fcSupported: false });
+
+  const w2 = buildTelemetryWiring({
+    pwm: { getTelemetry: () => ({ linkUp: true }) }, fleetClient: {}, io: { emit() {} }, config: {},
+    fs: { promises: { readFile: async () => '' } },
+  });
+  assert.deepEqual(w2.getFcTelemetry(), { linkUp: true });
+});
+
+test('a driver with no flight controller reports n/a, not a permanent link failure', () => {
+  // The four GPIO drivers have no getTelemetry, which yielded {} — leaving linkUp
+  // undefined, so the status bar showed a standing 'FC: DOWN ⚠' about a link the
+  // vehicle was never built with. A permanent warning is indistinguishable from no
+  // warning to the operator who has learned to ignore it.
+  const w = buildTelemetryWiring({
+    pwm: {}, fleetClient: {}, io: { emit() {} }, config: {},
+    fs: { promises: { readFile: async () => '' } },
+  });
+  assert.equal(w.getFcTelemetry().fcSupported, false);
+
+  // And a driver that DOES support telemetry must never be reported as unsupported —
+  // that would be a fail-open, hiding a genuinely dead link behind 'FC: n/a'.
+  const w2 = buildTelemetryWiring({
+    pwm: { getTelemetry: () => ({ linkUp: false }) }, fleetClient: {}, io: { emit() {} },
+    config: {}, fs: { promises: { readFile: async () => '' } },
+  });
+  assert.notEqual(w2.getFcTelemetry().fcSupported, false,
+    'a mavproxy driver with a down link must still report DOWN, not n/a');
+});
+
+test('an unwatchable pack is reported, and a watchable one is not', () => {
+  // Surviving mutation before this test existed: delete the startup guard entirely.
+  // It is the ONLY mitigation for a rover on which no state of charge can raise a
+  // warning — the percentage branch has no percentage, the voltage branch has no
+  // threshold, and the fail-closed branch needs the voltage to be missing too. A 2S
+  // pack at 3.0 V total (cells at 1.5 V, destroyed) renders with no warning and sets
+  // no fleet status bit.
+  const { batteryWarnabilityWarning } = require('../telemetry-loop');
+
+  // Unwatchable: no threshold, and the driver has no usable range.
+  assert.ok(batteryWarnabilityWarning({}, null), 'the shipped tracked config must warn');
+  assert.match(batteryWarnabilityWarning({}, null), /NEVER raise a battery warning/);
+
+  // Half-configured is the case the FIRST version of this guard missed: it tested
+  // whether battery_empty_volts was present, and setting only that satisfied it while
+  // the driver still refused to build a range.
+  assert.ok(batteryWarnabilityWarning({ battery_empty_volts: 6.0 }, null),
+    'a half-configured range leaves the pack unwatchable and must still warn');
+
+  // Watchable either way: an explicit voltage threshold...
+  assert.equal(batteryWarnabilityWarning({ batteryWarnVolts: 6.8 }, null), null);
+  // ...or a driver that can derive a percentage from voltage.
+  assert.equal(batteryWarnabilityWarning({}, { emptyV: 6.0, fullV: 8.4 }), null);
+  // A threshold of 0 is a real threshold, not an absent one.
+  assert.equal(batteryWarnabilityWarning({ batteryWarnVolts: 0 }, null), null);
 });

@@ -198,6 +198,17 @@ class PWMMavproxy {
     const emptyV = config.battery_empty_volts;
     const fullV  = config.battery_full_volts;
     this.batteryRange = null;
+    // A HALF-configured range used to fall straight through this block in silence:
+    // no range, no message, and — because app.js's startup guard only looked at
+    // battery_empty_volts — no warning either. Setting just the first of the two is
+    // the natural half-finished edit, and the result was a rover with no percentage,
+    // no voltage threshold and no complaint about either.
+    const halfSet = (emptyV === null || emptyV === undefined) !== (fullV === null || fullV === undefined);
+    if (halfSet) {
+      console.error('Battery percentage disabled: battery_empty_volts and battery_full_volts ' +
+        `must BOTH be set (got ${JSON.stringify(emptyV)} / ${JSON.stringify(fullV)}). ` +
+        'With no range and no batteryWarnVolts, a flat pack raises no warning at all.');
+    }
     if (emptyV !== null && emptyV !== undefined && fullV !== null && fullV !== undefined) {
       if (!Number.isFinite(emptyV) || !Number.isFinite(fullV)) {
         console.error('Battery percentage disabled: battery_empty_volts / battery_full_volts ' +
@@ -649,8 +660,17 @@ class PWMMavproxy {
     const entries = Object.entries(this.paramOverlay || {});
     if (entries.length === 0) return;
 
-    this.verifiedCriticalParams.clear();
-    this.paramVerificationFailures.clear();
+    // Deliberately NOT clearing verifiedCriticalParams here. It is cleared on close
+    // (:416), which is the event that genuinely invalidates it — a new link means a
+    // possibly different flight controller. Clearing on every reassert instead made
+    // params.verified empty for the ~4 s each chain takes, so the status bar flipped
+    // 'FC: ok' -> 'FC: 8 param unverified' -> 'FC: ok' up to four times per connect.
+    // Churn on the one indicator this branch added specifically to be trusted teaches
+    // an operator to ignore it.
+    //
+    // Not clearing is also the fail-CLOSED direction for paramVerificationFailures: a
+    // recorded mismatch persists until a read-back actually contradicts it, so a
+    // reassert whose reads are all lost leaves the warning up rather than clearing it.
     console.log('MAVProxy: Applying minimal Pixhawk param overlay...');
 
     // Every timer is tracked and cleared on the next overlay or on close. The
