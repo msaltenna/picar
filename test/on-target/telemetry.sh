@@ -55,7 +55,12 @@ for k in sys.argv[1].split("."):
   if isinstance(cur,dict) and k in cur: cur=cur[k]
   elif isinstance(cur,list) and k.isdigit() and int(k)<len(cur): cur=cur[int(k)]
   else: print("ABSENT"); sys.exit(0)
-print(json.dumps(cur) if isinstance(cur,(dict,list)) else cur)
+# json.dumps for everything except a bare string. Printing the raw Python value
+# emitted True/None, so every boolean and null check in this script compared
+# against "true"/"null" and silently failed — reporting a HEALTHY rover as broken.
+# A validation script that cries wolf is worse than no script: it gets ignored, and
+# then it is ignored on the run that matters.
+print(cur if isinstance(cur,str) else json.dumps(cur))
 ' "$1"
 }
 
@@ -78,8 +83,11 @@ J="$(journalctl -u picar --since '-10min' --no-pager 2>/dev/null || true)"
 if [[ -z "$J" ]]; then
   warn "no picar journal in the last 10 minutes — restart the service to re-check startup lines"
 else
-  grep -q 'autopilot' <<<"$J" && ok "autopilot identified in the log" \
-    || warn "no autopilot line in the last 10 min (normal if the service has been up longer)"
+  # The driver logs "Received first Pixhawk heartbeat (sys=1 MAVLink 2)" — it never
+  # uses the word "autopilot", so the previous pattern could not match and warned on
+  # every healthy run.
+  grep -qE 'Pixhawk heartbeat|autopilot' <<<"$J" && ok "autopilot heartbeat seen in the log" \
+    || warn "no autopilot heartbeat line in the last 10 min (normal if the service has been up longer)"
   # These must NOT appear. Each is a real config-failure mode the driver now reports.
   for pattern in 'REJECTED mavproxy_param_overlay' \
                  'param overlay is EMPTY' \
