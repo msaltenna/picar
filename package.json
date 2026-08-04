@@ -10,6 +10,7 @@
     "ws": "^8.18.2"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/*.test.js",
+    "test:on-target": "node test/on-target/control-e2e.js"
   }
 }
