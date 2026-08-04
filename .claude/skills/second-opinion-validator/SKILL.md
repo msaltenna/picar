@@ -126,6 +126,21 @@ Run this stage before every deploy, and always when a change touches: `control-s
 `client-control-safety.js`, the arm/disarm or framing paths in `pwm_mavproxy_servo.js`, any
 `*_timeout_ms` / `max_command_*` config value, or any of the ten safety invariants.
 
+## Hand off to the Red Team
+
+**On a pass, this stage is not the end of review.** `/red-team` runs next: a second
+adversarial pass on Fable 5 over the change you just approved, hunting what a diff-focused
+review structurally cannot see — a correct implementation of the wrong fix, a consumer in a
+file the diff never opened, evidence that does not support the claim made for it. Say in your
+report that it is next, so the pipeline does not stop at your pass.
+
+**On a rejection, the Red Team does not run.** Findings go to the Optimizer, the change comes
+back, and this stage runs again. The Red Team is not a second attempt at approval and not a
+route around your rejection.
+
+If you fell back to `opus-fallback`, note it: the Red Team still runs, but the primary
+reviewer was weaker than intended and that matters to how much the combined review is worth.
+
 ## Output
 
 The reviewer's verbatim output, then the triage, then a clear recommendation: proceed to

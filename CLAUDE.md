@@ -184,9 +184,9 @@ a focused commit, review, deploy, and a validator confirming the rover is health
 afterwards.
 
 ```
-  Auditor ─► Optimizer ─► Second Opinion ─► DevOps (branch + commit + deploy)
-                 ▲                                        │
-                 └──────── findings ◄── Embedded Validator ┘
+  Auditor ─► Optimizer ─► Second Opinion ─► Red Team ─► DevOps (branch+commit+deploy)
+                 ▲            (Codex)      (Fable 5)                    │
+                 └──────── findings ◄───────┴──── Embedded Validator ────┘
                                                           │ pass
                                                           ▼
                                               DevOps: push, PR, merge to main
@@ -211,11 +211,30 @@ afterwards.
    its findings must be addressed, but the merge waits for Codex. Opus reviewing Opus is the
    same model family checking its own work, and unlike the evidence-commit exemption below, the
    alternative here (wait for credits) is achievable. Record which reviewer ran.
-4. **DevOps Engineer** — owns all git operations. One focused branch and one focused commit
+4. **Red Team** — a second adversarial review, running on **Fable 5**, over what Codex
+   just approved. It runs *after* the Second Opinion stage and **only on a Codex pass**: it
+   is not a second attempt at approval and not a route around a rejection. On a Codex
+   rejection the findings go straight back to the Optimizer and the Red Team does not run.
+   It may summon fleets via `/fleet` and use the other skills, and it reviews under this
+   file.
+
+   Its purpose is explicitly *not* to repeat Codex. A diff-focused reviewer reads what
+   changed; it does not reliably ask whether the change was worth making, whether a file
+   nobody opened now behaves wrongly, or whether the evidence offered means what the commit
+   claims. Those are the failures this repository has actually shipped — an untouched UI
+   consumer caught three rounds running on the same file, and commit messages asserting
+   "mutation-verified", "bounded" and "it works" that were false. See
+   `.claude/skills/red-team/SKILL.md`.
+
+   Review-only; it never edits, commits, or touches a rover, and it cannot clear a change
+   Codex has failed. Record that it ran, because the point of the stage is that two
+   *differently-shaped* reviewers saw the change, and a reader must be able to tell whether
+   both did.
+5. **DevOps Engineer** — owns all git operations. One focused branch and one focused commit
    per feature or fix. Deploys the branch to the rover over SSH.
-5. **Embedded Validator** — proves the change works **on the rover**. Only this stage can
+6. **Embedded Validator** — proves the change works **on the rover**. Only this stage can
    declare a change validated.
-6. **DevOps Engineer** — on a validator pass, pushes the branch and opens/merges the PR.
+7. **DevOps Engineer** — on a validator pass, pushes the branch and opens/merges the PR.
    On a fail, hands the evidence back to the Optimizer and the loop repeats.
 
 **Fleet** is not a pipeline stage. It is the orchestrator that runs stages — or many
@@ -255,6 +274,7 @@ run in isolated context also have a subagent in `.claude/agents/`.
 | `/auditor` | Audit current state; update `TASKS.md` + `HANDOFF.md`; flag bugs, inconsistencies, improvement opportunities |
 | `/optimizer` | Implement audit findings and main-session flags; propose what the audit missed |
 | `/second-opinion-validator` | Adversarial review of decisions and diffs under this directive — Codex, falling back to Opus 5 when Codex cannot run |
+| `/red-team` | Second adversarial review on Fable 5, *after* a Codex pass — hunts what a diff-focused reviewer structurally cannot see |
 | `/devops-engineer` | Branches, focused commits, branch hygiene, SSH deploy, push and merge |
 | `/embedded-validator` | On-rover validation: test scripts, WebUI drive, MAVLink wire capture, service inspection |
 | `/fleet` | Summon a right-sized fleet of agents; match model tier to task complexity |
