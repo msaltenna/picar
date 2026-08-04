@@ -51,12 +51,44 @@ test('non-numeric and structural garbage is rejected', () => {
 });
 
 test('unknown keys are refused, so only whitelisted settings can ever be written', () => {
-  const { params, rejected } = sanitizeVideoParams(
-    { width: 640, rpiCameraExtraArgs: '; rm -rf /', __proto__: 'x', runOnInit: 'curl evil' });
+  // Built with JSON.parse, NOT an object literal. In a literal, `__proto__:` invokes the
+  // prototype SETTER and creates no own property, so the earlier version of this test
+  // never presented the key at all — it asserted a case it structurally could not reach.
+  // JSON.parse creates a real own property, which is what arrives over the wire.
+  const { params, rejected } = sanitizeVideoParams(JSON.parse(
+    '{"width":640,"rpiCameraExtraArgs":"; rm -rf /","__proto__":"x","runOnInit":"curl evil"}'));
   assert.deepEqual(params, { width: 640 });
   assert.ok(rejected.some((m) => m.includes('rpiCameraExtraArgs')));
   assert.ok(rejected.some((m) => m.includes('runOnInit')),
     'an unrecognised key must be reported, not ignored — this is the YAML injection surface');
+  assert.ok(rejected.some((m) => m.includes('__proto__')),
+    '__proto__ must be REPORTED, not silently swallowed');
+});
+
+test('inherited property names cannot pose as settable parameters', () => {
+  // `name in SPEC` walks the prototype chain, so with a plain-object spec table every
+  // one of these answered true — and their "spec" is a function whose .min/.max are
+  // undefined, so every bounds comparison was false and ANY finite value passed
+  // unbounded, straight into the persisted overlay with rejected:[].
+  //
+  // Two independent defences now block this (a null-prototype spec table, and
+  // hasOwnProperty at both lookup sites), which is why removing either one alone does
+  // not fail a test. So this pins the BEHAVIOUR rather than either mechanism: it is
+  // verified by mutating both together.
+  const hostile = JSON.parse(
+    '{"width":640,"constructor":7,"toString":9,"valueOf":11,"hasOwnProperty":13,"__proto__":15}');
+  const { params, rejected } = sanitizeVideoParams(hostile);
+  assert.deepEqual(params, { width: 640 },
+    'only the genuine parameter may survive');
+  for (const key of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    assert.ok(rejected.some((m) => m.startsWith(key)),
+      `${key} must be reported as not settable (got: ${JSON.stringify(rejected)})`);
+  }
+  // And the mapping layer independently, since persistVideoParams is exported and its
+  // mapping is the last line of defence if a caller forgets to sanitize.
+  const { updates } = overlayUpdatesFor('webrtc', hostile);
+  assert.deepEqual(updates, { webrtc_width: 640 },
+    'the codec mapping must not resolve an inherited name to an overlay key');
 });
 
 test('a non-object request is refused outright', () => {
@@ -65,6 +97,21 @@ test('a non-object request is refused outright', () => {
     assert.deepEqual(params, {});
     assert.equal(rejected.length, 1, `${JSON.stringify(bad) ?? 'undefined'} must be reported once`);
   }
+});
+
+test('the bounds are the specific numbers we intend, not whatever the table says', () => {
+  // The generic test below derives its expectations from VIDEO_PARAM_SPEC, so it holds
+  // for ANY bounds — a review widened width's max from 1920 to 100000 and all 256 tests
+  // stayed green. The bounds are the stated defence against persisting an unstartable
+  // encoder, so at least one test has to name the numbers.
+  assert.deepEqual(VIDEO_PARAM_SPEC.width,      { min: 160, max: 1920 });
+  assert.deepEqual(VIDEO_PARAM_SPEC.height,     { min: 120, max: 1080 });
+  assert.deepEqual(VIDEO_PARAM_SPEC.fps,        { min: 1,   max: 60   });
+  assert.deepEqual(VIDEO_PARAM_SPEC.bitrate,    { min: 50,  max: 8000 });
+  assert.deepEqual(VIDEO_PARAM_SPEC.idr_period, { min: 1,   max: 300  });
+  assert.deepEqual(Object.keys(VIDEO_PARAM_SPEC).sort(),
+    ['bitrate', 'fps', 'height', 'idr_period', 'quality', 'width'],
+    'a new settable parameter must be a deliberate change, not an accident');
 });
 
 test('every spec bound is inclusive at both ends', () => {
@@ -131,18 +178,30 @@ test('merging does not mutate the object it was given', () => {
 // A fake fs that records writes and can be told to fail, so every branch below is
 // exercised against the real persistVideoParams rather than a reimplementation.
 function fakeFs({ readResult = null, readError = null, failWrite = false, failRename = false } = {}) {
-  const calls = { writes: [], renames: [], unlinks: [] };
+  const calls = { writes: [], renames: [], unlinks: [], opens: [], syncs: 0, order: [] };
   return {
     calls,
     promises: {
       async readFile() { if (readError) throw readError; return readResult; },
-      async writeFile(p, data) {
-        if (failWrite) throw new Error('ENOSPC');
-        calls.writes.push([p, data]);
+      // Mirrors the real API the module now uses: open with 'wx' (O_CREAT|O_EXCL) and
+      // write through the handle, so the test exercises the exclusive-create and fsync
+      // path rather than a writeFile the module no longer calls.
+      async open(p, flags) {
+        calls.opens.push([p, flags]);
+        return {
+          async writeFile(data) {
+            if (failWrite) throw new Error('ENOSPC');
+            calls.writes.push([p, data]);
+            calls.order.push(`write:${p}`);
+          },
+          async sync() { calls.syncs += 1; calls.order.push(`sync:${p}`); },
+          async close() {},
+        };
       },
       async rename(from, to) {
         if (failRename) throw new Error('EXDEV');
         calls.renames.push([from, to]);
+        calls.order.push('rename');
       },
       async unlink(p) { calls.unlinks.push(p); },
     },
@@ -310,4 +369,97 @@ test('a partially valid request applies the good values and reports the bad', ()
   } finally {
     if (typeof stream.stop === 'function') stream.stop();
   }
+});
+
+// ── Concurrency: the defect that bricked a rover ─────────────────────────────
+
+test('concurrent persists cannot corrupt the overlay or lose a write', async () => {
+  // This runs against a REAL filesystem on purpose. The fake fs above cannot express
+  // this failure at all: its writeFile is an array append, which can neither tear nor
+  // collide. A review found the original implementation bricked a rover with two
+  // unauthenticated socket messages, reproduced 5/5:
+  //
+  //   the temp path was `.<file>.tmp-${process.pid}` — constant for the process — and
+  //   nothing serialised the handlers, so two writes interleaved and one renamed the
+  //   torn result into place:
+  //       { "rover_id": 3, "webrtc_fps": 15 }0,  "webrtc_height": 720 }
+  //
+  //   app.js parses this file at startup inside a try whose catch is process.exit(1),
+  //   and the unit is Restart=always — so the outcome was a PERMANENT crash loop of the
+  //   whole control plane with rover_id destroyed, surviving reboot.
+  const fs   = require('fs');
+  const os   = require('os');
+  const path = require('path');
+
+  for (let round = 0; round < 5; round++) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'picar-ovl-'));
+    const overlayPath = path.join(dir, 'picar-cfg.local.json');
+    fs.writeFileSync(overlayPath,
+      JSON.stringify({ rover_id: 3, battery_empty_volts: 6.0 }, null, 2));
+
+    const results = await Promise.all([
+      persistVideoParams({ overlayPath, codec: 'webrtc',
+        params: { width: 1280, height: 720, bitrate: 2000 } }),
+      persistVideoParams({ overlayPath, codec: 'webrtc', params: { fps: 15 } }),
+      persistVideoParams({ overlayPath, codec: 'webrtc', params: { bitrate: 400 } }),
+    ]);
+
+    // 1. It must still parse. This is the brick condition.
+    let parsed;
+    const text = fs.readFileSync(overlayPath, 'utf8');
+    try { parsed = JSON.parse(text); }
+    catch (err) { assert.fail(`round ${round}: overlay is CORRUPT (${err.message}): ${text}`); }
+
+    // 2. rover_id must survive — it is the vehicle's identity.
+    assert.equal(parsed.rover_id, 3, `round ${round}: rover_id destroyed`);
+    assert.equal(parsed.battery_empty_volts, 6.0, `round ${round}: unrelated key lost`);
+
+    // 3. Every write must report honestly AND actually be present. Checking only for
+    //    corruption would pass when nothing was written at all, which made an earlier
+    //    version of this check useless as a detector.
+    for (const r of results) {
+      assert.equal(r.persisted, true, `round ${round}: ${r.reason}`);
+    }
+    assert.equal(parsed.webrtc_width, 1280, `round ${round}: a concurrent write was lost`);
+    assert.equal(parsed.webrtc_height, 720, `round ${round}: a concurrent write was lost`);
+    assert.equal(parsed.webrtc_fps, 15, `round ${round}: a concurrent write was lost`);
+
+    // 4. No temp files may be left behind.
+    const leftover = fs.readdirSync(dir).filter((f) => f.includes('.tmp-'));
+    assert.deepEqual(leftover, [], `round ${round}: leftover temp files`);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the temp file is created exclusively, so a planted symlink cannot redirect it', async () => {
+  // The old temp name was fully predictable (`.<file>.tmp-<pid>`), so a local user with
+  // write access to the directory could pre-create it as a symlink and capture the
+  // write. 'wx' is O_CREAT|O_EXCL: an existing path fails instead of being followed.
+  const fs = fakeFs({ readResult: '{}' });
+  await persistVideoParams({
+    overlayPath: '/tmp/x.json', codec: 'webrtc', params: { width: 320 }, fs });
+  const tmpOpen = fs.calls.opens.find(([, flags]) => flags === 'wx');
+  assert.ok(tmpOpen, `no exclusive-create open was performed: ${JSON.stringify(fs.calls.opens)}`);
+  assert.ok(tmpOpen[0].includes('.tmp-'), tmpOpen[0]);
+  assert.notEqual(tmpOpen[0], '/tmp/x.json', 'the real file must never be opened for writing');
+});
+
+test('the write is fsynced before the rename, so a power cut cannot truncate it', async () => {
+  // Without fsync, ext4 data=ordered can commit the rename with the data blocks
+  // unwritten, leaving a ZERO-LENGTH config — JSON.parse('') throws, app.js exits, and
+  // the unit restarts forever. A rover losing supply is routine, not exotic.
+  const fs = fakeFs({ readResult: '{}' });
+  await persistVideoParams({
+    overlayPath: '/tmp/x.json', codec: 'webrtc', params: { width: 320 }, fs });
+  // Assert the ORDER and the TARGET, not merely that some sync happened: the directory
+  // fsync after the rename also increments a naive counter, so `syncs >= 1` passed even
+  // with the file's own fsync deleted.
+  const order = fs.calls.order;
+  const renameAt = order.indexOf('rename');
+  assert.notEqual(renameAt, -1, 'no rename occurred');
+  const tmpSyncAt = order.findIndex((e) => e.startsWith('sync:') && e.includes('.tmp-'));
+  assert.notEqual(tmpSyncAt, -1, 'the temp file was never fsynced');
+  assert.ok(tmpSyncAt < renameAt,
+    `the temp file must be fsynced BEFORE the rename (order: ${JSON.stringify(order)})`);
 });

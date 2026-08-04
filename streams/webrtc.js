@@ -57,7 +57,9 @@ paths:
 `;
 }
 
-module.exports = function createWebRTCStream(config /*, streamServer not used */) {
+// `deps` is a test-only injection point and is never populated from config. See
+// RESTART_CMD below for why that distinction is load-bearing.
+module.exports = function createWebRTCStream(config /*, streamServer not used */, deps = {}) {
   const PROTOCOL  = config.webrtc_protocol || 'https';
   const PORT      = config.webrtc_port     || 8889;
   const PATH_NAME = (config.webrtc_path    || 'cam').replace(/^\/+/, '');
@@ -99,9 +101,14 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
   // coalesced into a restart that never happens.
   const RESTART_TIMEOUT_MS = config.mediamtx_restart_timeout_ms ?? 30000;
 
-  // Array form, so there is no shell and no quoting to get wrong.
-  const RESTART_CMD = Array.isArray(config.mediamtx_restart_cmd) && config.mediamtx_restart_cmd.length
-    ? config.mediamtx_restart_cmd
+  // A test seam must NOT be a config key. The first version read this argv from the
+  // effective config, which app.js shallow-merges from the untracked, unreviewed
+  // picar-cfg.local.json — so a rover-local edit could make picar spawn an arbitrary
+  // binary on every video-param change. That converts a documented config-overlay
+  // weakness (invariant 8) into arbitrary process execution, to save a line in a test.
+  // Injected via the factory argument instead, which no config file can reach.
+  const RESTART_CMD = Array.isArray(deps.restartCmd) && deps.restartCmd.length
+    ? deps.restartCmd
     : ['systemctl', 'restart', 'mediamtx'];
 
   function clearRestartState() {

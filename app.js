@@ -338,7 +338,11 @@ io.on('connection', (socket) => {
     // override stream and the fail-safe timers (invariant 9).
     persistVideoParams({
       overlayPath: localConfigPath,
-      codec: (stream.getStreamConfig() || {}).codec,
+      // config.stream_codec, NOT getStreamConfig().codec. The h264 driver reports its
+      // codec as an SDP string ('avc1.42001f'), so the overlay mapping keyed on 'h264'
+      // was unreachable and that driver could never persist — while a test asserted the
+      // mapping worked. The selected driver name is what the mapping is keyed on.
+      codec: config.stream_codec || 'webrtc',
       params: applied,
     }).then((p) => {
       if (p.persisted) {
