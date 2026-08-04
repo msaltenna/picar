@@ -92,6 +92,35 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-04 — Embedded Validator PASS for `f37cc0610b49801ded4c1c55575e0bcb92257683` (merged SHA)
+
+Revalidation after reconciling `CLAUDE.md` with the skill files. That commit is
+documentation-only and cannot affect runtime, but it changed the tree, and the gate is that `main`
+receives a pass for the SHA that was actually deployed — so it was deployed and rerun rather than
+waved through.
+
+- Services active, `NRestarts=0` for `picar`, `mavproxy`, `mediamtx`; deployed SHA confirmed, tree
+  clean.
+- `npm test` on target: **237/237**.
+- On-target suite: **26 PASS, 0 FAIL**. `FRAME_CLASS` read back and matched, no unverified
+  critical parameters.
+- Control surface e2e: **PASS**, with `telemetryConfig` carrying `batteryWarnVolts: 6.8`.
+- Invariant 6 on the wire: **6 of 6** DISARM packets preceded by a neutral
+  `RC_CHANNELS_OVERRIDE` packet.
+
+This is the SHA that merged to `main`. The limits recorded against the two earlier passes still
+apply unchanged: no mechanical actuation was observed (no flight battery, throttle held at 0), the
+flight controller still ignores DISARM (existing P0), and the rendered UI was checked by the
+operator rather than by a scripted browser drive.
+
+**What the reconciliation fixed**, since it is the reason this SHA exists: `CLAUDE.md` and
+`.claude/skills/second-opinion-validator/SKILL.md` disagreed about whether the fallback reviewer
+may authorise an invariant-touching merge — and the skill file is the one the pipeline names as the
+single authority for fallback conditions, so that was the worst possible disagreement to leave
+behind. Three further stale claims went with it: a dangling `/red-team` skill reference I had
+introduced, a 46-test count that this merge takes to 237, and `FRAME_CLASS: 2` plus "no
+`test/on-target/` suite" both described as present state when this branch fixes both.
+
 ### 2026-08-04 — Embedded Validator PASS for `d741a62a9919550d0d417c2458fde4404734fefd`
 
 Revalidation after `batteryWarnVolts` was set to 6.8 V. That commit changed the battery-warning

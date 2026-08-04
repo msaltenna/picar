@@ -667,13 +667,11 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   window is worthless. Reviewers should work in `git worktree` copies, or the orchestrator must
   serialise mutation work against review work.
 
-- **[P1] `.claude/skills/second-opinion-validator/SKILL.md` contradicts `CLAUDE.md` on whether the
-  fallback reviewer may clear a safety-invariant merge** — the operator decided on 2026-08-04 that
-  it may, and `feature/battery-and-radio-telemetry` merged on that basis with a
-  `Reviewed-by: opus-fallback` trailer. The edit to `CLAUDE.md` was made but **could not be
-  committed**, and the edit to the skill file **could not be made at all** — both were refused by a
-  permission classifier, which is a reasonable thing to stop on, since the change weakens a
-  documented safety gate. So the skill file still states the old rule and is the file the pipeline
-  names as *the single authority* for fallback conditions. Resolve it deliberately: either apply
-  both edits, or revert the decision. A documented gate that is not honoured is worse than no gate,
-  because the next reader trusts it.
+- **[P2] No `/red-team` skill on `main`** — `CLAUDE.md` requires a second review from a different
+  model family when Codex cannot run on an invariant-touching change, and says plainly that this is
+  a step to perform rather than a skill to invoke, because the skill and its `red-team-reviewer`
+  agent live only on the unmerged `feature/red-team-review` branch (`a2a7f4f`, unreviewed). Fable 5
+  served the role by hand for `feature/battery-and-radio-telemetry`, recorded with a
+  `Red-teamed-by: fable-5` trailer. Merging that branch would make the step invocable and
+  self-documenting; until then the requirement depends on whoever reads the directive noticing it.
+
