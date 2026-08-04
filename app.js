@@ -141,13 +141,19 @@ const throttle_ramp_down = 0;
 //   - The Wi-Fi link carrying the control connection, read from the kernel. This
 //     is the link that actually matters for teleoperation here, so it is reported
 //     separately and never conflated with the MAVLink radio.
-// Clamped, not just defaulted. This key is reachable through the untracked
-// picar-cfg.local.json overlay, so a rover-local 0 or a typo would otherwise become
-// setInterval(fn, 1) — measured at ~10% of a core from the /proc read alone.
-// Clamped at BOTH ends — see config-bounds.js for why the upper bound is not
-// cosmetic. Extracted there so the bound is testable; inline it survived a mutation.
-const { clampTelemetryInterval } = require('./config-bounds');
-const telemetry_interval_ms = clampTelemetryInterval(config.telemetry_interval_ms);
+// The publish loop lives in telemetry-loop.js so its WIRING is testable, not just
+// its parts. app.js binds both HTTPS ports and the MAVProxy socket at require time,
+// so nothing declared here is reachable from a host test — and a round-7 review
+// proved what that costs: four mutations to this loop's body (clearing the Fleet
+// Manager battery bit, bypassing the interval clamp, making the /proc read
+// synchronous, deleting the broadcast) all left the suite green.
+//
+// telemetry_interval_ms is clamped at BOTH ends inside the loop. The key is
+// reachable through the untracked picar-cfg.local.json overlay, so a rover-local 0
+// or a typo would otherwise become setInterval(fn, 1) — measured at ~10% of a core
+// from the /proc read alone — and 1e400 is valid JSON that Node coerces to 1 ms.
+const { startTelemetryLoop } = require('./telemetry-loop');
+
 const batteryWarnLevel      = config.batteryWarnLevel ?? 20;
 const batteryWarnVolts      = config.batteryWarnVolts ?? null;
 // Fail closed when the battery monitor reports nothing usable. Set false only
@@ -155,74 +161,31 @@ const batteryWarnVolts      = config.batteryWarnVolts ?? null;
 // would be noise rather than information.
 const batteryWarnOnNoReading = config.batteryWarnOnNoReading !== false;
 
-let wifiLink = null;
-
-// /proc/net/wireless is a two-line-header text file; parsing it costs nothing and
-// needs no external tool. Read ASYNCHRONOUSLY: this runs on the same event loop as
-// the 20 Hz override stream and the fail-safe timers, and a synchronous read of a
-// proc file is exactly the kind of hidden stall invariant 9 forbids.
-function refreshWifiLink() {
-  fs.promises.readFile('/proc/net/wireless', 'utf8').then((text) => {
-    const line = text.split('\n').find((l) => /^\s*\w+:/.test(l));
-    if (!line) { wifiLink = null; return; }
-    const [iface, rest] = line.split(':');
-    const cols = rest.trim().split(/\s+/);
-    // status, link quality, signal level (dBm), noise level
-    const quality = parseFloat(cols[1]);
-    const signal  = parseFloat(cols[2]);
-    wifiLink = {
-      iface: iface.trim(),
-      // Quality is reported out of 70 by most drivers.
-      qualityPct: Number.isFinite(quality) ? Math.round((quality / 70) * 100) : null,
-      signalDbm:  Number.isFinite(signal) ? signal : null,
-    };
-  }).catch(() => { wifiLink = null; });
+// A voltage with no threshold to compare it against cannot ever raise a warning:
+// the percentage branch has no percentage, the voltage branch has no threshold, and
+// the fail-closed branch requires the voltage to be missing too. Silence here reads
+// as "pack healthy" when it means "nothing is watching the pack", so say so once,
+// loudly, at startup.
+if (batteryWarnVolts === null && config.battery_empty_volts == null) {
+  console.error('picar: no batteryWarnVolts and no battery_empty_volts/battery_full_volts — ' +
+                'a flight controller that reports voltage but no usable percentage (the ' +
+                'default on this fleet) can NEVER raise a battery warning. Set ' +
+                'batteryWarnVolts for this pack.');
 }
 
-function currentTelemetry() {
-  const fc = typeof pwm.getTelemetry === 'function' ? pwm.getTelemetry() : {};
-  return { ...fc, wifi: wifiLink };
-}
-
-// Extracted to battery-warning.js so the rule is testable — app.js binds both
-// HTTPS ports and the MAVProxy socket at require time, so nothing here is
-// reachable from a host test. A mutation reverting the fail-closed clause left
-// the entire suite green while it lived inline.
-const { batteryTrouble } = require('./battery-warning');
-const batteryWarnCfg = {
-  warnLevel:       batteryWarnLevel,
-  warnVolts:       batteryWarnVolts,
-  warnOnNoReading: batteryWarnOnNoReading,
-};
-
-setInterval(() => {
-  refreshWifiLink();
-  const t = currentTelemetry();
-  // Bit 0 of the Fleet Manager status bitmask is "battery trouble". It was defined
-  // and exported but never actually set by anything until now.
-  fleetClient.setStatusBit(0, batteryTrouble(t.battery, batteryWarnCfg,
-    { linkUp: t.linkUp, autopilotHeartbeat: t.autopilotHeartbeat }));
-  fleetClient.setTelemetry({
-    batteryV:    t.battery ? t.battery.voltageV : null,
-    batteryPct:  t.battery ? t.battery.remainingPct : null,
-    // Forwarded so the dashboard can mark an estimate, exactly as the rover UI
-    // does. Without it the Fleet Manager would present a voltage-derived
-    // percentage as if the flight controller had measured it.
-    batteryPctSource: t.battery ? t.battery.pctSource : null,
-    batteryA:    t.battery ? t.battery.currentA : null,
-    radioRssi:   t.radio ? t.radio.rssi : null,
-    boardV:      t.power ? t.power.boardV : null,
-    servoV:      t.power ? t.power.servoV : null,
-    wifiPct:     t.wifi ? t.wifi.qualityPct : null,
-    wifiDbm:     t.wifi ? t.wifi.signalDbm : null,
-    linkUp:      !!t.linkUp,
-    // Forwarded because linkUp only reflects the local MAVProxy TCP socket. A
-    // silent Pixhawk with MAVProxy still connected looked healthy without this.
-    autopilotHeartbeat: !!t.autopilotHeartbeat,
-  });
-  io.emit('telemetry', t);
-}, telemetry_interval_ms);
-refreshWifiLink();
+const telemetryLoop = startTelemetryLoop({
+  getFcTelemetry: () => (typeof pwm.getTelemetry === 'function' ? pwm.getTelemetry() : {}),
+  fleetClient,
+  emit:     (event, payload) => io.emit(event, payload),
+  readWifi: (path, enc) => fs.promises.readFile(path, enc),
+  config,
+  batteryWarnCfg: {
+    warnLevel:       batteryWarnLevel,
+    warnVolts:       batteryWarnVolts,
+    warnOnNoReading: batteryWarnOnNoReading,
+  },
+});
+const currentTelemetry = telemetryLoop.current;
 
 io.on('connection', (socket) => {
   console.log('Control client connected');
