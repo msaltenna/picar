@@ -92,6 +92,40 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-04 — Embedded Validator PASS for `d741a62a9919550d0d417c2458fde4404734fefd`
+
+Revalidation after `batteryWarnVolts` was set to 6.8 V. That commit changed the battery-warning
+path, so the earlier PASS for `ca44537` no longer attested the tree. Deployed to rover3 by git
+bundle over SSH, `origin` untouched, deployed SHA confirmed equal to the branch tip with a clean
+tree.
+
+- **Services** — `picar`, `mavproxy`, `mediamtx` active, `NRestarts=0` each.
+- **`npm test` on target** — 237/237.
+- **Parameters** — `PARAM_SET FRAME_CLASS=1` → `verified FRAME_CLASS=1`, `parameter overlay
+  confirmed by read-back`, 8/8 verified, `missing: []`, `mismatched: {}`.
+- **The threshold reaches the operator** — `telemetryConfig` carries
+  `batteryWarnVolts: 6.8`, so the UI warns on the same rule as the Fleet Manager status bit.
+- **The startup warnability guard is correctly SILENT now**, where before it fired. That is the
+  positive and negative case both observed on target.
+- **On-target suite** — 26 PASS, 0 FAIL, 1 WARN (the tmpfs tlog, a pre-existing finding).
+- **Control surface e2e** — handshake, initial state, arm, 12 commands, `setDrivetrain` rejecting
+  `'low'`/`0`/`0.5`/`null`/empty then applying `shift: 1`, operator stop, watchdog firing after
+  1000 ms of silence, light on/off, telemetry still arriving with a changing `ageMs`.
+- **Invariant 6 on the wire** — **35 of 35** DISARM packets preceded by a neutral
+  `RC_CHANNELS_OVERRIDE` packet (steer 1500, throttle 1500), 0.9–59.6 ms earlier.
+
+**Unchanged limits, restated because they travel with this PASS.** No mechanical actuation was
+observed — rover3 has no flight battery and throttle was held at 0 throughout. The flight
+controller still reports ARMED after a correctly-ordered DISARM (existing P0, untouched by this
+branch). The rendered browser UI was not driven by this session; the operator reported checking it
+and finding it fine, which is human confirmation rather than a scripted check.
+
+**About the 6.8 V value.** It is 3.4 V/cell against a 2S assumption, and that assumption comes
+from rover3's untracked `picar-cfg.local.json`, whose own comment says
+`PLACEHOLDER 2S LiPo range ... does not describe a real pack`. The threshold is now in the tracked
+config where it belongs, but it should be confirmed against the real pack before it is trusted as
+a warn level.
+
 ### 2026-08-04 — Embedded Validator PASS for `ca44537fbc5fba66b5ce31271f18699e76ccae97`
 
 `feature/battery-and-radio-telemetry`, validated live on rover3 (Compute Module 4 Rev 1.1,

@@ -455,7 +455,8 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   review the branch has had. Every round found real defects in the previous round's fixes,
   including nine tests that could not fail and two commit messages that claimed mutations were
   dead when they were not.
-  **Embedded Validator PASS recorded for `ca44537fbc5fba66b5ce31271f18699e76ccae97`** on rover3,
+  **Embedded Validator PASS recorded for `d741a62a9919550d0d417c2458fde4404734fefd`** (and
+  earlier for `ca44537fbc5fba66b5ce31271f18699e76ccae97`) on rover3,
   2026-08-04 — services, journal, 8/8 param read-back, bidirectional MAVLink, invariant 6 verified
   on the wire for 12/12 DISARM packets, control surface end-to-end, 236/236 on target. Full
   evidence and its explicit limits are in `HANDOFF.md`. The `FRAME_CLASS` reboot question was
@@ -665,3 +666,14 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   own in-tree results as unreliable in both directions. Any mutation verdict from an overlapping
   window is worthless. Reviewers should work in `git worktree` copies, or the orchestrator must
   serialise mutation work against review work.
+
+- **[P1] `.claude/skills/second-opinion-validator/SKILL.md` contradicts `CLAUDE.md` on whether the
+  fallback reviewer may clear a safety-invariant merge** — the operator decided on 2026-08-04 that
+  it may, and `feature/battery-and-radio-telemetry` merged on that basis with a
+  `Reviewed-by: opus-fallback` trailer. The edit to `CLAUDE.md` was made but **could not be
+  committed**, and the edit to the skill file **could not be made at all** — both were refused by a
+  permission classifier, which is a reasonable thing to stop on, since the change weakens a
+  documented safety gate. So the skill file still states the old rule and is the file the pipeline
+  names as *the single authority* for fallback conditions. Resolve it deliberately: either apply
+  both edits, or revert the decision. A documented gate that is not honoured is worse than no gate,
+  because the next reader trusts it.
