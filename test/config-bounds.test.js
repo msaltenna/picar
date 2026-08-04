@@ -172,18 +172,45 @@ test('the ceiling never drops below the floor, however large the chain', () => {
   }
 });
 
-test('the floor is tied to the schedule the driver actually uses', () => {
-  // Not a transcription of it. A review mutated the driver's real write spacing from
-  // 250 ms to 500 ms and the entire suite stayed green, because config-bounds held its
-  // own private copy of the number — so "derived from the overlay's own schedule" was
-  // false. The constants are now owned here and imported by applyParamOverlay.
-  const src = require('fs').readFileSync(
-    require('path').join(__dirname, '..', 'pwm_mavproxy_servo.js'), 'utf8');
-  for (const name of ['OVERLAY_WRITE_SPACING_MS', 'OVERLAY_SETTLE_MS', 'OVERLAY_READ_SPACING_MS']) {
-    assert.ok(src.includes(name),
-      `applyParamOverlay must use the shared ${name}, not a literal of its own`);
+test('the floor is tied to the schedule the driver actually SCHEDULES', () => {
+  // The previous version of this test grepped the driver's source for the shared
+  // constant names — and `src.includes('OVERLAY_WRITE_SPACING_MS')` is satisfied by the
+  // IMPORT line whether or not the schedule uses it. A review proved the consequence:
+  // replacing the constant with a literal at both use sites left all 173 tests green
+  // while 6 of 7 read-backs were cancelled by every reassert. The constants were owned
+  // in one place; their USE was unpinned, which is the same transcription defect one
+  // level up.
+  //
+  // So measure the real thing: instrument setTimeout, run applyParamOverlay, and take
+  // the largest delay it actually schedules. That is the chain, by definition, and it
+  // cannot be faked by a rename or a literal.
+  const PWMMavproxy = require('../pwm_mavproxy_servo.js');
+  const d = new PWMMavproxy({ mavproxy_autostart: false });
+  d.buildParamSet = () => Buffer.alloc(0);
+  d.buildParamRequestRead = () => Buffer.alloc(0);
+  d.sendPacket = () => true;
+
+  const delays = [];
+  const realSetTimeout = global.setTimeout;
+  try {
+    global.setTimeout = (fn, ms) => { delays.push(ms); return { unref() {} }; };
+    d.applyParamOverlay();
+  } finally {
+    global.setTimeout = realSetTimeout;
   }
-  // And no bare literals left in the schedule itself.
-  assert.ok(!/\}, index \* 250\)/.test(src), 'a hard-coded 250 ms write spacing remains');
-  assert.ok(!/index \* 150\)/.test(src),     'a hard-coded 150 ms read spacing remains');
+  d.clearOverlayTimers();
+
+  assert.ok(delays.length > 0, 'applyParamOverlay must schedule work');
+  const lastScheduled = Math.max(...delays);
+  const entries = Object.keys(d.paramOverlay).length;
+  const reads   = Object.keys(PWMMavproxy.EXPECTED_CRITICAL_PARAMS).length;
+
+  assert.equal(overlayChainMs(entries, reads), lastScheduled,
+    `overlayChainMs(${entries}, ${reads}) says ${overlayChainMs(entries, reads)} ms but the ` +
+    `driver actually schedules its last work at ${lastScheduled} ms — the bound is ` +
+    'computed from something other than the real schedule');
+
+  assert.ok(d.overlayReassertMs > lastScheduled,
+    `the reassert fires at ${d.overlayReassertMs} ms, before the chain's last work at ` +
+    `${lastScheduled} ms, so it cancels the read-backs that would confirm the attempt`);
 });

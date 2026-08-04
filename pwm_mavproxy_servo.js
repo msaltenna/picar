@@ -1182,4 +1182,10 @@ class PWMMavproxy {
 }
 
 module.exports = PWMMavproxy;
+// Exported so tests can read the REAL list rather than transcribing it. A test that
+// hard-coded a fallback copy was silently always using the copy, because
+// require(...).EXPECTED_CRITICAL_PARAMS on a module-scoped const is undefined — and
+// nothing would have caught the copy drifting away from the real list.
+module.exports.EXPECTED_CRITICAL_PARAMS = EXPECTED_CRITICAL_PARAMS;
+module.exports.DEFAULT_PARAM_OVERLAY = DEFAULT_PARAM_OVERLAY;
 

@@ -784,13 +784,16 @@ test('reasserting stops once read-back confirms every critical parameter', async
     await new Promise((r) => setImmediate(r));
 
     // Mark everything verified, as a successful read-back would.
-    for (const n of Object.keys(require('../pwm_mavproxy_servo.js').EXPECTED_CRITICAL_PARAMS
-      || {})) d.verifiedCriticalParams.add(n);
-    if (d.verifiedCriticalParams.size === 0) {
-      for (const n of ['SERVO1_FUNCTION','SERVO2_FUNCTION','SERVO3_FUNCTION',
-                       'SERVO4_FUNCTION','SERVO5_FUNCTION','SERVO6_FUNCTION',
-                       'FRAME_CLASS','RC_OVERRIDE_TIME']) d.verifiedCriticalParams.add(n);
-    }
+    // Read the REAL list. This used to be `EXPECTED_CRITICAL_PARAMS || {}` with a
+    // hand-transcribed fallback, and because the constant was module-scoped and not
+    // exported, the require() was ALWAYS undefined and the fallback ALWAYS ran. It
+    // happened to match, so the test passed for the wrong reason and would have gone
+    // on passing after the real list changed. The constant is exported now, and this
+    // asserts the export rather than tolerating its absence.
+    const expected = require('../pwm_mavproxy_servo.js').EXPECTED_CRITICAL_PARAMS;
+    assert.ok(expected && Object.keys(expected).length > 0,
+      'EXPECTED_CRITICAL_PARAMS must be exported for this test to mean anything');
+    for (const n of Object.keys(expected)) d.verifiedCriticalParams.add(n);
     const before = attempts;
     d.overlayReassertMs = 1;
     d.startOverlayReassertWatch();
