@@ -384,3 +384,32 @@ test('an unwatchable pack is reported, and a watchable one is not', () => {
   // A threshold of 0 is a real threshold, not an absent one.
   assert.equal(batteryWarnabilityWarning({ batteryWarnVolts: 0 }, null), null);
 });
+
+test('the TRACKED config ships a pack that can actually raise a warning', () => {
+  // Pins the shipped value, because "no threshold configured" is invisible in normal
+  // operation: everything renders, nothing warns, and the failure only appears on the
+  // one day a pack is flat. batteryWarnVolts was null until 2026-08-04 and, because
+  // ArduPilot reports battery_remaining=0 on this fleet, the percentage branch never
+  // fired either — so no state of charge could raise a warning at all.
+  //
+  // Deliberately reads the tracked config and NOT picar-cfg.local.json: a threshold
+  // that only exists in the untracked per-rover overlay is exactly what invariant 8
+  // forbids for safety-relevant config, and it is how rover3 came to have a
+  // PLACEHOLDER pack range standing in for a real one.
+  const cfg = require('../picar-cfg.json');
+  const { batteryWarnabilityWarning, batteryWarnCfgFrom } = require('../telemetry-loop');
+
+  assert.equal(batteryWarnabilityWarning(cfg, null), null,
+    'the tracked config leaves the pack unwatchable — see the startup warning this ' +
+    'returns for what the operator would be told');
+
+  const warn = batteryWarnCfgFrom(cfg);
+  assert.ok(Number.isFinite(warn.warnVolts) && warn.warnVolts > 0,
+    `batteryWarnVolts must be a positive number, got ${JSON.stringify(warn.warnVolts)}`);
+  // Sanity-bound it. A threshold above a full pack warns constantly (and is therefore
+  // ignored); one near zero never warns at all. 2S LiPo is 6.0-8.4 V.
+  assert.ok(warn.warnVolts >= 5.5 && warn.warnVolts <= 8.0,
+    `batteryWarnVolts=${warn.warnVolts} is outside a sane 2S range — if the fleet's cell ` +
+    'count changed, update this bound with it rather than deleting it');
+  assert.equal(warn.warnOnNoReading, true, 'and an unreadable monitor must still warn');
+});
