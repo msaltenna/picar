@@ -7,6 +7,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { sanitizeVideoParams } = require('../video-params');
 const { spawn } = require('child_process');
 
 function generateMediaMTXConfig(cfg, params) {
@@ -98,6 +99,11 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
   // coalesced into a restart that never happens.
   const RESTART_TIMEOUT_MS = config.mediamtx_restart_timeout_ms ?? 30000;
 
+  // Array form, so there is no shell and no quoting to get wrong.
+  const RESTART_CMD = Array.isArray(config.mediamtx_restart_cmd) && config.mediamtx_restart_cmd.length
+    ? config.mediamtx_restart_cmd
+    : ['systemctl', 'restart', 'mediamtx'];
+
   function clearRestartState() {
     if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
     restartChild = null;
@@ -110,7 +116,10 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     restartQueued = false;
     console.log('WebRTC: restarting mediamtx…');
     // spawn, not exec: no shell, and no buffering of output we do not read.
-    const child = spawn('systemctl', ['restart', 'mediamtx'], { stdio: 'ignore' });
+    // The command is configurable rather than hardcoded to systemd — CLAUDE.md notes
+    // the fleet is not homogeneous, and it gives tests a seam so that asserting
+    // "setParams validates its input" does not require restarting a real service.
+    const child = spawn(RESTART_CMD[0], RESTART_CMD.slice(1), { stdio: 'ignore' });
     restartChild = child;
 
     restartTimer = setTimeout(() => {
@@ -149,11 +158,17 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     },
 
     setParams(newParams) {
-      if (newParams.width      !== undefined) params.width      = newParams.width;
-      if (newParams.height     !== undefined) params.height     = newParams.height;
-      if (newParams.fps        !== undefined) params.fps        = newParams.fps;
-      if (newParams.bitrate    !== undefined) params.bitrate    = newParams.bitrate;
-      if (newParams.idr_period !== undefined) params.idr_period = newParams.idr_period;
+      // Validated, not assigned. This used to take whatever arrived —
+      // `params.width = newParams.width` — so a string, a NaN or an object went
+      // straight into the generated YAML from an unauthenticated socket. Now that
+      // operator settings are PERSISTED, an unvalidated value would survive reboots
+      // as a permanently unstartable encoder, so the whitelist is load-bearing.
+      const { params: clean, rejected } = sanitizeVideoParams(newParams);
+      for (const bad of rejected) console.error(`setVideoParams: REJECTED ${bad}`);
+      if (Object.keys(clean).length === 0) {
+        return { applied: {}, rejected, restarted: false };
+      }
+      Object.assign(params, clean);
       writeYml();
 
       // ASYNCHRONOUS on purpose. This used to be execSync, which blocks the Node
@@ -165,9 +180,10 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
       if (restarting) {
         console.log('WebRTC: mediamtx restart already in flight, coalescing');
         restartQueued = true;
-        return;
+        return { applied: clean, rejected, restarted: false };
       }
       restartMediamtx();
+      return { applied: clean, rejected, restarted: true };
     },
 
     getStreamConfig() {

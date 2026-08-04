@@ -152,6 +152,7 @@ const throttle_ramp_down = 0;
 // reachable through the untracked picar-cfg.local.json overlay, so a rover-local 0
 // or a typo would otherwise become setInterval(fn, 1) — measured at ~10% of a core
 // from the /proc read alone — and 1e400 is valid JSON that Node coerces to 1 ms.
+const { persistVideoParams } = require('./video-params');
 const { startTelemetryLoop, buildTelemetryWiring, batteryWarnCfgFrom,
         batteryWarnabilityWarning } = require('./telemetry-loop');
 
@@ -315,11 +316,46 @@ io.on('connection', (socket) => {
     return reply({ ok: true, on });
   });
 
-  socket.on('setVideoParams', (params) => {
+  socket.on('setVideoParams', (params, acknowledge) => {
+    const reply = (r) => { if (typeof acknowledge === 'function') acknowledge(r); return r; };
     console.log('setVideoParams:', params);
-    stream.setParams(params);
-    // Re-broadcast updated config to all connected clients
+    const result = stream.setParams(params) || {};
+    const applied = result.applied || {};
+
+    // Re-broadcast the EFFECTIVE config to every client, not the requested one. The
+    // client used to keep its own copy in localStorage and treat that as truth, so
+    // after a restart reverted the encoder the UI still displayed the operator's old
+    // request — it showed what was asked for, never what was running.
     setTimeout(() => io.emit('streamConfig', stream.getStreamConfig()), 600);
+
+    if (Object.keys(applied).length === 0) {
+      return reply({ ok: false, error: 'no valid video parameter in request',
+                     rejected: result.rejected || [] });
+    }
+
+    // Persist so the setting survives a restart. Awaited only to report the outcome;
+    // the write is async because this handler runs on the same event loop as the 20 Hz
+    // override stream and the fail-safe timers (invariant 9).
+    persistVideoParams({
+      overlayPath: localConfigPath,
+      codec: (stream.getStreamConfig() || {}).codec,
+      params: applied,
+    }).then((p) => {
+      if (p.persisted) {
+        console.log(`setVideoParams: persisted ${JSON.stringify(p.updates)} to ${localConfigPath}`);
+      } else {
+        // Loud: the operator's setting is live but will vanish on the next restart,
+        // and silence about that is the original defect.
+        console.error(`setVideoParams: NOT persisted (${p.reason}) — this setting will ` +
+                      'revert on the next restart');
+      }
+      reply({ ok: true, applied, rejected: result.rejected || [],
+              persisted: p.persisted, persistError: p.reason });
+    }).catch((err) => {
+      console.error(`setVideoParams: persistence threw — ${err.message}`);
+      reply({ ok: true, applied, rejected: result.rejected || [],
+              persisted: false, persistError: err.message });
+    });
   });
 
   socket.on('fromclient', (data) => {

@@ -476,6 +476,13 @@
         <span id="vpQualityVal" class="vval"></span>
       </div>
 
+      <!-- What the encoder is ACTUALLY running, as reported by the server. The
+           controls above are a request; this line is the truth. They diverge whenever
+           a value is rejected or a restart reverts a setting, and that divergence used
+           to be invisible. -->
+      <p id="vpEffective" style="font-size:12px;color:#8c8;margin:12px 0 0 0;
+         text-align:center;font-family:monospace;">running: --</p>
+
       <div class="config-close-row" style="display:flex;gap:10px;justify-content:center;">
         <button onclick="applyVideo()" style="background:#2a7;">Apply</button>
         <button onclick="closeVideo()" style="background:#555;">Close</button>
@@ -1290,6 +1297,7 @@
     socket.on('streamConfig', (cfg) => {
       setPendingStream(cfg);
       initVideoDefaults(cfg);
+      renderEffectiveVideo();
     });
 
     // ── Video params ──────────────────────────────────────────────────────────
@@ -1304,6 +1312,7 @@
     const vpQualityEl     = document.getElementById('vpQuality');
     const vpQualityVal    = document.getElementById('vpQualityVal');
     const vpQualityLabel  = document.getElementById('vpQualityLabel');
+    const vpEffectiveEl   = document.getElementById('vpEffective');
 
     // Loaded from localStorage, then overridden by server defaults if not present
     let videoParams = {};
@@ -1316,13 +1325,46 @@
       return RESOLUTIONS.includes(key) ? key : RESOLUTIONS[1]; // default 480x360
     }
 
+    // What the server says the encoder is ACTUALLY running. Kept separate from
+    // videoParams (what this browser last asked for) because conflating them is what
+    // made this panel lie.
+    let effectiveVideo = {};
+
     function initVideoDefaults(cfg) {
-      // Only set defaults from server if not already in localStorage
-      if (!videoParams.fps     && cfg.fps)     videoParams.fps     = cfg.fps;
-      if (!videoParams.width   && cfg.width)   videoParams.width   = cfg.width;
-      if (!videoParams.height  && cfg.height)  videoParams.height  = cfg.height;
-      if (!videoParams.bitrate && cfg.bitrate) videoParams.bitrate = cfg.bitrate;
-      if (!videoParams.quality && cfg.quality) videoParams.quality = cfg.quality;
+      // The SERVER wins. This used to be `if (!videoParams.fps && cfg.fps)` — a
+      // localStorage value shadowed the server's for the lifetime of the browser
+      // profile, so after a restart reverted the encoder to the config default this
+      // panel kept displaying the operator's old request. Measured: a UI change to
+      // 650 kbps was discarded server-side and the UI still showed 650.
+      //
+      // localStorage is now only a seed for a first-ever visit before any
+      // streamConfig has arrived; once the server speaks, it is authoritative.
+      effectiveVideo = {
+        width:   cfg.width,   height:  cfg.height,
+        fps:     cfg.fps,     bitrate: cfg.bitrate,
+        quality: cfg.quality,
+      };
+      for (const k of ['fps', 'width', 'height', 'bitrate', 'quality']) {
+        if (cfg[k] !== undefined && cfg[k] !== null) videoParams[k] = cfg[k];
+      }
+    }
+
+    // Rendered in the video panel so a silent revert is visible. Returns null when the
+    // server has not told us yet — showing a guess here would recreate the defect.
+    function formatEffectiveVideo() {
+      const e = effectiveVideo;
+      if (!e || e.width === undefined || e.width === null) return null;
+      const parts = [`${e.width}\u00d7${e.height}`];
+      if (e.fps     !== undefined && e.fps     !== null) parts.push(`${e.fps}fps`);
+      if (e.bitrate !== undefined && e.bitrate !== null) parts.push(`${e.bitrate}kbps`);
+      return parts.join(' ');
+    }
+
+    function renderEffectiveVideo(persistNote) {
+      if (!vpEffectiveEl) return;
+      const eff = formatEffectiveVideo();
+      if (!eff) { vpEffectiveEl.textContent = 'running: --'; return; }
+      vpEffectiveEl.textContent = `running: ${eff}${persistNote ? ' \u2014 ' + persistNote : ''}`;
     }
 
     function openVideo() {
@@ -1376,8 +1418,27 @@
         quality: Number(vpQualityEl.value),
       };
       localStorage.setItem('picar-video', JSON.stringify(videoParams));
-      socket.emit('setVideoParams', videoParams);
-      closeVideo();
+      // Acknowledged, so a rejected value or a failed persist is reported instead of
+      // being assumed to have worked. The panel stays OPEN until the server answers —
+      // closing it immediately is what let a silently-dropped setting look applied.
+      renderEffectiveVideo('applying\u2026');
+      socket.emit('setVideoParams', videoParams, (reply) => {
+        if (!reply) { renderEffectiveVideo('no response from rover'); return; }
+        if (reply.ok === false) {
+          renderEffectiveVideo(`REJECTED: ${(reply.rejected || []).join('; ') || reply.error}`);
+          return;
+        }
+        let note = reply.persisted
+          ? 'saved on rover'
+          : `NOT saved (${reply.persistError || 'unknown'}) \u2014 reverts on restart`;
+        if (reply.rejected && reply.rejected.length) {
+          note += ` | rejected: ${reply.rejected.join('; ')}`;
+        }
+        // The effective values arrive separately via streamConfig once mediamtx has
+        // restarted, so this only annotates; it never invents numbers.
+        renderEffectiveVideo(note);
+        closeVideo();
+      });
     }
 
     // ── Device / control mode ─────────────────────────────────────────────────
