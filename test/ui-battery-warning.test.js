@@ -130,9 +130,43 @@ test('a live link with no autopilot is distinguished from a healthy one', () => 
   const silent = f({ linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: false }, CFG);
   assert.ok(silent.includes('⚠'), `a silent autopilot must warn: ${silent}`);
 
-  const ok = f({ linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: true }, CFG);
+  // NOTE: this fixture now carries verified params. It used to omit them, which
+  // meant this test asserted that a live link with a live heartbeat and ZERO
+  // verified critical parameters was "healthy" — the exact state the vehicle was
+  // in while it ran as FRAME_CLASS=2 with the bar reading 'FC: ok'. The test was
+  // pinning the defect.
+  const ok = f({
+    linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: true,
+    params: { verified: ['FRAME_CLASS'], missing: [], mismatched: {} },
+  }, CFG);
   assert.ok(!ok.includes('⚠'), `a healthy link must not warn: ${ok}`);
   assert.ok(ok.includes('ok'), ok);
+});
+
+test('a link whose critical params are unverified is NOT reported as ok', () => {
+  // Invariant 7: arming requires read-back confirmation of every entry in
+  // EXPECTED_CRITICAL_PARAMS. The driver tracked that and reported it in
+  // telemetry.params; this bar rendered 'FC: ok' regardless, so the one surface
+  // that could have shown the FRAME_CLASS=2 incident showed an all-clear.
+  const f = loadFn('formatFcLink');
+  const base = { linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: true };
+
+  const unverified = f({ ...base,
+    params: { verified: [], missing: ['FRAME_CLASS', 'SERVO1_FUNCTION'], mismatched: {} } }, CFG);
+  assert.ok(unverified.includes('⚠'), `unverified params must warn: ${unverified}`);
+  assert.ok(!unverified.includes('ok'), `must not read as ok: ${unverified}`);
+  assert.ok(unverified.includes('2'), `the operator needs the count: ${unverified}`);
+
+  const mismatch = f({ ...base,
+    params: { verified: [], missing: [], mismatched: { FRAME_CLASS: { expected: 1, actual: 2 } } } }, CFG);
+  assert.ok(mismatch.includes('⚠'), `a mismatch must warn: ${mismatch}`);
+  assert.ok(!mismatch.includes('ok'), `must not read as ok: ${mismatch}`);
+
+  // Fail closed on the path not taken: a server that reports no params at all is
+  // an unknown, and an unknown is not a pass.
+  const absent = f(base, CFG);
+  assert.ok(absent.includes('⚠'), `absent param status must warn: ${absent}`);
+  assert.ok(!absent.includes('ok'), `must not read as ok: ${absent}`);
 });
 
 test('a partially valid radio frame never renders the literal string null', () => {

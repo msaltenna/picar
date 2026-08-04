@@ -717,6 +717,22 @@
       if (!telemetry.linkUp) return 'FC: DOWN ⚠';
       if (telemetry.awaitingAutopilot) return 'FC: no autopilot ⚠';
       if (telemetry.autopilotHeartbeat === false) return 'FC: silent ⚠';
+      // A live link and a live heartbeat are NOT the same thing as a configured
+      // vehicle, and this line said 'ok' for both. Invariant 7 requires read-back
+      // confirmation of every EXPECTED_CRITICAL_PARAMS entry before arming; the
+      // driver tracks exactly that and reports it here, and nothing rendered it.
+      //
+      // This is the incident this branch exists because of. FRAME_CLASS was being
+      // pushed as 2 (Boat) on a rover and "verified" back as the wrong value, and
+      // the status bar read 'FC: ok' throughout. The operator had no surface on
+      // which that was visible. Fail closed: if the driver did not tell us about
+      // params at all, that is not a pass either.
+      const p = telemetry.params;
+      if (!p) return 'FC: params unknown ⚠';
+      const mismatched = Object.keys(p.mismatched || {}).length;
+      if (mismatched) return `FC: ${mismatched} param mismatch ⚠`;
+      const missing = (p.missing || []).length;
+      if (missing) return `FC: ${missing} param unverified ⚠`;
       return 'FC: ok';
     }
 
