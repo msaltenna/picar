@@ -92,6 +92,65 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-04 — Battery/radio telemetry hardened through review rounds 4-8 (branch, unmerged)
+
+Branch `feature/battery-and-radio-telemetry`. **Not merged, and it cannot be merged on the
+reviews it has** — see the P0 merge entry in `TASKS.md`. 236 host tests pass (was 173 when the
+round-4 work began, 46 on `main`).
+
+**What shipped in these rounds.** `main` was merged into the branch first (`f526f42`): it had
+fallen 13 commits behind, so `git diff main..HEAD` reported `main`'s light-control feature as
+*deletions* and `main`'s test files produced 9 false failures against the branch's driver. The
+driver auto-merged with no conflict, which is the dangerous case — two independent sets of edits
+to the MAVLink framing path, and nobody forced to look at them.
+
+Then, in order: the overlay-reassert bound was pinned to the timer schedule the driver actually
+schedules rather than to a grep of its source; `sanitizeParamOverlay()` was added because `[]`
+in the untracked overlay silently disabled the whole critical-parameter mechanism and a string
+crashed the process from inside a `setTimeout`; **`FRAME_CLASS` was corrected from 2 (Boat) to 1
+(Rover)** at all three sites; the telemetry publish loop was extracted to `telemetry-loop.js`
+and then its `app.js` wiring extracted again to `buildTelemetryWiring()`; the UI status bar
+gained an FC indicator that reports unverified/mismatched critical parameters, telemetry
+expiry, and `FC: n/a` for the GPIO drivers.
+
+**What the reviews cost, and why that is the useful part of this entry.** Eight rounds ran, and
+*every* round found real defects in the previous round's fixes. Cumulatively they found **nine
+tests that could not fail** — asserting on source text, asserting the stub the test installed,
+tampering with a MAVLink frame without resealing its CRC so the parser rejected it for the wrong
+reason, never reaching the branch they named, and one that asserted the defect outright — plus
+**two commit messages that claimed mutations were dead when they were not**. The recurring shape
+has a name now and it is worth carrying forward: **a correct rule with an untouched consumer.**
+Extracting a rule to make it testable does nothing for its call site, and three times on this
+branch the call site was where the defect lived.
+
+**Reviewer record.** Rounds 1-6 and 8: `opus-fallback` (Codex reports `ERROR: Your workspace is
+out of credits.`). Round 8 additionally: a **Fable 5 red team** — the only different-model-family
+review this branch has had, and it found a survivor the fallback missed (the loop could schedule
+a no-op instead of its tick). No commit on this branch carries a `Reviewed-by:` trailer, which is
+honest: no review has cleared it.
+
+**Known limitation, stated rather than claimed closed.** `app.js` has no test file, so its three
+remaining one-line call sites survive their mutations. Every rule they invoke is tested; the
+invocation is not.
+
+**Open question to settle by measurement, not argument.** The two round-8 reviewers disagree on
+whether ArduRover's `FRAME_CLASS` is `@RebootRequired`. If it is, read-back confirms the *stored*
+and not the *active* value, and a validation pass on this branch would be unearned. The test is
+in `TASKS.md`: set it, read it back, and watch whether the HEARTBEAT's `MAV_TYPE` changes from
+`SURFACE_BOAT` to `GROUND_ROVER` without a power-cycle.
+
+**Two findings unrelated to this branch, found while validating it.** MAVProxy's tlog grows
+without bound in **tmpfs** — 412 MB of RAM after 17 h on rover3, filling in roughly a week. And
+`/var/log/mavproxy/mav.tlog` is a *stale* file from an earlier configuration; an on-target check
+that read it reported a healthy MAVProxy as wedged, which is the same misdiagnosis, in the same
+direction, as the 2026-08-03 incident below. Both are in `TASKS.md`.
+
+**New on-target script.** `test/on-target/telemetry.sh` — services and restart counts, journal
+evidence including the overlay's new failure messages, `/status` shape, critical-param read-back,
+MAVLink liveness (derived from the unit's real `--logfile`, not a guessed path), wedge signatures,
+and a two-sample freshness check that a frozen snapshot cannot pass. Read-only: no restarts, no
+config changes, no root.
+
 ### 2026-08-03 — MAVProxy wedged and took the control path with it
 
 Not a code change — an incident worth recording, because it cost an hour of misdirected

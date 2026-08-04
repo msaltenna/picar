@@ -222,16 +222,23 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   rover1/rover2 run; get `git rev-parse HEAD` and `git status --porcelain` from both before
   designing a fix.
 
-- **`DEFAULT_PARAM_OVERLAY` sets `FRAME_CLASS: 2` (Boat) in two places** —
-  `pwm_mavproxy_servo.js:41` sets it behind the comment `// Rover (must be set or
-  steering/throttle outputs are wrong)`, and `pwm_mavproxy_servo.js:56` re-asserts `2` in
-  `EXPECTED_CRITICAL_PARAMS`, so read-back "verifies" the wrong value. The warning text at
-  `:497` also tells the reader to check `FRAME_CLASS=2 (Rover)`. In ArduPilot Rover, `1` = Rover
-  and `2` = Boat; `CLAUDE.md` states the profile is `FRAME_CLASS=1`. Confirmed live in rover3's
-  journal (`PARAM_SET FRAME_CLASS=2`). Not a regression — the previously-running branch sets `2`
-  as well. **All three sites must change together**; the previous prescription ("cherry-pick that
-  one-line fix") would have left read-back expecting Boat. The Pixhawk needs a power-cycle to take
-  the new frame class.
+- **[P0] `FRAME_CLASS: 2` (Boat) is still what `main` pushes** — `pwm_mavproxy_servo.js`
+  sets it in `DEFAULT_PARAM_OVERLAY` behind the comment `// Rover`, re-asserts `2` in
+  `EXPECTED_CRITICAL_PARAMS` so read-back "verifies" the wrong value, and the mismatch warning
+  text tells the reader to check `FRAME_CLASS=2 (Rover)`. In ArduRover `1` = Rover and `2` = Boat.
+  Confirmed live in rover3's journal (`PARAM_SET FRAME_CLASS=2`, 2026-08-03 23:34:09).
+  **Fixed on `feature/battery-and-radio-telemetry` (`a8808c8`), all three sites together, plus a
+  test asserting every `EXPECTED_CRITICAL_PARAMS` entry matches what the overlay pushes — the
+  drift between the two tables is what made read-back a rubber stamp. This entry stays open until
+  that branch merges.**
+  Disputed and not yet settled: whether the parameter is `@RebootRequired`. An earlier revision of
+  this file asserted "the Pixhawk needs a power-cycle to take the new frame class" with no source;
+  a 2026-08-04 review of ArduPilot's own source found Rover's `FRAME_CLASS` carries no
+  `@RebootRequired` and `is_boat()` reads it live, while a second reviewer asserted the opposite.
+  It matters because if a reboot IS required, read-back confirms the stored and not the active
+  value, and a validation pass would be unearned. **Settle it by measurement on rover3** — set it,
+  read it back, and check whether the HEARTBEAT's `MAV_TYPE` changes from `SURFACE_BOAT` (12) to
+  `GROUND_ROVER` (10) without a power-cycle — not by argument.
 
 - **Fail-safe wire order is fixed on the server; four residuals remain** — as of `c6043d7`,
   operator stop, input timeout, process shutdown, MAVProxy reconnect and drivetrain changes all
@@ -411,13 +418,13 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   blocker under "nothing mechanically enforces the review gate". Fix: a CI job running
   `npm test` on push and PR, as the first required status check.
 
-- **`test/on-target/` does not exist** — the validation bar requires a committed, repeatable
-  on-target suite, so every validation so far has been ad hoc. `.claude/skills/embedded-validator/SKILL.md`
-  demands it and calls missing evidence a fail, which makes the stage currently unsatisfiable as
-  written. Bootstrap it with the checks already performed by hand: unit active with `NRestarts=0`,
-  expected startup lines, autopilot heartbeat seen, RC_CHANNELS_OVERRIDE streaming neutral,
-  `/status` shape, and HTTP reachability of `socket.html` / `socket.io` / WHEP. Author it via the
-  Optimizer, not the validator.
+- **[P1] `test/on-target/` is only two scripts deep** — the validation bar requires a committed,
+  repeatable on-target suite. `video-drop.sh` (frame shedding) and `telemetry.sh` (services,
+  journal, `/status` shape, param read-back, MAVLink liveness, telemetry freshness) exist now.
+  Still missing: RC_CHANNELS_OVERRIDE streaming neutral, each fail-safe path tripped
+  end-to-end, and HTTP reachability of `socket.html` / `socket.io` / WHEP. Until those land the
+  Embedded Validator's checklist is still not satisfiable purely from committed scripts.
+  Author via the Optimizer, not the validator.
 
 - **`install.sh` is destructive on re-run and blocks clean validation** —
   1. `install.sh:244` rewrites the **tracked** `picar-cfg.json` in place from the prompt answers,
@@ -431,28 +438,26 @@ Open work only. Completed tasks are **deleted** from this file — their record 
      dead code that dies with `command not found`.
   4. `uninstall.sh` never removes the polkit rule installed at `install.sh:331`.
 
-- **Merge the finished battery/radio telemetry work** — `origin/feature/battery-and-radio-telemetry`
-  (code SHA `6675341`, evidence commit `a979b59`) implements battery V/A, board and servo rails,
-  radio RSSI and WiFi link quality across `socket.html`, `fleetmgr-client.js`,
-  `fleet-manager/`, and adds `test/telemetry.test.js` (522 lines). It carries a recorded Embedded
-  Validator **PASS** on rover3, and **rover3 is currently running it** (`a979b59`, clean tree, all
-  units active, verified 2026-08-03). It also lands the **MAVLink v2 (`0xFD`) parser** — its
-  comment states MAVProxy on this platform forwards v2 exclusively — and proved param read-back
-  works here: all seven `EXPECTED_CRITICAL_PARAMS` verified live, `missing: []`, journal showing
-  `Received first Pixhawk heartbeat (sys=1 MAVLink 2)`. **Re-confirmed on rover3 2026-08-03** by
-  running both builds back to back: on `main`'s code `/status` has no telemetry and **zero** params
-  verify; on `a979b59` it returns
-  `"params":{"verified":[all 7],"missing":[],"mismatched":{}}`, `autopilotHeartbeat:true`, battery
-  7.986 V / 0.45 A, board 5.163 V, servo 6.017 V, wifi 70 % / −61 dBm, `radio:null` (no SiK radio
-  fitted — consistent with the tlog showing zero `RADIO_STATUS` frames).
-  Caveat: it "verifies" `FRAME_CLASS` against `EXPECTED_CRITICAL_PARAMS`, which still expects
-  **2 (Boat)** — so read-back confirms the wrong value, which is why the `FRAME_CLASS` P0 must be
-  fixed in the same change. **No rebase is needed** — `6675341`'s
-  parent *is* current `main` (`4580209`), and `git rev-list 6675341..main` is empty. Before
-  merging: obtain the **required** Codex review (see the re-review entry — this branch is gated by
-  invariant 6, not merely owed a review), and if `FRAME_CLASS: 1` or the missing `armDelayMs`
-  assignment are folded in, that produces a new SHA which must be revalidated — the existing PASS
-  attests `6675341` exactly.
+- **[P0] Merge the battery/radio telemetry work — blocked on a Codex review** —
+  `feature/battery-and-radio-telemetry`. It implements battery V/A and a voltage-derived
+  percentage, board and servo rails, radio RSSI and Wi-Fi link quality, a MAVLink v2 parser with
+  CRC validation, param-overlay validation and reassert-until-verified, and the operator-facing FC
+  status indicator. 236 host tests pass.
+  **The blocker is not the code.** `CLAUDE.md` and
+  `.claude/skills/second-opinion-validator/SKILL.md` both state that the `opus-fallback` reviewer
+  runs but does not authorise a merge for a change touching the ten safety invariants, and this one
+  touches 6 (fail-safe timing: `RC_OVERRIDE_TIME` moved to overlay position 0 and reasserted), 7
+  (it builds the read-back machinery invariant 7 names), 8 (six new overlay-reachable keys, all
+  bounded) and 9 (a new interval doing a `/proc` read on the control event loop). Codex reports
+  `ERROR: Your workspace is out of credits.` **Restore credits, review this diff, and merge with a
+  `Reviewed-by: codex` trailer.** Eight review rounds have run: rounds 1-6 and 8 by
+  `opus-fallback`, round 8 additionally by a Fable 5 red team — the only different-model-family
+  review the branch has had. Every round found real defects in the previous round's fixes,
+  including nine tests that could not fail and two commit messages that claimed mutations were
+  dead when they were not.
+  Also outstanding for this branch: `app.js`'s three one-line call sites
+  (`buildTelemetryWiring(...)`, `startTelemetryLoop(...)`, the startup warnability
+  `console.error`) survive their mutations because `app.js` has no test file — see that entry.
 
 - **`main`'s MAVLink receive path never validates the frame CRC, and drops v2** —
   `pwm_mavproxy_servo.js:443-459`. `parseIncoming` resyncs on `0xFE`, reads `payloadLen`, and
@@ -621,3 +626,36 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 - **`sw.js` proxies every request through a service worker that does no caching** —
   `sw.js:5`. It adds a termination hazard for long-lived streaming fetches on worker update while
   providing no benefit. Fix: drop the fetch handler.
+
+- **[P1] Pick a `batteryWarnVolts` for the fleet's packs — operator decision** — with the tracked
+  config as shipped (`batteryWarnVolts: null`, `battery_empty_volts`/`battery_full_volts` null) and
+  ArduPilot reporting `battery_remaining = 0` on this fleet, **no state of charge can raise a
+  battery warning**: the percentage branch has no percentage, the voltage branch has no threshold,
+  and the fail-closed branch needs the voltage to be missing too. Measured: a 2S pack at 3.0 V
+  total renders with no warning and sets no Fleet Manager status bit.
+  `feature/battery-and-radio-telemetry` adds a loud startup warning so the silence is visible, and
+  gates it on the driver's effective capability so a half-configured range cannot suppress it — but
+  choosing the threshold is a hardware judgement, not a code fix. Needs a per-pack value in the
+  **tracked** config (the untracked overlay is exactly what invariant 8 forbids for safety config).
+
+- **[P2] Ban `readFileSync` outside startup with a lint rule** — invariant 9. The telemetry loop
+  takes its `/proc` reader as an injected promise-returning dependency and a test asserts
+  `fs.readFileSync` is never called, but the injection itself is a one-line lambda in `app.js`
+  that `Promise.resolve(fs.readFileSync(...))` would satisfy while still blocking. The contract
+  confines the risk to one line; it does not prove it. `pwm_libgpiod_servo.js` spawning ~200
+  `execSync`/s is the same class and much worse. A lint rule is the durable fix.
+
+- **[P1] MAVProxy's tlog grows without bound in RAM** — measured on rover3 2026-08-04: `mavproxy.service`
+  runs with `--logfile /tmp/mav.tlog`, `/tmp` is **tmpfs**, and after 17 h of uptime
+  `mav.tlog` + `mav.tlog.raw` held **412 MB of the 3.9 GB tmpfs** (~24 MB/h). At that rate a rover
+  left running fills tmpfs in about a week, after which MAVProxy's writes fail and anything else
+  using `/tmp` fails with it — on the machine that carries the control path. There is no rotation.
+  Either point `--logfile` at real storage with rotation, or cap it. Note `/var/log/mavproxy/`
+  contains a *stale* `mav.tlog` from an earlier configuration, which is its own trap: an on-target
+  check that read it reported a healthy MAVProxy as wedged.
+
+- **[P3] Mutation-testing agents must not share a working tree** — during round 8 a reviewer
+  observed this session's mutation runs modifying the same tree it was reviewing, and discarded its
+  own in-tree results as unreliable in both directions. Any mutation verdict from an overlapping
+  window is worthless. Reviewers should work in `git worktree` copies, or the orchestrator must
+  serialise mutation work against review work.
