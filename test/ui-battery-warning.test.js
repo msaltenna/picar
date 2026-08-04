@@ -192,24 +192,65 @@ test('a radio frame with no usable signal falls through to Wi-Fi', () => {
     `no usable radio measurement must not suppress the Wi-Fi fallback: ${out}`);
 });
 
-test('the status bar actually renders the FC link indicator', () => {
-  // Pinning the WIRING. Testing formatFcLink() in isolation passes even if nothing
-  // calls it — removing its push from renderStatusBar survived the suite, which is
-  // the same mechanism-versus-wiring gap that has recurred across this branch.
-  //
-  // socket.html has no module boundary, so this asserts on the source of
-  // renderStatusBar. That is weaker than executing it and it can be defeated by a
-  // rename — but the alternative here is no coverage at all, and it does catch the
-  // deletion that actually happened.
-  const start = html.indexOf('function renderStatusBar()');
-  assert.notEqual(start, -1, 'renderStatusBar() not found — renamed?');
-  const body = html.slice(start, html.indexOf('\n    }', start));
-  assert.ok(body.includes('formatFcLink()'),
-    'renderStatusBar must render the FC link — an operator has to be able to tell a ' +
-    'live vehicle from a silent one');
-  // And it must not be hidden behind a uiCfg toggle: the one indicator that
-  // distinguishes a dead link from a healthy one should not be switchable off.
-  assert.ok(!/uiCfg\.\w+\s*&&\s*c3\.push\(formatFcLink/.test(body)
-         && !/if \(uiCfg\.\w+\)\s*c3\.push\(formatFcLink/.test(body),
-    'the FC link indicator must not be behind a uiCfg toggle');
+// Execute the real renderStatusBar() against stub column elements, with the real
+// formatters wired in. This replaces a pair of regexes over the source text that
+// looked like they policed the no-toggle rule and did not: round 7 defeated both
+// with `if (uiCfg.showFcLink) { c3.push(formatFcLink()); }` — braces, 199/0 green,
+// and because showFcLink is in no CFG_DEFAULTS the FC indicator vanished from the
+// bar entirely. That is the precise outcome the assertion existed to prevent, which
+// makes it a worked example of why a test that restates a rule in a different
+// notation proves nothing about the code.
+function renderStatusBarWith({ uiCfg = {}, telemetry = null, telemetryCfg = CFG } = {}) {
+  const grab = (name) => {
+    const at = html.indexOf(`function ${name}()`);
+    assert.notEqual(at, -1, `${name}() not found in socket.html — renamed?`);
+    return html.slice(at, html.indexOf('\n    }', at) + 6);
+  };
+  const cols = { 1: '', 2: '', 3: '' };
+  const stub = (n) => ({ set innerHTML(v) { cols[n] = v; }, get innerHTML() { return cols[n]; } });
+  const src = ['formatBattery', 'formatRadio', 'formatRails', 'formatFcLink']
+    .map(grab).join('\n') + '\n' + grab('renderStatusBar') + '\nrenderStatusBar();';
+  new Function('uiCfg', 'telemetry', 'telemetryCfg', 'statusCol1', 'statusCol2', 'statusCol3',
+    'isConnected', 'controlMode', 'liveStats', 'throttleValue', 'steeringValue', 'applyCurve', src)(
+    uiCfg, telemetry, telemetryCfg, stub(1), stub(2), stub(3),
+    true, 'keyboard',
+    { downKbps: null, upKbps: null, fps: null, latencyMs: null, resW: null, resH: null },
+    0, 0, (v) => v);
+  return cols[3];
+}
+
+test('the status bar renders the FC link indicator with every toggle OFF', () => {
+  // The no-toggle rule, asserted by observing the rendered output rather than by
+  // pattern-matching the source. An operator must not be able to hide the one
+  // indicator that distinguishes a live vehicle from a silent one — on 2026-08-03
+  // MAVProxy wedged, picar streamed overrides into a dead socket for over an hour,
+  // and this screen looked healthy throughout.
+  const allOff = renderStatusBarWith({ uiCfg: {}, telemetry: { linkUp: false } });
+  assert.ok(allOff.includes('FC:'),
+    `the FC indicator must survive every toggle being off, got: ${JSON.stringify(allOff)}`);
+  assert.ok(allOff.includes('DOWN'), allOff);
+
+  // And it is still there when the toggles are all ON, alongside the rest.
+  const allOn = renderStatusBarWith({
+    uiCfg: { showThrottle: true, showSteering: true, showBattery: true,
+             showRadio: true, showRails: true },
+    telemetry: { linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: true,
+                 params: { verified: ['FRAME_CLASS'], missing: [], mismatched: {} },
+                 battery: { voltageV: 7.9, currentA: 0.4, remainingPct: 79, pctSource: 'voltage' } },
+  });
+  assert.ok(allOn.includes('FC: ok'), allOn);
+  assert.ok(allOn.includes('7.9V'), allOn);
+});
+
+test('the rendered bar surfaces unverified params, not just a live link', () => {
+  // End to end through the real render path: driver-reported param status reaches
+  // the operator's screen. Every earlier version of this coverage stopped at the
+  // formatter and so could not see whether anything called it.
+  const out = renderStatusBarWith({
+    uiCfg: {},
+    telemetry: { linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: true,
+                 params: { verified: [], missing: ['FRAME_CLASS'], mismatched: {} } },
+  });
+  assert.ok(out.includes('⚠'), `unverified params must reach the bar: ${out}`);
+  assert.ok(!out.includes('FC: ok'), out);
 });
