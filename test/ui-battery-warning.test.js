@@ -74,7 +74,27 @@ test('a voltage-derived percentage is marked with a leading tilde', () => {
     .includes('~'), 'a coulomb-counted percentage must NOT be marked as an estimate');
 });
 
-test('a missing battery entry renders the absent form', () => {
+test('a missing battery on a LIVE link warns — it is not an all-clear', () => {
+  // This test previously asserted the opposite, pinning the very defect the
+  // fail-closed work exists to remove. Mutation could not have saved it: it was
+  // asserting the bug. Something is talking (linkUp) and not reporting the pack.
   const f = loadFormatBattery();
-  assert.equal(f({ battery: null }, CFG), 'Batt: --');
+  const out = f({ battery: null, linkUp: true }, CFG);
+  assert.ok(out.includes('⚠'),
+    `a live link with no battery reading must warn (got: ${out})`);
+});
+
+test('a missing battery on a DOWN link does not warn', () => {
+  // The other side of the contract: a dropped link is a link fault, surfaced
+  // separately. Warning here would fire on every blip and make the flag useless.
+  const f = loadFormatBattery();
+  const out = f({ battery: null, linkUp: false }, CFG);
+  assert.equal(out, 'Batt: --', `a down link must not claim battery trouble (got: ${out})`);
+  assert.equal(f({ battery: null }, CFG), 'Batt: --', 'no link info means no claim');
+});
+
+test('the missing-battery warning respects the opt-out', () => {
+  const f = loadFormatBattery();
+  const off = { ...CFG, batteryWarnOnNoReading: false };
+  assert.equal(f({ battery: null, linkUp: true }, off), 'Batt: --');
 });

@@ -828,17 +828,30 @@ test('a close cancels the overlay timer chain', async () => {
   }
 });
 
-test('RADIO_STATUS 255 sentinels are reported as unknown, not as signal', () => {
-  // UINT8_MAX is "invalid" for these fields. Reporting 255 rendered as a plausible
-  // link quality and suppressed the Wi-Fi fallback, which IS measured.
+test('an all-invalid RADIO_STATUS reports NO radio, so the Wi-Fi fallback shows', () => {
+  // UINT8_MAX means "invalid" for these fields. Mapping them to null was not enough:
+  // the radio OBJECT stayed non-null, socket.html selects it by truthiness, and the
+  // bar rendered "Radio: null/null rem null" — which suppressed the Wi-Fi link
+  // quality, the one measurement that is actually real on this vehicle.
   const d = driver({ mavproxy_apply_param_overlay: false });
   d.parseIncoming(frameV1(MSG.RADIO_STATUS, radioStatusPayload({
     rssi: 255, remrssi: 255, noise: 255, remnoise: 255, rxerrors: 0, fixed: 0, txbuf: 100,
   })));
+  assert.equal(d.getTelemetry().radio, null,
+    'a frame with no usable signal level must not present itself as a radio link');
+});
+
+test('a partially valid RADIO_STATUS is still reported, with the invalid fields null', () => {
+  // Must not throw the baby out: a real SiK frame with a valid rssi but an
+  // unmeasured noise floor is still a genuine link report.
+  const d = driver({ mavproxy_apply_param_overlay: false });
+  d.parseIncoming(frameV1(MSG.RADIO_STATUS, radioStatusPayload({
+    rssi: 180, remrssi: 255, noise: 255, remnoise: 40, rxerrors: 2, fixed: 1, txbuf: 95,
+  })));
   const r = d.getTelemetry().radio;
-  assert.notEqual(r, null, 'the frame is still decoded');
-  assert.equal(r.rssi, null, '255 rssi must be unknown');
-  assert.equal(r.remRssi, null);
+  assert.notEqual(r, null, 'a usable rssi means a usable link report');
+  assert.equal(r.rssi, 180);
+  assert.equal(r.remRssi, null, '255 remrssi is unknown');
   assert.equal(r.noise, null);
-  assert.equal(r.remNoise, null);
+  assert.equal(r.remNoise, 40);
 });

@@ -636,7 +636,21 @@
     // each returns an explicit "--" when the source is absent or stale.
     function formatBattery() {
       const b = telemetry && telemetry.battery;
-      if (!b) return 'Batt: --';
+      if (!b) {
+        // Fail closed, matching batteryTrouble() on the server. A missing or stale
+        // battery entry while the LINK IS UP means something is talking and it is
+        // not telling us about the pack — a dead pack and a dead monitor look
+        // identical from here, and neither is an all-clear. A DOWN link is a
+        // different fault, surfaced separately, so it does not warn here.
+        //
+        // This is the third review round to catch this file as the missed half of
+        // the fail-closed fix: the server set the fleet status bit correctly while
+        // this bar rendered a bare "Batt: --", so the dashboard flagged trouble the
+        // operator looking at the vehicle could not see.
+        const linkUp = !!(telemetry && telemetry.linkUp);
+        const warnNoReading = telemetryCfg.batteryWarnOnNoReading !== false && linkUp;
+        return warnNoReading ? 'Batt: -- ⚠' : 'Batt: --';
+      }
       const parts = [];
       if (b.voltageV !== null && b.voltageV !== undefined) parts.push(`${b.voltageV.toFixed(1)}V`);
       // A leading ~ marks a percentage interpolated from voltage rather than

@@ -4,6 +4,8 @@
 // Uses proper MAVLink v1 framing with CRC
 
 const net = require('net');
+const { overlayChainMs, clampOverlayReassert, clampOverlayAttempts } =
+  require('./config-bounds');
 
 const MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE = 70;
 const RC_OVERRIDE_CRC_EXTRA = 124;
@@ -187,8 +189,15 @@ class PWMMavproxy {
       ? config.mavproxy_radio_system : null;
     this.overlayReassertTimer = null;
     this.overlayAttempts = 0;
-    this.overlayReassertMs = Math.max(3000, Number(config.mavproxy_overlay_reassert_ms) || 5000);
-    this.maxOverlayAttempts = Math.max(1, Number(config.mavproxy_overlay_max_attempts) || 4);
+    // Derived from the overlay's own schedule, then clamped at BOTH ends — see
+    // config-bounds.js. A lower bound alone let 1e400 (valid JSON) become Infinity,
+    // which Node turns into a 1 ms timer.
+    const chainMs = overlayChainMs(
+      Object.keys(this.paramOverlay || {}).length,
+      Object.keys(EXPECTED_CRITICAL_PARAMS).length);
+    this.overlayChainMs = chainMs;
+    this.overlayReassertMs  = clampOverlayReassert(config.mavproxy_overlay_reassert_ms, chainMs);
+    this.maxOverlayAttempts = clampOverlayAttempts(config.mavproxy_overlay_max_attempts);
 
     // Latest decoded telemetry. Each entry carries its own `at` timestamp so a
     // reader can tell a live reading from a stale one — reporting a last-known
@@ -950,9 +959,16 @@ class PWMMavproxy {
       // renders as a plausible-looking link quality when there is no measurement at
       // all — and it also suppressed the Wi-Fi fallback, which IS measured.
       const rssiOrNull = (v) => (v === 255 ? null : v);
+      const rssi    = rssiOrNull(payload.readUInt8(4));
+      const remRssi = rssiOrNull(payload.readUInt8(5));
+      // If neither end reports a signal level, this frame carries no link
+      // measurement. Keeping a non-null radio object made the UI select it purely by
+      // truthiness and render "Radio: null/null", which SUPPRESSED the Wi-Fi
+      // fallback — the one link quality that is actually measured here.
+      if (rssi === null && remRssi === null) { this.telemetry.radio = null; return; }
       this.telemetry.radio = {
-        rssi:     rssiOrNull(payload.readUInt8(4)),
-        remRssi:  rssiOrNull(payload.readUInt8(5)),
+        rssi,
+        remRssi,
         noise:    rssiOrNull(payload.readUInt8(7)),
         remNoise: rssiOrNull(payload.readUInt8(8)),
         rxErrors: payload.readUInt16LE(0),
