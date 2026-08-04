@@ -858,3 +858,74 @@ test('a partially valid RADIO_STATUS is still reported, with the invalid fields 
   assert.equal(r.noise, null);
   assert.equal(r.remNoise, 40);
 });
+
+// ── The two guards round 7 found uncovered ───────────────────────────────────
+
+// frameV1 hardcodes sysId 1 (the autopilot). The radio does not use sysId 1.
+function frameV1From(msg, payload, sysId, compId = 1) {
+  const buf = frameV1(msg, payload);
+  buf[3] = sysId;
+  buf[4] = compId;
+  // Reseal: changing a header byte invalidates the CRC, and a frame the parser
+  // rejects for a bad checksum would pass this test for entirely the wrong reason.
+  // That exact mistake was made four times on this branch.
+  let crc = PWMMavproxy.crc16(buf.subarray(1, 6 + payload.length), 5 + payload.length);
+  crc = PWMMavproxy.crcAccumulate(msg.crc, crc);
+  buf.writeUInt16LE(crc, 6 + payload.length);
+  return buf;
+}
+
+test('mavproxy_radio_system closes the RADIO_STATUS spoofing hole', () => {
+  // Surviving mutation: replace the source gate with `if (false)`. No test set
+  // mavproxy_radio_system, so the configurable half of a documented spoofing hole
+  // was entirely unverified — the config key could have been inert.
+  const pinned = driver({ mavproxy_radio_system: 51 });
+  pinned.parseIncoming(frameV1From(MSG.RADIO_STATUS,
+    radioStatusPayload({ rssi: 180, remrssi: 170, noise: 30, remnoise: 25 }), 51));
+  assert.ok(pinned.getTelemetry().radio, 'the configured radio sysId must be accepted');
+  assert.equal(pinned.getTelemetry().radio.rssi, 180);
+
+  const spoofed = driver({ mavproxy_radio_system: 51 });
+  spoofed.parseIncoming(frameV1From(MSG.RADIO_STATUS,
+    radioStatusPayload({ rssi: 10, remrssi: 10, noise: 200, remnoise: 200 }), 77));
+  assert.equal(spoofed.getTelemetry().radio, null,
+    'a CRC-valid RADIO_STATUS from any other sysId must be dropped once the radio ' +
+    'sysId is pinned — otherwise anything on the link can fake link quality and ' +
+    'suppress the Wi-Fi fallback');
+});
+
+test('an unpinned radio sysId still accepts the fitted radio', () => {
+  // The documented default, asserted so the hole cannot be closed by accident and
+  // silently break radio telemetry on a rover that has not set the key. SiK emits
+  // source system 51 (ASCII '3'), which is not the autopilot's sysId.
+  const d = driver();
+  d.parseIncoming(frameV1From(MSG.RADIO_STATUS,
+    radioStatusPayload({ rssi: 180, remrssi: 170, noise: 30, remnoise: 25 }), 51));
+  assert.ok(d.getTelemetry().radio, 'gating on target_system would drop all SiK telemetry');
+});
+
+test('every decoded message declares both a CRC_EXTRA and a payload length', () => {
+  // Surviving mutation: delete the load-time consistency check. Its own comment says
+  // the consequence is "a crash on the MAVLink receive path" — a field read past the
+  // end of an un-extended payload throws ERR_OUT_OF_RANGE inside the socket data
+  // handler, which is a process-level failure while the vehicle can move, not a
+  // dropped message. Nothing proved the check fires.
+  const { MSG_CRC_EXTRA, MSG_PAYLOAD_LEN } = PWMMavproxy;
+  assert.ok(MSG_CRC_EXTRA && Object.keys(MSG_CRC_EXTRA).length > 0, 'tables must be exported');
+  for (const id of Object.keys(MSG_CRC_EXTRA)) {
+    assert.notEqual(MSG_PAYLOAD_LEN[id], undefined,
+      `msgId ${id} has a CRC_EXTRA but no MSG_PAYLOAD_LEN, so its payload is never ` +
+      'zero-extended and a field read past its end crashes the receive path');
+  }
+});
+
+test('a maximally zero-trimmed frame of every known type never throws', () => {
+  // The property the load-time check protects, asserted directly. A real v2 sender
+  // trims trailing zero bytes, so a message whose fields are all zero arrives with a
+  // 1-byte payload; every handler must survive that.
+  for (const [name, msg] of Object.entries(MSG)) {
+    const d = driver();
+    assert.doesNotThrow(() => d.parseIncoming(frameV2(msg, Buffer.alloc(msg.len))),
+      `${name} (msgId ${msg.id}) threw on a fully zero-trimmed payload`);
+  }
+});

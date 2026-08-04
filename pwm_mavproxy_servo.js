@@ -1218,4 +1218,9 @@ module.exports = PWMMavproxy;
 // the copy had drifted to a different tree's contents.
 module.exports.EXPECTED_CRITICAL_PARAMS = EXPECTED_CRITICAL_PARAMS;
 module.exports.DEFAULT_PARAM_OVERLAY = DEFAULT_PARAM_OVERLAY;
+// Exported for the load-time consistency check's own test. Every decoded message
+// needs BOTH a CRC_EXTRA and a declared payload length; the throw above enforces it
+// at load, and nothing proved the throw fires.
+module.exports.MSG_CRC_EXTRA = MSG_CRC_EXTRA;
+module.exports.MSG_PAYLOAD_LEN = MSG_PAYLOAD_LEN;
 
