@@ -427,6 +427,9 @@
           <h3>Feedback</h3>
           <label><input type="checkbox" id="cfgThrottle"> Throttle</label>
           <label><input type="checkbox" id="cfgSteering"> Steering</label>
+          <label><input type="checkbox" id="cfgBattery"> Battery</label>
+          <label><input type="checkbox" id="cfgRadio"> Radio / link</label>
+          <label><input type="checkbox" id="cfgRails"> Board rails</label>
         </div>
       </div>
 
@@ -525,6 +528,9 @@
       showBtnRearDiff: false,
       showBtnLight:    true,
       showKeyboardHint:true,
+      showBattery:     true,
+      showRadio:       false,
+      showRails:       false,
     };
 
     let uiCfg = { ...CFG_DEFAULTS };
@@ -553,6 +559,9 @@
       cfgBtnRearDiff:  'showBtnRearDiff',
       cfgBtnLight:     'showBtnLight',
       cfgKeyboardHint: 'showKeyboardHint',
+      cfgBattery:      'showBattery',
+      cfgRadio:        'showRadio',
+      cfgRails:        'showRails',
     };
 
     function openConfig() {
@@ -590,6 +599,57 @@
 
     // ── Status bar ────────────────────────────────────────────────────────────
     let liveStats = { downKbps: null, upKbps: null, fps: null, latencyMs: null, resW: null, resH: null };
+    // Latest telemetry pushed by the server. null until the first message; each
+    // sub-object is null when that source is unavailable or its reading is stale,
+    // so the UI can show "--" rather than a last-known value dressed up as live.
+    let telemetry = null;
+    // Thresholds come from the server so the UI warns on the same rule the fleet
+    // status bit uses. Percentage alone is not usable: it is null unless
+    // BATT_CAPACITY is set on the flight controller.
+    let telemetryCfg = { batteryWarnLevel: 20, batteryWarnVolts: null, batteryWarnOnNoReading: true };
+    // When the last frame arrived, and how long a gap means "no longer live".
+    let telemetryAt = 0;
+    let telemetryStaleMs = 3000;
+
+    // Staleness is checked on a timer, not only cleared by the disconnect handler.
+    // Relying on the handler alone covers one of the two ways telemetry stops
+    // arriving: it catches a dropped socket and misses a socket that stays up while
+    // the server's publish loop dies. The second shape is worse than a blank bar,
+    // because the last frame carried linkUp:true — so the UI renders 'FC: ok' beside
+    // a plausible battery voltage for as long as the page stays open.
+    //
+    // To be accurate about which incident this does and does not cover: it is NOT the
+    // 2026-08-03 MAVProxy wedge. There, picar's publish loop kept running and kept
+    // emitting fresh frames whose heartbeat was stale, so 'FC: silent ⚠' is what
+    // covers that one. This covers picar's own loop or event loop dying, which is
+    // reachable today given the synchronous-work violations of invariant 9 still on
+    // main. An earlier version of this comment claimed the wedge outright and was
+    // wrong.
+    //
+    // Pure and argument-taking so it can be tested; the window is derived from the
+    // server's own publish interval so a deliberately slow rover does not blank its
+    // own bar.
+    function telemetryExpired(t, at, staleMs, now) {
+      return t !== null && (now - at) > staleMs;
+    }
+
+    // The rule above was pure and tested; its CALLER was an anonymous arrow inside a
+    // setInterval, and deleting that whole block left the suite green — so both
+    // reviewers were able to restore the original defect (a dead link rendering
+    // 'FC: ok' beside an hours-old voltage, permanently) with nothing turning red.
+    // A tested rule with an untestable caller is this branch's signature defect, and
+    // it appeared in the commit written to eliminate it. Named and argument-taking so
+    // the caller is a unit too.
+    function telemetryExpiryTick(now) {
+      if (!telemetryExpired(telemetry, telemetryAt, telemetryStaleMs, now)) return false;
+      telemetry = null;
+      renderStatusBar();
+      return true;
+    }
+
+    function startTelemetryExpiryWatch(setIntervalFn) {
+      return setIntervalFn(() => telemetryExpiryTick(Date.now()), 1000);
+    }
 
     function renderStatusBar() {
       // Column 1: connection + control mode
@@ -611,7 +671,145 @@
       const c3 = [];
       if (uiCfg.showThrottle) c3.push(`Thr: ${throttleValue.toFixed(2)}`);
       if (uiCfg.showSteering) c3.push(`Str: ${applyCurve(steeringValue).toFixed(2)}`);
+      if (uiCfg.showBattery)  c3.push(formatBattery());
+      if (uiCfg.showRadio)    c3.push(formatRadio());
+      if (uiCfg.showRails)    c3.push(formatRails());
+      // Always shown, not behind a uiCfg toggle: an operator must not be able to
+      // hide the one indicator that distinguishes a live vehicle from a silent one.
+      c3.push(formatFcLink());
       statusCol3.innerHTML = c3.join('<br>');
+    }
+
+
+    // ── Telemetry formatting ──────────────────────────────────────────────────
+    //
+    // Every one of these can legitimately be unavailable, and showing a stale or
+    // invented value on a vehicle status display is worse than showing nothing. So
+    // each returns an explicit "--" when the source is absent or stale.
+    function formatBattery() {
+      const b = telemetry && telemetry.battery;
+      if (!b) {
+        // Fail closed, matching batteryTrouble() on the server. A missing or stale
+        // battery entry while the LINK IS UP means something is talking and it is
+        // not telling us about the pack — a dead pack and a dead monitor look
+        // identical from here, and neither is an all-clear. A DOWN link is a
+        // different fault, surfaced separately, so it does not warn here.
+        //
+        // This is the third review round to catch this file as the missed half of
+        // the fail-closed fix: the server set the fleet status bit correctly while
+        // this bar rendered a bare "Batt: --", so the dashboard flagged trouble the
+        // operator looking at the vehicle could not see.
+        //
+        // See formatFcLink() for why "a down link is surfaced separately" is now
+        // actually true of this file — it was not when that justification was written.
+        const linkUp = !!(telemetry && telemetry.linkUp);
+        const warnNoReading = telemetryCfg.batteryWarnOnNoReading !== false && linkUp;
+        return warnNoReading ? 'Batt: -- ⚠' : 'Batt: --';
+      }
+      const parts = [];
+      if (b.voltageV !== null && b.voltageV !== undefined) parts.push(`${b.voltageV.toFixed(1)}V`);
+      // A leading ~ marks a percentage interpolated from voltage rather than
+      // coulomb-counted by the flight controller. It is not decoration: a
+      // voltage estimate sags under throttle, so an unmarked number would read as
+      // a fuel gauge and a hard acceleration would look like a failing pack.
+      if (b.remainingPct !== null && b.remainingPct !== undefined) {
+        parts.push(`${b.pctSource === 'voltage' ? '~' : ''}${b.remainingPct}%`);
+      }
+      if (b.currentA !== null && b.currentA !== undefined) parts.push(`${b.currentA.toFixed(1)}A`);
+      const text = parts.length ? parts.join(' ') : '--';
+      const lowPct = b.remainingPct !== null && b.remainingPct !== undefined
+        && b.remainingPct <= telemetryCfg.batteryWarnLevel;
+      const lowV = telemetryCfg.batteryWarnVolts !== null && b.voltageV !== null
+        && b.voltageV !== undefined && b.voltageV <= telemetryCfg.batteryWarnVolts;
+      // Fail closed here too, matching batteryTrouble() on the server. The fleet
+      // status bit already treated an unreadable monitor as trouble, but this bar
+      // did not, so the operator looking at the vehicle saw a bare "Batt: --" with
+      // no warning while the dashboard flagged it. A dead pack and a missing
+      // monitor look identical from here, and neither is an all-clear.
+      const noReading = telemetryCfg.batteryWarnOnNoReading !== false
+        && (b.remainingPct === null || b.remainingPct === undefined)
+        && (b.voltageV === null || b.voltageV === undefined);
+      const low = lowPct || lowV || noReading;
+      return low ? `Batt: ${text} ⚠` : `Batt: ${text}`;
+    }
+
+    // Board 5V rail and servo rail, from the flight controller's POWER_STATUS. A
+    // servo rail at 0 V means nothing can actuate even when everything else looks
+    // healthy, which is worth being able to see.
+    function formatRails() {
+      const p = telemetry && telemetry.power;
+      if (!p) return 'Rails: --';
+      return `Rails: ${p.boardV.toFixed(2)}V / ${p.servoV.toFixed(2)}V`;
+    }
+
+    // The flight-controller link, which had NO representation in the operator UI.
+    //
+    // That gap became concrete on 2026-08-03: MAVProxy wedged, picar streamed
+    // overrides into a dead socket for over an hour, and every indicator on this
+    // screen looked healthy — rails and battery simply read "--", which is
+    // indistinguishable from "not fitted". The dashboard showed a fault the operator
+    // could not see. A control station must be able to tell a live vehicle from a
+    // silent one.
+    //
+    // Two distinct states, because they fail differently:
+    //   linkUp false            — the TCP link to MAVProxy is down. picar knows.
+    //   awaitingAutopilot true  — link up, but the autopilot has never identified
+    //                             itself, so nothing has been confirmed by read-back.
+    function formatFcLink() {
+      if (!telemetry) return 'FC: --';
+      // A driver that has no flight controller at all is not a flight controller that
+      // has gone away. The four GPIO drivers report fcSupported:false and used to
+      // render a permanent 'FC: DOWN ⚠' — a standing warning about a link the vehicle
+      // was never built with, which trains the operator to ignore the indicator.
+      if (telemetry.fcSupported === false) return 'FC: n/a';
+      if (!telemetry.linkUp) return 'FC: DOWN ⚠';
+      if (telemetry.awaitingAutopilot) return 'FC: no autopilot ⚠';
+      if (telemetry.autopilotHeartbeat === false) return 'FC: silent ⚠';
+      // A live link and a live heartbeat are NOT the same thing as a configured
+      // vehicle, and this line said 'ok' for both. Invariant 7 requires read-back
+      // confirmation of every EXPECTED_CRITICAL_PARAMS entry before arming; the
+      // driver tracks exactly that and reports it here, and nothing rendered it.
+      //
+      // This is the incident this branch exists because of. FRAME_CLASS was being
+      // pushed as 2 (Boat) on a rover and "verified" back as the wrong value, and
+      // the status bar read 'FC: ok' throughout. The operator had no surface on
+      // which that was visible. Fail closed: if the driver did not tell us about
+      // params at all, that is not a pass either.
+      const p = telemetry.params;
+      if (!p) return 'FC: params unknown ⚠';
+      const mismatched = Object.keys(p.mismatched || {}).length;
+      if (mismatched) return `FC: ${mismatched} param mismatch ⚠`;
+      const missing = (p.missing || []).length;
+      if (missing) return `FC: ${missing} param unverified ⚠`;
+      return 'FC: ok';
+    }
+
+    function formatRadio() {
+      if (!telemetry) return 'Link: --';
+      // A SiK telemetry radio, if one is fitted. Distinct from the Wi-Fi link.
+      //
+      // Every field is checked individually rather than selecting the object by
+      // truthiness. The driver now drops a frame whose BOTH rssi fields are the 255
+      // "invalid" sentinel, but a partially valid frame legitimately survives with
+      // some fields null — and interpolating those printed the literal string
+      // "Radio: null/null rem 42" while still suppressing the Wi-Fi reading, which is
+      // the only measurement that is real on this vehicle. That was the same
+      // untouched-consumer defect for the fourth review round running, in this file.
+      const r = telemetry.radio;
+      const usable = r && (r.rssi !== null || r.remRssi !== null);
+      if (usable) {
+        const n = (v) => (v === null || v === undefined ? '--' : v);
+        return `Radio: ${n(r.rssi)}/${n(r.noise)} rem ${n(r.remRssi)}`;
+      }
+      // Otherwise report the Wi-Fi link that is actually carrying this session.
+      const w = telemetry.wifi;
+      if (w && (w.signalDbm !== null || w.qualityPct !== null)) {
+        const bits = [];
+        if (w.qualityPct !== null) bits.push(`${w.qualityPct}%`);
+        if (w.signalDbm !== null) bits.push(`${w.signalDbm}dBm`);
+        return `Link: ${bits.join(' ')}`;
+      }
+      return 'Link: --';
     }
 
     // ── Client-side stats ─────────────────────────────────────────────────────
@@ -1564,9 +1762,24 @@
     document.addEventListener('keyup', (e) => { delete keysDown[e.code]; });
 
     // ── Socket status ─────────────────────────────────────────────────────────
+    socket.on('telemetry', (t) => { telemetry = t; telemetryAt = Date.now(); renderStatusBar(); });
+    socket.on('telemetryConfig', (c) => {
+      telemetryCfg = { ...telemetryCfg, ...c };
+      // Three missed frames, floor 3 s. Derived from the server's real interval
+      // rather than hard-coded, because that key is operator-settable up to 60 s and
+      // a fixed window would blank the bar on a deliberately slow rover.
+      if (Number.isFinite(c.telemetryIntervalMs)) {
+        telemetryStaleMs = Math.max(3000, c.telemetryIntervalMs * 3);
+      }
+    });
+    startTelemetryExpiryWatch(setInterval);
     socket.on('connect',    () => { isConnected = true;  renderStatusBar(); });
     socket.on('disconnect', () => {
       isConnected = false;
+      // Clear telemetry too. No further messages arrive, so the server's staleness
+      // window cannot help: the bar would keep showing the last battery voltage
+      // indefinitely after the link dropped.
+      telemetry = null;
       // A dropped link means our commands are no longer reaching the vehicle, so
       // stop claiming to be armed. The operator must re-arm deliberately after a
       // reconnect rather than resuming the previous throttle.

@@ -58,6 +58,9 @@
       flex-shrink: 0;
     }
     .status-dot.online  { background: #2ecc71; box-shadow: 0 0 6px #2ecc71; }
+    .telemetry          { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; }
+    .tele               { font-size: 12px; color: #9aa; background: #1a1a1a;
+                          border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
     .status-dot.offline { background: #555; }
 
     .rover-ip { font-size: 12px; color: #666; margin-bottom: 10px; }
@@ -136,11 +139,49 @@
           return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
         });
 
+        const esc = (v) => String(v).replace(/[&<>"']/g,
+          (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
         grid.innerHTML = list.map(r => {
+          try {
           const state = r.online ? 'online' : 'offline';
           const flags = [];
           if (r.batteryTrouble) flags.push('<span class="flag battery">⚡ Battery</span>');
           if (r.notMobile)      flags.push('<span class="flag mobile">⚠ Not Mobile</span>');
+
+          // Telemetry is optional: a rover on older code sends none, and any
+          // individual reading can be unavailable. Render only what is present
+          // rather than showing a zero or a stale value as if it were live.
+          // Heartbeats are stored from an UNAUTHENTICATED POST, so every field here
+          // is untrusted input. Guard on Number.isFinite rather than != null: a
+          // string would pass a null-check and then throw on .toFixed inside
+          // list.map, which aborts the whole render and blanks the dashboard for
+          // every rover because of one bad entry.
+          const t = r.telemetry || {};
+          const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+          const tele = [];
+          const bv = num(t.batteryV), bp = num(t.batteryPct), ba = num(t.batteryA);
+          if (bv !== null) {
+            let b = `${bv.toFixed(1)}V`;
+            // A leading ~ marks a percentage interpolated from voltage rather than
+            // coulomb-counted by the flight controller, matching the rover UI. An
+            // estimate sags under load, so presenting it unmarked would read as a
+            // fuel gauge. Still routed through esc() — batteryPctSource arrives in
+            // the same unauthenticated heartbeat body as everything else here.
+            if (bp !== null) b += ` ${t.batteryPctSource === 'voltage' ? '~' : ''}${bp}%`;
+            if (ba !== null) b += ` ${ba.toFixed(1)}A`;
+            tele.push(`<span class="tele">🔋 ${esc(b)}</span>`);
+          }
+          const rr = num(t.radioRssi), wd = num(t.wifiDbm), wp = num(t.wifiPct);
+          if (rr !== null)      tele.push(`<span class="tele">📶 RSSI ${rr}</span>`);
+          else if (wd !== null) tele.push(`<span class="tele">📶 ${wd}dBm</span>`);
+          else if (wp !== null) tele.push(`<span class="tele">📶 ${wp}%</span>`);
+          const bd = num(t.boardV), sv = num(t.servoV);
+          if (bd !== null || sv !== null) {
+            tele.push(`<span class="tele">⚡ ${bd !== null ? bd.toFixed(2) : '--'}V / ` +
+                      `${sv !== null ? sv.toFixed(2) : '--'}V</span>`);
+          }
+          if (r.telemetry && t.linkUp === false) tele.push('<span class="tele">⛔ No FC link</span>');
 
           return `
             <div class="rover-card ${state}">
@@ -150,11 +191,17 @@
               </div>
               <div class="rover-ip">${r.ip}</div>
               <div class="flags">${flags.join('') || ''}</div>
+              <div class="telemetry">${tele.join('') || ''}</div>
               <a class="card-link ${r.online ? '' : 'disabled'}"
                  href="${r.controllerUrl}" target="_blank">
                 ${r.online ? '▶ Open Controller' : 'Offline'}
               </a>
             </div>`;
+          } catch (e) {
+            // One malformed rover entry must not take the whole dashboard down.
+            console.warn('skipping malformed rover entry', r && r.id, e);
+            return '';
+          }
         }).join('');
 
       } catch (e) {

@@ -17,6 +17,10 @@ const http = require('http');
 const os   = require('os');
 
 let _statusBits = 0x00;
+// Optional telemetry snapshot included in each heartbeat. The status BITMASK stays
+// authoritative for warnings so an older Fleet Manager keeps working unchanged;
+// this is purely additive detail for a newer dashboard to display.
+let _telemetry = null;
 
 const DISCOVERY_PORT_DEFAULT = 3000;
 const PROBE_TIMEOUT_MS       = 500;   // per-host probe timeout
@@ -34,6 +38,8 @@ function getLocalIp() {
   }
   return '127.0.0.1';
 }
+
+function setTelemetry(t) { _telemetry = t; }
 
 function setStatusBit(bit, value) {
   if (value) _statusBits |=  (1 << bit);
@@ -139,6 +145,7 @@ function start(config) {
       ip:        getLocalIp(),
       timestamp: Math.floor(Date.now() / 1000),
       status:    _statusBits,
+      telemetry: _telemetry,
     });
     try {
       const u = new URL('/api/heartbeat', base);
@@ -204,4 +211,4 @@ function start(config) {
     : `Fleet heartbeat: ${fleetUrl} rover_id=${roverId} every ${intervalMs / 1000}s`);
 }
 
-module.exports = { start, setStatusBit, SweepBackoff, MAX_SWEEP_BACKOFF_MS };
+module.exports = { start, setStatusBit, setTelemetry, SweepBackoff, MAX_SWEEP_BACKOFF_MS };

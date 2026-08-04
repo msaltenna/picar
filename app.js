@@ -35,7 +35,8 @@ console.log(`Rover ID: ${config.rover_id ?? 1}`);
 const PWMDriver = require('./pwm_servo');
 const pwm = PWMDriver(config);
 
-require('./fleetmgr-client').start(config);
+const fleetClient = require('./fleetmgr-client');
+fleetClient.start(config);
 
 const file = new static.Server();
 const options = {
@@ -77,7 +78,12 @@ const appServer = https.createServer(options, (req, res) => {
   const parsed = url.parse(req.url, true);
   if (parsed.pathname === '/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'OK', throttle: old_throttle, steering: old_steering }));
+    res.end(JSON.stringify({
+      status: 'OK',
+      throttle: old_throttle,
+      steering: old_steering,
+      telemetry: currentTelemetry(),
+    }));
   } else if (parsed.pathname === '/manifest.json') {
     const roverId = config.rover_id ?? 1;
     const manifest = {
@@ -124,11 +130,60 @@ let lastAction = null;
 const throttle_ramp_up   = 0;
 const throttle_ramp_down = 0;
 
+
+// ── Telemetry: battery, board power, radio link ───────────────────────────────
+//
+// Battery and board power come from the flight controller over MAVLink
+// (SYS_STATUS / POWER_STATUS). "Radio" has two possible sources and they are not
+// interchangeable:
+//   - RADIO_STATUS from a SiK telemetry radio. Absent on this platform unless one
+//     is fitted; the driver reports null rather than inventing a value.
+//   - The Wi-Fi link carrying the control connection, read from the kernel. This
+//     is the link that actually matters for teleoperation here, so it is reported
+//     separately and never conflated with the MAVLink radio.
+// The publish loop lives in telemetry-loop.js so its WIRING is testable, not just
+// its parts. app.js binds both HTTPS ports and the MAVProxy socket at require time,
+// so nothing declared here is reachable from a host test — and a round-7 review
+// proved what that costs: four mutations to this loop's body (clearing the Fleet
+// Manager battery bit, bypassing the interval clamp, making the /proc read
+// synchronous, deleting the broadcast) all left the suite green.
+//
+// telemetry_interval_ms is clamped at BOTH ends inside the loop. The key is
+// reachable through the untracked picar-cfg.local.json overlay, so a rover-local 0
+// or a typo would otherwise become setInterval(fn, 1) — measured at ~10% of a core
+// from the /proc read alone — and 1e400 is valid JSON that Node coerces to 1 ms.
+const { startTelemetryLoop, buildTelemetryWiring, batteryWarnCfgFrom,
+        batteryWarnabilityWarning } = require('./telemetry-loop');
+
+// Derived in ONE place, shared by the loop and by the config pushed to the UI, so
+// the operator's warning threshold and the fleet status bit cannot disagree.
+const batteryWarnCfg = batteryWarnCfgFrom(config);
+
+// The rule lives in telemetry-loop.js so it is testable; this is the one line that
+// applies it. Silence about an unwatchable pack reads as "pack healthy" when it means
+// "nothing is watching the pack", so it is said once, loudly, at startup.
+const warnability = batteryWarnabilityWarning(config, pwm.batteryRange);
+if (warnability) console.error(warnability);
+
+// One call, and every lambda it used to inline is now covered by
+// telemetry-loop.test.js. See buildTelemetryWiring() for the two mutations that
+// survived while those lambdas lived here.
+const telemetryLoop = startTelemetryLoop(
+  buildTelemetryWiring({ pwm, io, fleetClient, fs, config }));
+const currentTelemetry = telemetryLoop.current;
+
 io.on('connection', (socket) => {
   console.log('Control client connected');
 
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
+  socket.emit('telemetryConfig', { batteryWarnLevel:       batteryWarnCfg.warnLevel,
+    batteryWarnVolts:        batteryWarnCfg.warnVolts,
+    batteryWarnOnNoReading:  batteryWarnCfg.warnOnNoReading,
+    // The UI derives its staleness window from this rather than hard-coding one,
+    // so a deliberately slow rover does not blank its own status bar.
+    telemetryIntervalMs: telemetryLoop.intervalMs });
+  socket.emit('telemetry', currentTelemetry());
   if (typeof pwm.lightIsOn === 'function') socket.emit('lightState', { on: pwm.lightIsOn() });
 
   socket.on('arm', () => {
