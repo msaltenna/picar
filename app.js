@@ -192,7 +192,10 @@ io.on('connection', (socket) => {
 
   // Push stream config so the client sets up the right decoder
   socket.emit('streamConfig', stream.getStreamConfig());
-  socket.emit('telemetryConfig', { batteryWarnLevel, batteryWarnVolts, batteryWarnOnNoReading });
+  socket.emit('telemetryConfig', { batteryWarnLevel, batteryWarnVolts, batteryWarnOnNoReading,
+    // The UI derives its staleness window from this rather than hard-coding one,
+    // so a deliberately slow rover does not blank its own status bar.
+    telemetryIntervalMs: telemetryLoop.intervalMs });
   socket.emit('telemetry', currentTelemetry());
   if (typeof pwm.lightIsOn === 'function') socket.emit('lightState', { on: pwm.lightIsOn() });
 

@@ -254,3 +254,37 @@ test('the rendered bar surfaces unverified params, not just a live link', () => 
   assert.ok(out.includes('⚠'), `unverified params must reach the bar: ${out}`);
   assert.ok(!out.includes('FC: ok'), out);
 });
+
+// ── Telemetry staleness in the UI ────────────────────────────────────────────
+
+test('telemetry that stopped arriving expires instead of being shown as live', () => {
+  // Round 7 found that deleting `telemetry = null` from the disconnect handler
+  // survived the suite: the bar kept the last battery voltage indefinitely. Worse
+  // than blank — the last frame carried linkUp:true, so a dead UI rendered 'FC: ok'.
+  //
+  // The handler is still there, but it only covers a dropped socket. A socket that
+  // stays up while the server's publish loop dies is the 2026-08-03 wedge shape, and
+  // nothing covered it. This is the rule that does.
+  const start = html.indexOf('function telemetryExpired(');
+  assert.notEqual(start, -1, 'telemetryExpired() not found in socket.html — renamed?');
+  const src = html.slice(start, html.indexOf('\n    }', start) + 6);
+  const expired = new Function(`${src}; return telemetryExpired;`)();
+
+  const T = { linkUp: true, battery: { voltageV: 7.9 } };
+  assert.equal(expired(T, 10_000, 3000, 11_000), false, 'a fresh frame is live');
+  assert.equal(expired(T, 10_000, 3000, 13_000), false, 'exactly at the window is still live');
+  assert.equal(expired(T, 10_000, 3000, 13_001), true,
+    'past the window the frame must expire — a last-known value dressed up as live is ' +
+    'what made the wedge invisible');
+  assert.equal(expired(null, 0, 3000, 999_999), false,
+    'already-cleared telemetry must not re-trigger a render every second');
+});
+
+test('an expired bar reports no link and warns about the pack', () => {
+  // The consequence of expiry, through the real render path: not merely blank, but
+  // actively flagged. 'FC: --' and a battery warning are both honest; 'FC: ok' with a
+  // three-minute-old voltage is not.
+  const out = renderStatusBarWith({ uiCfg: { showBattery: true }, telemetry: null });
+  assert.ok(out.includes('FC: --'), `an expired bar must not claim a link: ${out}`);
+  assert.ok(out.includes('Batt: --'), out);
+});

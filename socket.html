@@ -607,6 +607,25 @@
     // status bit uses. Percentage alone is not usable: it is null unless
     // BATT_CAPACITY is set on the flight controller.
     let telemetryCfg = { batteryWarnLevel: 20, batteryWarnVolts: null, batteryWarnOnNoReading: true };
+    // When the last frame arrived, and how long a gap means "no longer live".
+    let telemetryAt = 0;
+    let telemetryStaleMs = 3000;
+
+    // Staleness is checked on a timer, not only cleared by the disconnect handler.
+    // Relying on the handler alone covers one of the two ways telemetry stops
+    // arriving: it catches a dropped socket and misses a socket that stays up while
+    // the server's publish loop dies. That second shape is exactly the 2026-08-03
+    // wedge, where picar streamed overrides into a dead MAVProxy socket for over an
+    // hour and this screen looked healthy — and it is worse than a blank bar,
+    // because the last frame carried linkUp:true, so a disconnected UI rendered
+    // 'FC: ok' next to a plausible battery voltage.
+    //
+    // Pure and argument-taking so it can be tested; the window is derived from the
+    // server's own publish interval so a deliberately slow rover does not blank its
+    // own bar.
+    function telemetryExpired(t, at, staleMs, now) {
+      return t !== null && (now - at) > staleMs;
+    }
 
     function renderStatusBar() {
       // Column 1: connection + control mode
@@ -1714,8 +1733,22 @@
     document.addEventListener('keyup', (e) => { delete keysDown[e.code]; });
 
     // ── Socket status ─────────────────────────────────────────────────────────
-    socket.on('telemetry', (t) => { telemetry = t; renderStatusBar(); });
-    socket.on('telemetryConfig', (c) => { telemetryCfg = { ...telemetryCfg, ...c }; });
+    socket.on('telemetry', (t) => { telemetry = t; telemetryAt = Date.now(); renderStatusBar(); });
+    socket.on('telemetryConfig', (c) => {
+      telemetryCfg = { ...telemetryCfg, ...c };
+      // Three missed frames, floor 3 s. Derived from the server's real interval
+      // rather than hard-coded, because that key is operator-settable up to 60 s and
+      // a fixed window would blank the bar on a deliberately slow rover.
+      if (Number.isFinite(c.telemetryIntervalMs)) {
+        telemetryStaleMs = Math.max(3000, c.telemetryIntervalMs * 3);
+      }
+    });
+    setInterval(() => {
+      if (telemetryExpired(telemetry, telemetryAt, telemetryStaleMs, Date.now())) {
+        telemetry = null;
+        renderStatusBar();
+      }
+    }, 1000);
     socket.on('connect',    () => { isConnected = true;  renderStatusBar(); });
     socket.on('disconnect', () => {
       isConnected = false;
