@@ -33,15 +33,26 @@ function clampTelemetryInterval(value) {
 // chain and firing PARAM_SET roughly every millisecond. The commit that introduced
 // it claimed the loop was "bounded" and "cannot spin"; a review reproduced both.
 
-// How long one full overlay attempt takes to complete, from its own schedule:
-// writes are spaced 250 ms, then a 500 ms settle, then read-backs every 150 ms.
-// Computed rather than assumed, because a larger overlay makes any fixed floor
-// wrong — the previous 3000 ms floor was already shorter than the real 3650 ms
-// chain, so a reassert could cancel the read-backs that would have confirmed it.
+// The overlay's schedule, OWNED HERE and imported by applyParamOverlay so the two
+// cannot drift. A previous version hand-copied these numbers into both files, and a
+// review proved the consequence: mutating the driver's real spacing from 250 ms to
+// 500 ms left the whole 166-test suite green while the actual chain grew past the
+// floor derived from the stale copy. "Derived from the schedule" has to mean the
+// same constants, not a transcription of them.
+const OVERLAY_WRITE_SPACING_MS = 250;
+const OVERLAY_SETTLE_MS        = 500;
+const OVERLAY_READ_SPACING_MS  = 150;
+
+// How long one full overlay attempt takes: writes spaced, then a settle, then
+// read-backs spaced. Computed rather than assumed, because a larger overlay makes
+// any fixed floor wrong — the original 3000 ms floor was already shorter than the
+// real 3650 ms chain, so a reassert cancelled the read-backs that would have
+// confirmed it.
 function overlayChainMs(entryCount, readCount) {
   const entries = Math.max(0, Number(entryCount) || 0);
   const reads   = Math.max(0, Number(readCount)  || 0);
-  return entries * 250 + 500 + Math.max(0, reads - 1) * 150;
+  return entries * OVERLAY_WRITE_SPACING_MS + OVERLAY_SETTLE_MS
+       + Math.max(0, reads - 1) * OVERLAY_READ_SPACING_MS;
 }
 
 // Reassert no sooner than a full chain plus time for the replies to come back, and
@@ -53,7 +64,15 @@ function clampOverlayReassert(value, chainMs) {
   const floor = Math.max(1000, Number(chainMs) || 0) + OVERLAY_RESPONSE_MARGIN_MS;
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return floor;
-  return Math.min(OVERLAY_REASSERT_MAX_MS, Math.max(floor, n));
+  // The ceiling must never drop below the floor. Applying a flat 60 s cap AFTER the
+  // floor meant that once the chain exceeded 60 s — reachable with a large custom
+  // mavproxy_param_overlay, which the untracked config can set with no review — every
+  // FINITE configured value collapsed to 60 000 ms, i.e. back inside the chain, and
+  // each reassert cancelled the writes and read-backs still in flight so no attempt
+  // ever completed. The inversion was the tell: an ABSENT value was safe (it returns
+  // the uncapped floor) while an explicit, sane 5000 was broken.
+  const ceiling = Math.max(OVERLAY_REASSERT_MAX_MS, floor);
+  return Math.min(ceiling, Math.max(floor, n));
 }
 
 // A small finite integer. Ten attempts is already far more than a healthy link
@@ -70,4 +89,5 @@ module.exports = {
   clampTelemetryInterval, TELEMETRY_INTERVAL_MIN_MS, TELEMETRY_INTERVAL_MAX_MS,
   overlayChainMs, clampOverlayReassert, clampOverlayAttempts,
   OVERLAY_REASSERT_MAX_MS, OVERLAY_ATTEMPTS_MAX,
+  OVERLAY_WRITE_SPACING_MS, OVERLAY_SETTLE_MS, OVERLAY_READ_SPACING_MS,
 };

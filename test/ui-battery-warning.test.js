@@ -98,3 +98,84 @@ test('the missing-battery warning respects the opt-out', () => {
   const off = { ...CFG, batteryWarnOnNoReading: false };
   assert.equal(f({ battery: null, linkUp: true }, off), 'Batt: --');
 });
+
+// ── The flight-controller link indicator ─────────────────────────────────────
+//
+// This existed nowhere in the operator UI until a review pointed out that the
+// justification "a down link is surfaced separately" was untrue of this file. The
+// gap became concrete on 2026-08-03: MAVProxy wedged, picar streamed overrides into
+// a dead socket for over an hour, and this screen looked healthy throughout — rails
+// and battery read "--", which is indistinguishable from "not fitted".
+
+function loadFn(name) {
+  const start = html.indexOf(`function ${name}()`);
+  assert.notEqual(start, -1, `${name}() not found in socket.html — renamed?`);
+  const end = html.indexOf('\n    }', start) + 6;
+  const src = html.slice(start, end);
+  return (telemetry, telemetryCfg) =>
+    new Function('telemetry', 'telemetryCfg', `${src}; return ${name}();`)(telemetry, telemetryCfg);
+}
+
+test('a down FC link is shown as a warning, not as a dash', () => {
+  const f = loadFn('formatFcLink');
+  const out = f({ linkUp: false }, CFG);
+  assert.ok(out.includes('DOWN') && out.includes('⚠'), `got: ${out}`);
+});
+
+test('a live link with no autopilot is distinguished from a healthy one', () => {
+  const f = loadFn('formatFcLink');
+  const awaiting = f({ linkUp: true, awaitingAutopilot: true }, CFG);
+  assert.ok(awaiting.includes('⚠'), `awaiting autopilot must warn: ${awaiting}`);
+
+  const silent = f({ linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: false }, CFG);
+  assert.ok(silent.includes('⚠'), `a silent autopilot must warn: ${silent}`);
+
+  const ok = f({ linkUp: true, awaitingAutopilot: false, autopilotHeartbeat: true }, CFG);
+  assert.ok(!ok.includes('⚠'), `a healthy link must not warn: ${ok}`);
+  assert.ok(ok.includes('ok'), ok);
+});
+
+test('a partially valid radio frame never renders the literal string null', () => {
+  // The driver drops a frame whose BOTH rssi fields are the 255 sentinel, but a
+  // partially valid frame survives with some fields null — and interpolating those
+  // printed "Radio: null/null rem 42" while still suppressing the Wi-Fi reading.
+  const f = loadFn('formatRadio');
+  const out = f({
+    radio: { rssi: null, remRssi: 42, noise: null, remNoise: null },
+    wifi: { qualityPct: 70, signalDbm: -61 },
+  }, CFG);
+  assert.ok(!out.includes('null'), `must not render the literal "null": ${out}`);
+  assert.ok(out.includes('42'), `must still report the measurement it does have: ${out}`);
+});
+
+test('a radio frame with no usable signal falls through to Wi-Fi', () => {
+  const f = loadFn('formatRadio');
+  const out = f({
+    radio: { rssi: null, remRssi: null, noise: null, remNoise: null },
+    wifi: { qualityPct: 70, signalDbm: -61 },
+  }, CFG);
+  assert.ok(!out.startsWith('Radio:'),
+    `no usable radio measurement must not suppress the Wi-Fi fallback: ${out}`);
+});
+
+test('the status bar actually renders the FC link indicator', () => {
+  // Pinning the WIRING. Testing formatFcLink() in isolation passes even if nothing
+  // calls it — removing its push from renderStatusBar survived the suite, which is
+  // the same mechanism-versus-wiring gap that has recurred across this branch.
+  //
+  // socket.html has no module boundary, so this asserts on the source of
+  // renderStatusBar. That is weaker than executing it and it can be defeated by a
+  // rename — but the alternative here is no coverage at all, and it does catch the
+  // deletion that actually happened.
+  const start = html.indexOf('function renderStatusBar()');
+  assert.notEqual(start, -1, 'renderStatusBar() not found — renamed?');
+  const body = html.slice(start, html.indexOf('\n    }', start));
+  assert.ok(body.includes('formatFcLink()'),
+    'renderStatusBar must render the FC link — an operator has to be able to tell a ' +
+    'live vehicle from a silent one');
+  // And it must not be hidden behind a uiCfg toggle: the one indicator that
+  // distinguishes a dead link from a healthy one should not be switchable off.
+  assert.ok(!/uiCfg\.\w+\s*&&\s*c3\.push\(formatFcLink/.test(body)
+         && !/if \(uiCfg\.\w+\)\s*c3\.push\(formatFcLink/.test(body),
+    'the FC link indicator must not be behind a uiCfg toggle');
+});

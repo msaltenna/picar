@@ -74,6 +74,60 @@ armed; and the CA and server private keys are committed to the repository. These
 
 Newest first.
 
+### 2026-08-03 — `feature/battery-and-radio-telemetry` — SIX review rounds, still unmerged
+
+Battery, board-power and radio telemetry, plus a voltage-derived battery percentage.
+Reviewed six times; every round found real defects, and several rounds found defects in the
+*previous round's fixes*. Suite 76 → 173. Recording the pattern because it is the most
+useful thing this branch produced.
+
+**Rounds 1–5 (Codex).** MAVLink v2 parsing and CRC validation, an invariant-6 fail-open where
+the param overlay could stay unapplied while the vehicle stayed drivable, a battery warning
+that cleared itself on a dead pack, a `sysId` gate that broke real SiK telemetry, `compId`
+never checked so any component could forge parameter verification, unknown-frame lengths
+trusted, `1e400` collapsing a retry into a 1 ms storm, and CRC tests that verified themselves.
+
+**Round 6 (Fable 5, because Codex ran out of credits.)** Verbatim: *"Your workspace is out of
+credits. Ask your workspace owner to refill in order to continue."* Under `CLAUDE.md` that is a
+permitted fallback condition. Note the fallback model was **changed from Opus 5 to Fable 5 on
+operator instruction**, which is strictly stronger: the original restriction on the fallback
+existed because Opus reviewing Opus is the same model family checking its own work, and Fable
+is not. It found four findings Codex's five rounds had not:
+
+- **The 60 s reassert cap defeated the derived floor.** `Math.min(MAX, Math.max(floor, n))`
+  applies the cap *after* the floor, so once the overlay chain exceeded 60 s — reachable with
+  a large custom overlay, which the untracked config can set — every finite configured value
+  collapsed back *inside* the chain and no reassert attempt could ever complete. The tell was
+  an inversion: an **absent** value was safe while an explicit, sane `5000` was broken.
+- **The floor was derived from a *transcription* of the schedule, not the schedule.**
+  `config-bounds.js` and `applyParamOverlay` each held their own copies of 250/500/150.
+  Mutating the driver's real spacing left all 166 tests green while the actual chain grew past
+  the floor. "Derived from the overlay's own schedule" was therefore overstated. The constants
+  are now owned in one place and imported.
+- **`formatRadio` still rendered the literal string `null`** for a *partially* valid frame,
+  and still suppressed the Wi-Fi reading. The all-invalid case had been fixed; the partial case
+  shipped the same defect. **Fourth consecutive round in which `socket.html` was the missed
+  half of a driver fix.**
+- **"A down link is surfaced separately" was untrue of `socket.html`.** `linkUp` appeared
+  nowhere except inside `formatBattery`. Nothing in the operator UI showed flight-controller
+  link state at all — which is exactly how the MAVProxy wedge earlier the same day went
+  unnoticed for over an hour while every indicator on screen looked healthy. There is now an
+  always-visible `FC:` indicator distinguishing down, no-autopilot, silent and ok. It is
+  deliberately **not** behind a `uiCfg` toggle.
+
+**Two of my own tests then survived mutation** and had to be fixed: the bounds test only
+exercised the default 9-entry overlay, so it could not see the cap defect at all; and nothing
+asserted the status bar *renders* the new indicator, only that the function worked in
+isolation. Same mechanism-versus-wiring gap that recurred all branch.
+
+**Still open, explicitly not fixed here:** arming is ungated (invariant 7) and the overlay
+reasserts `FRAME_CLASS=2`. Both are equally true of `main`, so neither blocks — but the
+reviewer's observation is worth keeping: this branch's retry machinery now asserts that wrong
+frame class *more* reliably than before, so the healthier this code gets, the more firmly the
+`FRAME_CLASS` P0 is entrenched. Fix it soon.
+
+**Not yet validated on rover3 at this SHA, and not yet Codex-reviewed at this SHA.**
+
 ### 2026-07-31 — `feature/battery-and-radio-telemetry` — VALIDATED, NOT MERGED
 
 Battery, board-power and radio/link telemetry, surfaced in the controller UI, on

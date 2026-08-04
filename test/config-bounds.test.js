@@ -146,3 +146,44 @@ test('the driver actually uses these bounds, not its own arithmetic', () => {
   assert.ok(Number.isInteger(d.maxOverlayAttempts) && d.maxOverlayAttempts <= OVERLAY_ATTEMPTS_MAX,
     `attempts must be a small finite integer, got ${d.maxOverlayAttempts}`);
 });
+
+test('the ceiling never drops below the floor, however large the chain', () => {
+  // The defect a review found in the first version of this clamp: a flat 60 s cap
+  // applied AFTER the floor meant that once the chain exceeded 60 s — reachable with
+  // a large custom mavproxy_param_overlay, which the untracked config can set with no
+  // review — every FINITE configured value collapsed to 60 000 ms, back INSIDE the
+  // chain, so each reassert cancelled the writes and read-backs still in flight and
+  // no attempt ever completed.
+  //
+  // The inversion was the giveaway: an ABSENT value was safe, because it returns the
+  // uncapped floor, while an explicit and perfectly sane 5000 was broken. Any test
+  // that only exercises the default 9-entry overlay cannot see this — the previous
+  // one didn't, which is why the mutation survived.
+  for (const entries of [235, 300, 1000]) {
+    const chain = overlayChainMs(entries, 7);
+    assert.ok(chain > OVERLAY_REASSERT_MAX_MS,
+      `precondition: ${entries} entries must exceed the cap (chain ${chain})`);
+    for (const cfg of [5000, 60000, 1, undefined, Infinity, 1e400]) {
+      const got = clampOverlayReassert(cfg, chain);
+      assert.ok(got > chain,
+        `${entries} entries, cfg ${cfg}: got ${got}, inside the ${chain} ms chain`);
+      assert.ok(Number.isFinite(got), `${cfg} produced a non-finite delay`);
+    }
+  }
+});
+
+test('the floor is tied to the schedule the driver actually uses', () => {
+  // Not a transcription of it. A review mutated the driver's real write spacing from
+  // 250 ms to 500 ms and the entire suite stayed green, because config-bounds held its
+  // own private copy of the number — so "derived from the overlay's own schedule" was
+  // false. The constants are now owned here and imported by applyParamOverlay.
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'pwm_mavproxy_servo.js'), 'utf8');
+  for (const name of ['OVERLAY_WRITE_SPACING_MS', 'OVERLAY_SETTLE_MS', 'OVERLAY_READ_SPACING_MS']) {
+    assert.ok(src.includes(name),
+      `applyParamOverlay must use the shared ${name}, not a literal of its own`);
+  }
+  // And no bare literals left in the schedule itself.
+  assert.ok(!/\}, index \* 250\)/.test(src), 'a hard-coded 250 ms write spacing remains');
+  assert.ok(!/index \* 150\)/.test(src),     'a hard-coded 150 ms read spacing remains');
+});

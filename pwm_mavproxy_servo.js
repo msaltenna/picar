@@ -4,8 +4,11 @@
 // Uses proper MAVLink v1 framing with CRC
 
 const net = require('net');
-const { overlayChainMs, clampOverlayReassert, clampOverlayAttempts } =
-  require('./config-bounds');
+const {
+  overlayChainMs, clampOverlayReassert, clampOverlayAttempts,
+  // The schedule below is driven by these, shared with the bound that depends on it.
+  OVERLAY_WRITE_SPACING_MS, OVERLAY_SETTLE_MS, OVERLAY_READ_SPACING_MS,
+} = require('./config-bounds');
 
 const MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE = 70;
 const RC_OVERRIDE_CRC_EXTRA = 124;
@@ -597,17 +600,17 @@ class PWMMavproxy {
           console.error(`MAVProxy: WARNING PARAM_SET ${name}=${value} was NOT written — ` +
             `the link went down mid-overlay. Treat every critical parameter as unverified.`);
         }
-      }, index * 250));
+      }, index * OVERLAY_WRITE_SPACING_MS));
     });
 
     // After all writes, read back critical params and warn loudly if
     // anything doesn't match. This catches the "steering also drives
     // throttle" class of failure on a fresh board.
-    const writeWindowMs = entries.length * 250 + 500;
+    const writeWindowMs = entries.length * OVERLAY_WRITE_SPACING_MS + OVERLAY_SETTLE_MS;
     Object.keys(EXPECTED_CRITICAL_PARAMS).forEach((name, index) => {
       this.overlayTimers.push(setTimeout(() => {
         this.sendPacket(this.buildParamRequestRead(name));
-      }, writeWindowMs + index * 150));
+      }, writeWindowMs + index * OVERLAY_READ_SPACING_MS));
     });
   }
 

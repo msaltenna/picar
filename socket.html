@@ -625,6 +625,9 @@
       if (uiCfg.showBattery)  c3.push(formatBattery());
       if (uiCfg.showRadio)    c3.push(formatRadio());
       if (uiCfg.showRails)    c3.push(formatRails());
+      // Always shown, not behind a uiCfg toggle: an operator must not be able to
+      // hide the one indicator that distinguishes a live vehicle from a silent one.
+      c3.push(formatFcLink());
       statusCol3.innerHTML = c3.join('<br>');
     }
 
@@ -647,6 +650,9 @@
         // the fail-closed fix: the server set the fleet status bit correctly while
         // this bar rendered a bare "Batt: --", so the dashboard flagged trouble the
         // operator looking at the vehicle could not see.
+        //
+        // See formatFcLink() for why "a down link is surfaced separately" is now
+        // actually true of this file — it was not when that justification was written.
         const linkUp = !!(telemetry && telemetry.linkUp);
         const warnNoReading = telemetryCfg.batteryWarnOnNoReading !== false && linkUp;
         return warnNoReading ? 'Batt: -- ⚠' : 'Batt: --';
@@ -687,12 +693,43 @@
       return `Rails: ${p.boardV.toFixed(2)}V / ${p.servoV.toFixed(2)}V`;
     }
 
+    // The flight-controller link, which had NO representation in the operator UI.
+    //
+    // That gap became concrete on 2026-08-03: MAVProxy wedged, picar streamed
+    // overrides into a dead socket for over an hour, and every indicator on this
+    // screen looked healthy — rails and battery simply read "--", which is
+    // indistinguishable from "not fitted". The dashboard showed a fault the operator
+    // could not see. A control station must be able to tell a live vehicle from a
+    // silent one.
+    //
+    // Two distinct states, because they fail differently:
+    //   linkUp false            — the TCP link to MAVProxy is down. picar knows.
+    //   awaitingAutopilot true  — link up, but the autopilot has never identified
+    //                             itself, so nothing has been confirmed by read-back.
+    function formatFcLink() {
+      if (!telemetry) return 'FC: --';
+      if (!telemetry.linkUp) return 'FC: DOWN ⚠';
+      if (telemetry.awaitingAutopilot) return 'FC: no autopilot ⚠';
+      if (telemetry.autopilotHeartbeat === false) return 'FC: silent ⚠';
+      return 'FC: ok';
+    }
+
     function formatRadio() {
       if (!telemetry) return 'Link: --';
       // A SiK telemetry radio, if one is fitted. Distinct from the Wi-Fi link.
-      if (telemetry.radio) {
-        return `Radio: ${telemetry.radio.rssi}/${telemetry.radio.noise} ` +
-               `rem ${telemetry.radio.remRssi}`;
+      //
+      // Every field is checked individually rather than selecting the object by
+      // truthiness. The driver now drops a frame whose BOTH rssi fields are the 255
+      // "invalid" sentinel, but a partially valid frame legitimately survives with
+      // some fields null — and interpolating those printed the literal string
+      // "Radio: null/null rem 42" while still suppressing the Wi-Fi reading, which is
+      // the only measurement that is real on this vehicle. That was the same
+      // untouched-consumer defect for the fourth review round running, in this file.
+      const r = telemetry.radio;
+      const usable = r && (r.rssi !== null || r.remRssi !== null);
+      if (usable) {
+        const n = (v) => (v === null || v === undefined ? '--' : v);
+        return `Radio: ${n(r.rssi)}/${n(r.noise)} rem ${n(r.remRssi)}`;
       }
       // Otherwise report the Wi-Fi link that is actually carrying this session.
       const w = telemetry.wifi;
