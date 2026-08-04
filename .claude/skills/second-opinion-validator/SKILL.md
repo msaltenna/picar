@@ -59,18 +59,28 @@ Opus, isolated context, read-only). Give it the base ref and what the change cla
 derives the diff itself. It runs with **no access to this conversation**, deliberately: a
 reviewer that inherits the author's reasoning inherits the author's blind spots.
 
-#### The fallback does NOT clear a safety-invariant change
+#### The fallback MAY clear a safety-invariant change (operator decision, 2026-08-04)
 
-If the change touches any of the ten safety invariants in `CLAUDE.md`, the fallback review
-**runs and its findings must be addressed, but it does not authorise a merge to `main`.** That
-change waits for Codex.
+This section previously said the opposite: a change touching any of the ten safety invariants had
+its merge held for Codex, on the grounds that the alternative — waiting for credits — was
+achievable, unlike the evidence-commit exemption's. **The operator overrode that on 2026-08-04.**
+A fallback review now clears the stage for every change, invariant-touching included. `CLAUDE.md`
+carries the same rule; if these two files ever disagree about it again, that is a defect to fix
+before shipping anything, not a discrepancy to interpret.
 
-This is deliberate and it follows `CLAUDE.md`'s own stated standard for accepting a weakening:
-the evidence-commit exemption is accepted because its alternative is *unachievable*. Here the
-alternative is *wait for Codex credits* — entirely achievable, with no deadline and no flight
-battery connected. So a same-model-family review may clear hygiene, performance, and
-documentation work, which is where the stalling actually hurts; it may not put safety-path code
-on a vehicle.
+The old reasoning is outranked, not refuted. A same-model-family reviewer really does inherit the
+author's blind spots, and eight review rounds on `feature/battery-and-radio-telemetry`
+demonstrated it — every round found real defects in the previous round's fixes, including two
+commit messages that asserted mutations were dead when they were not. So the mitigation shifts
+from delay to **disclosure and reviewer diversity**:
+
+- Record the reviewer in the commit trailer (`Reviewed-by: opus-fallback`). That trailer is the
+  only durable record; prose in `HANDOFF.md` is rewritten by every later change.
+- When Codex cannot run and the change touches an invariant, **also obtain a review from a
+  different model family** and record it with a `Red-teamed-by:` trailer. Convergence between two
+  families is evidence; agreement inside one is not. There is no `/red-team` skill on `main` yet —
+  spawn the reviewer directly.
+- Say in the report that the primary reviewer was weaker than intended.
 
 For everything else, a fallback review clears the stage normally.
 

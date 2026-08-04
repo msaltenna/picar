@@ -27,8 +27,9 @@ is not obvious from the code.
 > standard, not a description of `main`** — see the table at the end of this section for which
 > ones actually hold today.
 >
-> `main` *does* have a `test/` suite (`npm test` → 46 tests) — that is a separate thing from the
-> archived branch's suite, and an earlier revision of this file wrongly said `main` had neither.
+> `main` *does* have a `test/` suite (`npm test` → 237 tests as of 2026-08-04) — that is a separate
+> thing from the archived branch's suite, and an earlier revision of this file wrongly said `main`
+> had neither.
 > **Do not cherry-pick the heartbeat filter out of the archive without its v2 parser**, and do
 > not drop `control-safety.js` onto `main`'s driver, which has no `getSafetyStatus()` for its
 > `typeof` guard to find. Both traps are written up in `TASKS.md`.
@@ -37,9 +38,14 @@ is not obvious from the code.
 ArduPilot. Verified on rover3: **Compute Module 4 Rev 1.1**, Debian 13 (trixie), Node
 v20.19.2. Do not assume Pi 5 behavior or Node 22 APIs; the fleet is not homogeneous, so check the
 target. (`README.md` claimed Pi 5 / Bookworm / Node 18 until 2026-08-03; it is now correct.)
-The vehicle profile is **ArduRover**, which means `FRAME_CLASS=1` — but note the code currently
-pushes `FRAME_CLASS: 2` (Boat) on every connect and "verifies" that wrong value back; all three
-sites are listed as a P0 in `TASKS.md`. The
+The vehicle profile is **ArduRover**, which means `FRAME_CLASS=1`. The overlay pushed `2` (Boat)
+until 2026-08-04 while `EXPECTED_CRITICAL_PARAMS` expected `2` as well, so read-back confirmed the
+wrong value and reported the vehicle verified — rover3 really was running as a boat. Fixed at all
+three sites, and measured on target: the autopilot's HEARTBEAT `MAV_TYPE` moved `11 SURFACE_BOAT`
+→ `10 GROUND_ROVER` with **no power-cycle**, so this parameter takes effect live on Rover (an
+earlier revision of `TASKS.md` claimed a reboot was required; it was wrong). A test now asserts
+every `EXPECTED_CRITICAL_PARAMS` entry matches what the overlay pushes, because the two tables
+drifting apart is what turned read-back into a rubber stamp. The
 long-term direction is a custom software stack on the same Pixhawk 6C mini hardware.
 **A custom flight controller is out of scope.** Do not add speculative multirotor or
 alternate-airframe plumbing until an airframe exists — abstract when needed, not before.
@@ -79,21 +85,40 @@ app.js ──────────────────────── 
 `picar-cfg.local.json` (holds per-rover `rover_id`). Never commit machine-specific values
 to the tracked config.
 
-**Tests:** `npm test` (`node --test`) runs on `main` and passes — 46 tests across
-`test/drivetrain-safety.test.js` (15) and `test/video-latency.test.js` (31). **Verify by running
-it rather than trusting this paragraph** — it has been wrong before, and a reviewer who believes
-there is no suite skips mutation testing, which is the highest-value check available here. A
-separate, smaller 24-test suite exists on the archived branch; it is not a superset of `main`'s.
+**Tests:** `npm test` (`node --test test/*.test.js`) runs on `main` and passes — **237 tests** as
+of 2026-08-04, up from 46 before the telemetry work merged. **Verify by running it rather than
+trusting this paragraph** — it has been wrong before, and a reviewer who believes there is no suite
+skips mutation testing, which is the highest-value check available here. A separate, smaller
+24-test suite exists on the archived branch; it is not a superset of `main`'s.
 
-**Green does not mean covered.** A 23-mutation pass on 2026-08-03 found **8 survivors** — the
-input watchdog can be deleted outright, and `failSafeStop` can be reverted to the DISARM-before-
-neutral pattern, without turning the suite red. The cause is that **`app.js` has no test file at
-all**, so every Socket.IO handler is unverified. Four existing tests are provably vacuous. Details
-and the full list are in `TASKS.md`; mutation-test anything you touch rather than trusting a pass.
+Note the explicit path in the test script. `node --test` with no argument recurses the whole tree
+and executes every `.js` under `test/`, which would run the **on-target** scripts as unit tests —
+on a rover that means arming the vehicle and tripping fail-safes as a side effect of `npm test`.
+Use `npm run test:on-target` for those, deliberately, on a rover you intend to drive.
 
-These are host-side unit tests; necessary and not sufficient — see Validation. There is still
-**no** `test/on-target/` suite (`TASKS.md`), which makes the Embedded Validator's own checklist
-unsatisfiable as written.
+**Green does not mean covered.** This is the single most load-bearing paragraph in this file, and
+the evidence for it keeps growing. A 23-mutation pass on 2026-08-03 found **8 survivors**: the
+input watchdog could be deleted outright and `failSafeStop` reverted to the DISARM-before-neutral
+pattern without turning the suite red. A second pass on 2026-08-04, against a branch with 222
+passing tests, found **8 more** — including a hardwired-false fleet battery-trouble bit, a
+synchronous `/proc` read on the control event loop, and a deleted telemetry broadcast.
+
+Across eight review rounds, **nine tests were caught being unable to fail.** The variants are worth
+knowing, because they recur: asserting on *source text* (satisfied by an import line, or defeated by
+adding braces); asserting the behaviour of the *stub the test installed*; tampering with a MAVLink
+frame *without resealing its CRC*, so the parser rejects it for the wrong reason; never reaching the
+branch the test names; and one that asserted the defect outright, pinning it. Two commit messages
+claimed mutations were dead when they were not.
+
+The dominant shape has a name: **a correct rule with an untouched consumer.** Extracting a rule to
+make it testable does nothing for its call site, and three times on one branch the call site was
+where the defect lived. `app.js` still has **no test file**, so its remaining wiring is unverified
+that way. **Mutation-test anything you touch rather than trusting a pass**, and treat a HANG as
+distinct from a failure — a leaked timer makes `node --test` hang, and a hang looks like a pass.
+
+These are host-side unit tests; necessary and not sufficient — see Validation. `test/on-target/`
+now exists (`video-drop.sh`, `telemetry.sh`, `control-e2e.js`) but does not yet cover every item on
+the Embedded Validator's checklist; the gap is tracked in `TASKS.md`.
 
 **No CI runs any of this.** The two `.github/workflows/` files only invoke Claude review, and the
 last five merges were local merge commits, so neither the suite nor the review has ever run
@@ -205,12 +230,19 @@ afterwards.
    The permitted fallback conditions are enumerated in
    `.claude/skills/second-opinion-validator/SKILL.md`, which is the single authority for them —
    default-deny, and a timeout is not one of them.
-   Two hard limits. **The bright line is information, not exit status:** once you have seen any
+   One hard limit. **The bright line is information, not exit status:** once you have seen any
    Codex finding for a diff, the fallback is unavailable for that diff however Codex terminated.
-   And **the fallback does not clear a change touching the ten safety invariants** — it runs,
-   its findings must be addressed, but the merge waits for Codex. Opus reviewing Opus is the
-   same model family checking its own work, and unlike the evidence-commit exemption below, the
-   alternative here (wait for credits) is achievable. Record which reviewer ran.
+   **Operator decision, 2026-08-04: the fallback CAN authorise a merge, including for a change
+   touching the ten safety invariants.** This file previously held the merge for Codex in that
+   case. It no longer does. The reasoning behind the old rule still stands on its own terms —
+   Opus reviewing Opus is the same model family checking its own work — so the mitigation is
+   disclosure rather than delay: record which reviewer ran in the commit trailer, and when Codex
+   cannot run on an invariant-touching change, **obtain a second review from a reviewer of a
+   different model family** — spawn one directly (Fable 5 served this role for
+   `feature/battery-and-radio-telemetry`) and record it with a `Red-teamed-by:` trailer.
+   Convergence between two families is evidence; agreement inside one is not. There is no
+   `/red-team` skill on `main`; a branch adding one exists and is tracked in `TASKS.md`, so until
+   it merges this is a step you perform, not a skill you invoke.
 4. **DevOps Engineer** — owns all git operations. One focused branch and one focused commit
    per feature or fix. Deploys the branch to the rover over SSH.
 5. **Embedded Validator** — proves the change works **on the rover**. Only this stage can
