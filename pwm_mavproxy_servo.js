@@ -106,7 +106,12 @@ const DEFAULT_PARAM_OVERLAY = {
   SERVO4_FUNCTION: 1,  // RC passthrough: front diff on RC4
   SERVO5_FUNCTION: 1,  // RC passthrough: rear diff on RC5
   SERVO6_FUNCTION: 1,  // RC passthrough: light module on RC6
-  FRAME_CLASS: 2,      // Rover (must be set or steering/throttle outputs are wrong)
+  // ArduRover FRAME_CLASS: 0=Undefined, 1=Rover, 2=Boat, 3=BalanceBot. This pushed
+  // 2 (Boat) while the comment claimed "Rover", and EXPECTED_CRITICAL_PARAMS below
+  // expected 2 as well — so the read-back dutifully confirmed the wrong value and
+  // reported the vehicle verified. A wrong expectation is worse than no expectation:
+  // it converts the verification step into a rubber stamp.
+  FRAME_CLASS: 1,      // Rover (must be set or steering/throttle outputs are wrong)
   AHRS_GPS_USE: 0,     // no GPS installed
   GPS1_TYPE: 0         // no GPS installed
 };
@@ -121,7 +126,7 @@ const EXPECTED_CRITICAL_PARAMS = {
   SERVO4_FUNCTION: 1,
   SERVO5_FUNCTION: 1,
   SERVO6_FUNCTION: 1,
-  FRAME_CLASS: 2,
+  FRAME_CLASS: 1,
   RC_OVERRIDE_TIME: 0.2
 };
 
@@ -1094,7 +1099,7 @@ class PWMMavproxy {
           console.error(
             `MAVProxy: WARNING ${name}=${actual} on flight controller ` +
             `but expected ${expected}. Outputs will be miswired ` +
-            `(e.g. steering will drive throttle). Check FRAME_CLASS=2 (Rover) ` +
+            `(e.g. steering will drive throttle). Check FRAME_CLASS=1 (Rover) ` +
             `and that the firmware is ArduRover, then power-cycle.`
           );
         } else {

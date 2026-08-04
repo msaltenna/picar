@@ -263,3 +263,33 @@ test('the driver actually applies the sanitizer to its own overlay config', () =
     mavproxy_param_overlay: { FRAME_CLASS: 1, JUNK: 'x' } });
   assert.deepEqual(d2.paramOverlay, { FRAME_CLASS: 1 });
 });
+
+// ── The overlay and the expectation must agree, and must say Rover ────────────
+
+test('every verified expectation matches what the overlay actually pushes', () => {
+  // The read-back exists to catch a flight controller that silently rejected
+  // PARAM_SET. If EXPECTED_CRITICAL_PARAMS disagrees with DEFAULT_PARAM_OVERLAY the
+  // check inverts: it reports a correctly-applied parameter as a mismatch, or —
+  // what actually happened — both tables agree on a WRONG value and the read-back
+  // rubber-stamps it.
+  const PWMMavproxy = require('../pwm_mavproxy_servo.js');
+  const overlay  = PWMMavproxy.DEFAULT_PARAM_OVERLAY;
+  const expected = PWMMavproxy.EXPECTED_CRITICAL_PARAMS;
+  for (const [name, want] of Object.entries(expected)) {
+    assert.ok(name in overlay,
+      `${name} is verified but never pushed — the read-back can only ever confirm ` +
+      'whatever the flight controller already held');
+    assert.equal(overlay[name], want,
+      `${name}: the overlay pushes ${overlay[name]} but the read-back expects ${want}`);
+  }
+});
+
+test('FRAME_CLASS is 1 (Rover), not 2 (Boat)', () => {
+  // ArduRover FRAME_CLASS: 0=Undefined, 1=Rover, 2=Boat, 3=BalanceBot. The vehicle
+  // profile is ArduRover. Pushing 2 configured every rover as a boat, and because
+  // the expectation was also 2, telemetry reported params verified and the status
+  // bar read 'FC: ok' throughout.
+  const PWMMavproxy = require('../pwm_mavproxy_servo.js');
+  assert.equal(PWMMavproxy.DEFAULT_PARAM_OVERLAY.FRAME_CLASS, 1);
+  assert.equal(PWMMavproxy.EXPECTED_CRITICAL_PARAMS.FRAME_CLASS, 1);
+});
