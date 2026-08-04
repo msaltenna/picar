@@ -92,6 +92,88 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-04 — Embedded Validator PASS for `ca44537fbc5fba66b5ce31271f18699e76ccae97`
+
+`feature/battery-and-radio-telemetry`, validated live on rover3 (Compute Module 4 Rev 1.1,
+Debian 13 trixie, Node v20.19.2). Deployed by git bundle over SSH — `origin` was deliberately
+not touched. Deployed SHA confirmed equal to the branch tip with a clean tree before the run.
+
+**1. Services.** `picar`, `mavproxy`, `mediamtx` all active, `NRestarts=0` for each.
+
+**2. Journal and parameter read-back.** `Received first Pixhawk heartbeat (sys=1 MAVLink 2)`,
+`PARAM_SET FRAME_CLASS=1` → `verified FRAME_CLASS=1`, `parameter overlay confirmed by
+read-back`, all **8/8** `EXPECTED_CRITICAL_PARAMS` verified with `missing: []` and
+`mismatched: {}`. None of the new overlay failure messages appeared (no REJECTED entry, no
+EMPTY overlay, no DISABLED overlay, no unconfirmed overlay).
+
+**3. The FRAME_CLASS reboot question is SETTLED, by measurement.** The two round-8 reviewers
+disagreed on whether ArduRover's `FRAME_CLASS` is `@RebootRequired`; an earlier revision of
+`TASKS.md` asserted it was, with no source. Decoded from MAVProxy's live tlog, the autopilot's
+own HEARTBEAT `MAV_TYPE`:
+
+| Time | MAV_TYPE |
+| --- | --- |
+| 15:29:43 – 17:15:02 (continuous) | **11 SURFACE_BOAT** |
+| 17:15:20 onward | **10 GROUND_ROVER** |
+
+The transition is exactly when the overlay pushed `FRAME_CLASS=1`. **No power-cycle occurred** —
+`mavproxy.service` has been up since Aug 03 23:27:53 and only `picar.service` restarted. So it
+takes effect live, the reviewer who checked ArduPilot's source was right, and this repo's earlier
+claim was wrong. It also proves the defect was real and live: rover3 had been running as a
+**boat**.
+
+**4. MAVLink wire verification.** Bidirectional traffic decoded from the tlog:
+`RC_CHANNELS_OVERRIDE` outbound from picar (sysId 255, 1434 frames in a 300 KB window), and
+inbound from the autopilot (sysId 1) `SYS_STATUS`, `POWER_STATUS`, `SERVO_OUTPUT_RAW`,
+`ATTITUDE`, `VFR_HUD`, `RC_CHANNELS` at 288 frames each.
+
+**5. Invariant 6 verified on the wire, not in call order.** Every one of **12** DISARM packets
+in the window was preceded by a *neutral* `RC_CHANNELS_OVERRIDE` packet (steer 1500, throttle
+1500) 1.0–2.3 ms earlier. This is the check a mock cannot perform: `setServoPWM` only mutates the
+channel buffer, so a setter followed by `disarm()` would put DISARM on the link first and neutral
+on the next 20 Hz tick.
+
+**6. Control surface end-to-end** (`npm run test:on-target`). Socket.IO handlers driven on
+target: a joining socket receives `streamConfig`, `telemetryConfig` (carrying
+`telemetryIntervalMs: 1000`) and a first `telemetry` frame; `arm`; 12 `fromclient` commands;
+`setDrivetrain` rejecting `'low'`, `0`, `0.5`, `null` and an empty request, then applying
+`shift: 1` through the interlock; `disarm`; the input watchdog firing on its own after 1000 ms of
+silence; `setLight` on/off. Journal confirms `### FAIL-SAFE STOP (operator stop) neutral=true
+disarm=true` and `### FAIL-SAFE STOP (no input for 1000 ms) neutral=true disarm=true`.
+
+**7. Telemetry readings.** Battery 7.95–7.97 V, 82 % marked as voltage-derived (`pctSource:
+"voltage"`), board rail 5.163 V, servo rail 6.017 V, Wi-Fi 61–63 %, `radio: null` (correct — no
+SiK radio fitted). Battery `ageMs` differs between consecutive frames, so the reading is live
+rather than a repeated snapshot.
+
+**8. No regressions.** `npm test` 236/236 on the rover and on the dev host.
+
+#### What this PASS does NOT cover — read before merging
+
+- **No mechanical actuation was observed or implied.** rover3 has no flight battery connected;
+  motors and servos cannot move. Throttle was held at 0 for the entire run. Everything above
+  validates the command path up to and including the flight controller's response.
+- **The rendered browser UI was not driven.** No Chrome browser was connected to the session, so
+  the WebUI requirement was met at the Socket.IO protocol level instead. The UI's own formatting
+  logic is covered by host tests that execute the real functions out of `socket.html`, but nothing
+  clicked a real button in a real browser.
+- **The flight controller remains ARMED after a DISARM.** `base_mode=0xc1` with the armed bit
+  set, immediately after DISARM packets went out in the correct order. This is the existing P0
+  "DISARM does not disarm this flight controller", unchanged and unaffected by this branch — the
+  packets are correct and the FC ignores them. It is why nothing here should be read as "the
+  vehicle can be stopped".
+- **`npm test` on a rover WITH a battery would have driven the vehicle** until `ca44537`. The
+  on-target e2e script landed under `test/`, where `node --test` executed it as a unit test. Fixed
+  in `ca44537`; worth knowing because it was live for two commits on this branch.
+
+#### Rover3 state at the end of this session
+
+Left on `feature/battery-and-radio-telemetry` @ `ca44537`, clean tree, all three services active
+and enabled — **not** on `main`, because the branch cannot merge until Codex reviews it. The
+Pixhawk now holds `FRAME_CLASS=1`. Note that deploying `main` to rover3 would push `FRAME_CLASS=2`
+back and return it to reporting as a boat. `picar-cfg.local.json` was preserved untouched
+throughout.
+
 ### 2026-08-04 — Battery/radio telemetry hardened through review rounds 4-8 (branch, unmerged)
 
 Branch `feature/battery-and-radio-telemetry`. **Not merged, and it cannot be merged on the

@@ -455,6 +455,12 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   review the branch has had. Every round found real defects in the previous round's fixes,
   including nine tests that could not fail and two commit messages that claimed mutations were
   dead when they were not.
+  **Embedded Validator PASS recorded for `ca44537fbc5fba66b5ce31271f18699e76ccae97`** on rover3,
+  2026-08-04 — services, journal, 8/8 param read-back, bidirectional MAVLink, invariant 6 verified
+  on the wire for 12/12 DISARM packets, control surface end-to-end, 236/236 on target. Full
+  evidence and its explicit limits are in `HANDOFF.md`. The `FRAME_CLASS` reboot question was
+  settled by measurement in that run: `MAV_TYPE` moved 11 SURFACE_BOAT → 10 GROUND_ROVER with no
+  power-cycle. **If any further commit lands on this branch, that PASS no longer attests it.**
   Also outstanding for this branch: `app.js`'s three one-line call sites
   (`buildTelemetryWiring(...)`, `startTelemetryLoop(...)`, the startup warnability
   `console.error`) survive their mutations because `app.js` has no test file — see that entry.
