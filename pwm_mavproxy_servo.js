@@ -8,6 +8,7 @@ const {
   overlayChainMs, clampOverlayReassert, clampOverlayAttempts,
   // The schedule below is driven by these, shared with the bound that depends on it.
   OVERLAY_WRITE_SPACING_MS, OVERLAY_SETTLE_MS, OVERLAY_READ_SPACING_MS,
+  sanitizeParamOverlay,
 } = require('./config-bounds');
 
 const MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE = 70;
@@ -147,8 +148,32 @@ class PWMMavproxy {
     this.target_system = config.mavproxy_target_system || 1;
     this.target_component = config.mavproxy_target_component || 1;
 
-    this.paramOverlay = config.mavproxy_param_overlay || DEFAULT_PARAM_OVERLAY;
+    // Validated, not trusted: this key is reachable from untracked
+    // picar-cfg.local.json, so a typo here silently disables the overlay that
+    // corrects FRAME_CLASS. See sanitizeParamOverlay() for the two shapes that
+    // did exactly that.
+    const overlayCheck = sanitizeParamOverlay(config.mavproxy_param_overlay, DEFAULT_PARAM_OVERLAY);
+    this.paramOverlay = overlayCheck.overlay;
+    for (const bad of overlayCheck.rejected) {
+      console.error(`MAVProxy: REJECTED mavproxy_param_overlay entry — ${bad}`);
+    }
+    if (overlayCheck.rejected.length && overlayCheck.usedFallback) {
+      console.error('MAVProxy: falling back to the built-in critical-parameter overlay');
+    }
+    if (Object.keys(this.paramOverlay).length === 0) {
+      console.error('MAVProxy: mavproxy_param_overlay is EMPTY — NO critical parameters ' +
+                    'will be pushed, and every read-back will confirm whatever the flight ' +
+                    'controller already holds');
+    }
+
     this.applyParamOverlayOnConnect = config.mavproxy_apply_param_overlay !== false;
+    // Loud on purpose. Turning this off leaves FRAME_CLASS and the SERVOn_FUNCTION
+    // map at whatever is already flashed, and the only evidence used to be its
+    // absence from the log.
+    if (!this.applyParamOverlayOnConnect) {
+      console.error('MAVProxy: mavproxy_apply_param_overlay=false — the critical-parameter ' +
+                    'overlay is DISABLED; parameters will be neither written nor verified');
+    }
 
     this.seq = 0;
 
@@ -1185,7 +1210,7 @@ module.exports = PWMMavproxy;
 // Exported so tests can read the REAL list rather than transcribing it. A test that
 // hard-coded a fallback copy was silently always using the copy, because
 // require(...).EXPECTED_CRITICAL_PARAMS on a module-scoped const is undefined — and
-// nothing would have caught the copy drifting away from the real list.
+// the copy had drifted to a different tree's contents.
 module.exports.EXPECTED_CRITICAL_PARAMS = EXPECTED_CRITICAL_PARAMS;
 module.exports.DEFAULT_PARAM_OVERLAY = DEFAULT_PARAM_OVERLAY;
 

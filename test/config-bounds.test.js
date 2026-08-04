@@ -77,7 +77,8 @@ test('a non-numeric string does not become a hot loop', () => {
 // the 20 Hz override stream and the fail-safe watchdog.
 
 const { overlayChainMs, clampOverlayReassert, clampOverlayAttempts,
-        OVERLAY_REASSERT_MAX_MS, OVERLAY_ATTEMPTS_MAX } = require('../config-bounds.js');
+        OVERLAY_REASSERT_MAX_MS, OVERLAY_ATTEMPTS_MAX, sanitizeParamOverlay
+} = require('../config-bounds.js');
 
 test('the chain duration matches the overlay schedule it is derived from', () => {
   // writes 250 ms apart, 500 ms settle, read-backs 150 ms apart. With the default
@@ -213,4 +214,52 @@ test('the floor is tied to the schedule the driver actually SCHEDULES', () => {
   assert.ok(d.overlayReassertMs > lastScheduled,
     `the reassert fires at ${d.overlayReassertMs} ms, before the chain's last work at ` +
     `${lastScheduled} ms, so it cancels the read-backs that would confirm the attempt`);
+});
+
+// ── Parameter-overlay shape validation (F4) ──────────────────────────────────
+
+test('a non-object param overlay falls back instead of silently pushing nothing', () => {
+  // `[]` is truthy, so `config.mavproxy_param_overlay || DEFAULT` accepted it and
+  // Object.entries([]) is empty: the overlay pushed NOTHING, FRAME_CLASS was never
+  // corrected, and every read-back "verified" whatever the FC already held.
+  for (const bad of [[], 'FRAME_CLASS=1', 42, true]) {
+    const r = sanitizeParamOverlay(bad, { FRAME_CLASS: 1 });
+    assert.equal(r.usedFallback, true, `${JSON.stringify(bad)} must not be accepted`);
+    assert.deepEqual(r.overlay, { FRAME_CLASS: 1 });
+    assert.equal(r.rejected.length, 1, 'and it must be reported, not dropped silently');
+  }
+});
+
+test('a non-numeric overlay value is dropped rather than reaching writeFloatLE', () => {
+  // An unhandled throw inside the overlay's setTimeout is an uncaught exception in
+  // a timer, which takes the process down — while the vehicle may be armed.
+  const r = sanitizeParamOverlay(
+    { FRAME_CLASS: 1, SERVO1_FUNCTION: 'seventy', SERVO3_FUNCTION: null, BAD: NaN, ALSO: Infinity },
+    { FRAME_CLASS: 99 });
+  assert.deepEqual(r.overlay, { FRAME_CLASS: 1 }, 'only finite numbers survive');
+  assert.equal(r.usedFallback, false, 'a partially valid object is not a whole-overlay failure');
+  assert.equal(r.rejected.length, 4);
+  assert.ok(r.rejected.some((m) => m.includes('SERVO1_FUNCTION')), r.rejected.join('; '));
+});
+
+test('a numeric string is rejected, not coerced', () => {
+  // Coercing would hide a real config error and there is no upside: the tracked
+  // config uses numbers, so a string only ever arrives from a hand-edited overlay.
+  const r = sanitizeParamOverlay({ FRAME_CLASS: '1' }, { FRAME_CLASS: 1 });
+  assert.deepEqual(r.overlay, {});
+  assert.equal(r.rejected.length, 1);
+});
+
+test('the driver actually applies the sanitizer to its own overlay config', () => {
+  // The consumer, not just the helper — this branch's recurring defect is a
+  // correct rule with an untouched caller.
+  const PWMMavproxy = require('../pwm_mavproxy_servo.js');
+  const d = new PWMMavproxy({ mavproxy_autostart: false, mavproxy_param_overlay: [] });
+  assert.notDeepEqual(d.paramOverlay, [], 'an array overlay reached the driver intact');
+  assert.ok(Object.keys(d.paramOverlay).length > 0,
+    'the driver kept an empty overlay, so it would push no critical params at all');
+
+  const d2 = new PWMMavproxy({ mavproxy_autostart: false,
+    mavproxy_param_overlay: { FRAME_CLASS: 1, JUNK: 'x' } });
+  assert.deepEqual(d2.paramOverlay, { FRAME_CLASS: 1 });
 });

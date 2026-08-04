@@ -85,7 +85,46 @@ function clampOverlayAttempts(value) {
   return Math.min(OVERLAY_ATTEMPTS_MAX, Math.max(1, Math.round(n)));
 }
 
+// ── Parameter-overlay shape validation ────────────────────────────────────────
+//
+// The overlay is reachable from untracked picar-cfg.local.json, so its VALUE is
+// operator-supplied and its SHAPE was never checked. Two concrete failures:
+//
+//   mavproxy_param_overlay: []      -> truthy, so it replaced the defaults, and
+//                                      Object.entries([]) is empty. The overlay
+//                                      silently pushed nothing, FRAME_CLASS was
+//                                      never corrected, and every read-back
+//                                      "verified" whatever the FC already held.
+//   mavproxy_param_overlay: "x"     -> Object.entries('x') yields ['0','x'], and
+//                                      buf.writeFloatLE(NaN...) is fine but the
+//                                      name padding throws inside a setTimeout —
+//                                      an uncaught exception in a timer, which
+//                                      takes the process down WHILE ARMED.
+//
+// So coerce to a plain object of finite numbers and report everything dropped.
+// Rejecting loudly beats a config typo disabling the safety overlay in silence.
+function sanitizeParamOverlay(value, fallback) {
+  const rejected = [];
+  if (value === undefined || value === null) {
+    return { overlay: { ...fallback }, rejected, usedFallback: true };
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    rejected.push(`whole overlay is ${Array.isArray(value) ? 'an array' : `a ${typeof value}`}, not an object`);
+    return { overlay: { ...fallback }, rejected, usedFallback: true };
+  }
+  const overlay = {};
+  for (const [name, raw] of Object.entries(value)) {
+    const n = typeof raw === 'number' ? raw : NaN; // a numeric STRING is a config
+                                                   // error worth surfacing, not
+                                                   // something to quietly coerce
+    if (!Number.isFinite(n)) { rejected.push(`${name}=${JSON.stringify(raw)}`); continue; }
+    overlay[name] = n;
+  }
+  return { overlay, rejected, usedFallback: false };
+}
+
 module.exports = {
+  sanitizeParamOverlay,
   clampTelemetryInterval, TELEMETRY_INTERVAL_MIN_MS, TELEMETRY_INTERVAL_MAX_MS,
   overlayChainMs, clampOverlayReassert, clampOverlayAttempts,
   OVERLAY_REASSERT_MAX_MS, OVERLAY_ATTEMPTS_MAX,
