@@ -20,19 +20,26 @@ is not obvious from the code.
 ## Platform state (read this before touching anything)
 
 > **Read this first.** The safety layer described below — `control-safety.js`,
-> `client-control-safety.js`, the `test/` suite, and the arm-gating in
-> `pwm_mavproxy_servo.js` — is **not on `main`**. It exists only on the unmerged branch
-> the archived branch `origin/archive/control-failsafe-2026-07-30`, which is shelved and not
-> scheduled. On `main`, `app.js` arms the vehicle from any socket with no
-> lease, token, sequence, or staleness check. Validating and merging that branch is the
-> platform's top priority (`TASKS.md`, P0). Until it lands, the invariants below are the
-> **required standard**, not a description of `main`.
+> `client-control-safety.js`, and the arm-gating in `pwm_mavproxy_servo.js` — is **not on
+> `main`**. It exists only on `origin/archive/control-failsafe-2026-07-30`, which is shelved and
+> not scheduled. On `main`, `app.js:133` arms the vehicle from any socket with no lease, token,
+> sequence, or staleness check. Until that is closed, the invariants below are the **required
+> standard, not a description of `main`** — see the table at the end of this section for which
+> ones actually hold today.
+>
+> `main` *does* have a `test/` suite (`npm test` → 46 tests) — that is a separate thing from the
+> archived branch's suite, and an earlier revision of this file wrongly said `main` had neither.
+> **Do not cherry-pick the heartbeat filter out of the archive without its v2 parser**, and do
+> not drop `control-safety.js` onto `main`'s driver, which has no `getSafetyStatus()` for its
+> `typeof` guard to find. Both traps are written up in `TASKS.md`.
 
 **Vehicle:** Raspberry Pi companion computer + **Pixhawk 6C mini** flight controller running
 ArduPilot. Verified on rover3: **Compute Module 4 Rev 1.1**, Debian 13 (trixie), Node
-v20.19.2 — *not* the Pi 5 / Node 18 that `README.md` still claims. Do not assume Pi 5
-behavior or Node 22 APIs; the fleet is not homogeneous, so check the target.
-Today the vehicle profile is **ArduRover** (`FRAME_CLASS=1`). The
+v20.19.2. Do not assume Pi 5 behavior or Node 22 APIs; the fleet is not homogeneous, so check the
+target. (`README.md` claimed Pi 5 / Bookworm / Node 18 until 2026-08-03; it is now correct.)
+The vehicle profile is **ArduRover**, which means `FRAME_CLASS=1` — but note the code currently
+pushes `FRAME_CLASS: 2` (Boat) on every connect and "verifies" that wrong value back; all three
+sites are listed as a P0 in `TASKS.md`. The
 long-term direction is a custom software stack on the same Pixhawk 6C mini hardware.
 **A custom flight controller is out of scope.** Do not add speculative multirotor or
 alternate-airframe plumbing until an airframe exists — abstract when needed, not before.
@@ -43,8 +50,8 @@ alternate-airframe plumbing until an airframe exists — abstract when needed, n
 browser (socket.html)
   │  HTTPS + Socket.IO :8443           ┌─ /status, /manifest.json, static
   ▼                                    │
-app.js ── control-safety.js ── pwm_servo.js ─► pwm_mavproxy_servo.js
-  │         (safety lease)               (driver select)   │ TCP :5760 (MAVLink v1 out)
+app.js ──────────────────────── pwm_servo.js ─► pwm_mavproxy_servo.js
+  │   (no lease on main — see above)    (driver select)   │ TCP :5760 (MAVLink v1 out)
   │                                                        ▼
   │                                              mavproxy.service ── /dev/ttyACM0
   │                                                        ▼
@@ -57,10 +64,10 @@ app.js ── control-safety.js ── pwm_servo.js ─► pwm_mavproxy_servo.js
 
 | File | Responsibility |
 | --- | --- |
-| `app.js` | HTTPS servers (:8443 UI/control, :8081 stream), Socket.IO wiring, shutdown |
-| `control-safety.js` | Single-owner control lease, replay/staleness rejection, watchdog, fail-safe |
-| `client-control-safety.js` | Browser-side lease: token + monotonic seq + `sentAt` envelope |
-| `pwm_servo.js` | Driver selection; auto-overrides `pwm_method` by detected Pi model |
+| `app.js` | HTTPS servers (:8443 UI/control, :8081 stream), Socket.IO wiring, `failSafeStop`, input watchdog, `setDrivetrain` transaction, shutdown |
+| `control-safety.js` | **Not on `main`** — archive branch only. Single-owner lease, replay/staleness rejection, watchdog |
+| `client-control-safety.js` | **Not on `main`** — archive branch only. Browser-side lease envelope |
+| `pwm_servo.js` | Driver selection; auto-overrides `pwm_method` by detected Pi model (fails to detect the CM4) |
 | `pwm_mavproxy_servo.js` | MAVLink v1 framing, RC_CHANNELS_OVERRIDE @20 Hz, param overlay + read-back verification, arm/disarm |
 | `streams/` | Pluggable video: `webrtc` (MediaMTX, default), `h264` (WebCodecs), `mjpeg` |
 | `fleetmgr-client.js` | `/24` unicast sweep auto-discovery + heartbeat to Fleet Manager |
@@ -72,12 +79,25 @@ app.js ── control-safety.js ── pwm_servo.js ─► pwm_mavproxy_servo.js
 `picar-cfg.local.json` (holds per-rover `rover_id`). Never commit machine-specific values
 to the tracked config.
 
-**Tests:** `npm test` (`node --test`) runs on `main` and passes. **Verify by running it rather
-than trusting this paragraph** — it has been wrong before, and a reviewer who believes there is
-no suite skips mutation testing, which is the highest-value check available here. A larger but
-unmerged suite also exists on the archived `origin/archive/control-failsafe-2026-07-30`. These
-are host-side unit and source-wiring tests; necessary and not sufficient — see Validation.
-There is still **no** `test/on-target/` suite (`TASKS.md`).
+**Tests:** `npm test` (`node --test`) runs on `main` and passes — 46 tests across
+`test/drivetrain-safety.test.js` (15) and `test/video-latency.test.js` (31). **Verify by running
+it rather than trusting this paragraph** — it has been wrong before, and a reviewer who believes
+there is no suite skips mutation testing, which is the highest-value check available here. A
+separate, smaller 24-test suite exists on the archived branch; it is not a superset of `main`'s.
+
+**Green does not mean covered.** A 23-mutation pass on 2026-08-03 found **8 survivors** — the
+input watchdog can be deleted outright, and `failSafeStop` can be reverted to the DISARM-before-
+neutral pattern, without turning the suite red. The cause is that **`app.js` has no test file at
+all**, so every Socket.IO handler is unverified. Four existing tests are provably vacuous. Details
+and the full list are in `TASKS.md`; mutation-test anything you touch rather than trusting a pass.
+
+These are host-side unit tests; necessary and not sufficient — see Validation. There is still
+**no** `test/on-target/` suite (`TASKS.md`), which makes the Embedded Validator's own checklist
+unsatisfiable as written.
+
+**No CI runs any of this.** The two `.github/workflows/` files only invoke Claude review, and the
+last five merges were local merge commits, so neither the suite nor the review has ever run
+automatically.
 
 ---
 
@@ -111,16 +131,22 @@ requires an explicit written justification in the commit body and Second Opinion
    buffer; it transmits nothing. Calling a setter and then `disarm()` sends DISARM first and
    neutral on the next 20 Hz tick — the opposite of the intended order. Assert packet order,
    not method-call order: a mock that records calls cannot see this defect.
-7. **No arming without verified hardware.** `isSafetyReady()` requires a live TCP link, an
-   autopilot HEARTBEAT (autopilot != 8), and read-back confirmation of every entry in
-   `EXPECTED_CRITICAL_PARAMS`.
-8. **Safety-relevant configuration cannot be overridden off-branch.** `app.js` shallow-
+7. **No arming without verified hardware.** Arming must require a live TCP link, an autopilot
+   HEARTBEAT (autopilot != 8, correct sysId), and read-back confirmation of every entry in
+   `EXPECTED_CRITICAL_PARAMS`. The `isSafetyReady()` / `getSafetyStatus()` accessors this needs
+   **do not exist on `main`** — only `EXPECTED_CRITICAL_PARAMS` does, and nothing gates on it.
+   Worse, `arm()` sends the `21196` force magic, which tells ArduPilot to skip *its own* pre-arm
+   checks — so `main` has no gate and disables the hardware's. Both are P0s in `TASKS.md`.
+8. **Safety-relevant configuration cannot be overridden off-branch.** `app.js:24-32` shallow-
    merges untracked `picar-cfg.local.json` over the tracked config, so *any* key can be
    changed on a rover with no branch, diff, review, or validation record. Only per-rover
-   identity belongs there. `mavproxy_allow_unverified_arm` and every `max_command_*` /
-   `*_timeout_ms` value must be false/at their tracked values in the **effective** config,
-   not merely the tracked one — the overlay must whitelist what it is allowed to override,
-   and validation must check the effective config, not the file in git.
+   identity belongs there. The overlay must whitelist what it may override, and validation must
+   check the **effective** config, not the file in git. Note the keys an earlier revision named
+   here — `mavproxy_allow_unverified_arm`, `max_command_age_ms`,
+   `max_command_future_skew_ms` — **do not exist anywhere on `main`**; they belong to the
+   archived branch. The keys that exist and matter today are `input_timeout_ms`,
+   `drivetrain_settle_ms` and `mavproxy_rate_hz`, which are enough to disable the watchdog or
+   stall the override loop.
 9. **Never block the event loop while the vehicle can move.** The watchdog is a
    `setTimeout`. Synchronous work — `execSync`, `readFileSync` on a hot path, an unbounded
    loop — freezes the fail-safe. Treat any new synchronous call in a request/socket handler
@@ -128,6 +154,25 @@ requires an explicit written justification in the commit body and Second Opinion
 10. **A driver that cannot honour a command reports it.** Silent `return false` from a
     setter is not acceptable on the motion path; the caller must be able to distinguish
     "applied" from "dropped".
+
+### Which of these actually hold on `main` today
+
+Verified against `main` @ `4580209` on 2026-08-03. **This table is the honest state; the ten
+items above are the target.** Do not cite an invariant as implemented without checking here first
+— that mistake has been made repeatedly in this repo.
+
+| # | State on `main` | Note |
+| --- | --- | --- |
+| 1 | ❌ not implemented | No auth anywhere. Any socket reaching `:8443` can arm |
+| 2 | ❌ not implemented | No lease exists |
+| 3 | ❌ violated | `fromclient` is accepted while disarmed, so the channel buffer can be pre-loaded and the vehicle lunges on arm |
+| 4 | ❌ not implemented | No token, sequence, or timestamp check |
+| 5 | ⚠️ present, untested | `app.js:265`. Deletable without failing a test; also defeated by window blur and by the hidden-tab timer clamp |
+| 6 | ⚠️ partial | Correct in `pwm_mavproxy_servo.js:197`. But no blur/pagehide handler, `touchcancel` keeps throttle, and on any non-mavproxy driver every path is a silent no-op |
+| 7 | ❌ not implemented | No `isSafetyReady()`; and `arm()` force-arms, disabling ArduPilot's own checks |
+| 8 | ❌ not implemented | The overlay can still change any key |
+| 9 | ⚠️ violated on a reachable path | `writeFileSync` in the `setVideoParams` handler; `pwm_libgpiod` spawns ~200 `execSync`/s |
+| 10 | ⚠️ mavproxy only | All four GPIO drivers return `undefined` from `setServoPWM` |
 
 ---
 

@@ -30,7 +30,14 @@ const MAV_PARAM_TYPE_REAL32 = 9;
 
 // Channels driving two-position mechanical actuators. Only the endpoints are
 // valid positions for these; see setServoPWM.
-const DISCRETE_CHANNELS = new Set(['shift', 'tlock_front', 'tlock_rear']);
+const DISCRETE_CHANNELS = new Set(['shift', 'tlock_front', 'tlock_rear', 'light']);
+
+// The light is in DISCRETE_CHANNELS for input validation, not for the mechanical
+// reason the others are: it cannot jam at mid-travel. It is on/off, so a value
+// between the endpoints is a caller bug rather than a valid dim level. If dimming
+// is ever wanted, remove it from this set and give it a continuous range — do not
+// widen the set's meaning.
+const LIGHT_CHANNEL = 'light';
 
 // ── Inbound messages we decode ───────────────────────────────────────────────
 //
@@ -97,6 +104,7 @@ const DEFAULT_PARAM_OVERLAY = {
   SERVO3_FUNCTION: 70, // Throttle on RC3
   SERVO4_FUNCTION: 1,  // RC passthrough: front diff on RC4
   SERVO5_FUNCTION: 1,  // RC passthrough: rear diff on RC5
+  SERVO6_FUNCTION: 1,  // RC passthrough: light module on RC6
   FRAME_CLASS: 2,      // Rover (must be set or steering/throttle outputs are wrong)
   AHRS_GPS_USE: 0,     // no GPS installed
   GPS1_TYPE: 0         // no GPS installed
@@ -111,6 +119,7 @@ const EXPECTED_CRITICAL_PARAMS = {
   SERVO3_FUNCTION: 70,
   SERVO4_FUNCTION: 1,
   SERVO5_FUNCTION: 1,
+  SERVO6_FUNCTION: 1,
   FRAME_CLASS: 2,
   RC_OVERRIDE_TIME: 0.2
 };
@@ -226,13 +235,23 @@ class PWMMavproxy {
     this.channels[2] = config.throttle_neutral_us ?? this.neutral;       // throttle
     this.channels[3] = config.tlock_front_default_us ?? this.max_us;     // front t-lock (unlocked - wiring reversed)
     this.channels[4] = config.tlock_rear_default_us ?? this.min_us;      // rear t-lock (unlocked)
+    // Light module on Pixhawk output 6. Starts OFF: a vehicle that boots with its
+    // light already on tells the operator nothing about whether the control works,
+    // and an output whose state is not commanded is an output nobody owns.
+    this.channels[5] = config.light_off_us ?? this.min_us;               // light (off)
     this.channelMap = {
       throttle: 2,    // RC channel 3 (0-indexed)
       shift: 1,       // RC channel 2 (0-indexed)
       steering: 0,    // RC channel 1 (0-indexed)
       tlock_front: 3, // RC channel 4 (0-indexed)
-      tlock_rear: 4   // RC channel 5 (0-indexed)
+      tlock_rear: 4,  // RC channel 5 (0-indexed)
+      light: 5        // RC channel 6 (0-indexed) -> Pixhawk output 6
     };
+    // Endpoint microseconds for the light. Separate from min_us/max_us so a module
+    // that wants something other than the full PWM range can be trimmed without
+    // touching the motion channels.
+    this.lightOnUs  = config.light_on_us  ?? this.max_us;
+    this.lightOffUs = config.light_off_us ?? this.min_us;
 
     // Remembered so a fail-safe can restore motion channels to the SAME values
     // the driver booted with, rather than recomputing a midpoint that may not
@@ -424,6 +443,17 @@ class PWMMavproxy {
   //
   // Note this only mutates the channel buffer — it transmits nothing. The value
   // goes out on the next RC_CHANNELS_OVERRIDE tick.
+  // Convenience wrapper: the light is on/off, so callers should not have to know
+  // that -1 means off. Returns applied/dropped like setServoPWM.
+  setLight(on) {
+    if (typeof on !== 'boolean') return false;
+    return this.setServoPWM(LIGHT_CHANNEL, on ? 1 : -1);
+  }
+
+  lightIsOn() {
+    return this.channels[this.channelMap[LIGHT_CHANNEL]] === this.lightOnUs;
+  }
+
   setServoPWM(name, value) {
     const ch = this.channelMap[name];
     if (ch === undefined) return false;
@@ -448,6 +478,13 @@ class PWMMavproxy {
     // "ignore this field" sentinel — so an unvalidated value would quietly
     // release the channel's override instead of setting it. Reject it here so
     // the buffer can never hold a value nobody asked for.
+    // The light has its own endpoint pair so it can be trimmed independently of the
+    // motion channels' PWM range.
+    if (name === LIGHT_CHANNEL) {
+      this.channels[ch] = value === 1 ? this.lightOnUs : this.lightOffUs;
+      return true;
+    }
+
     const scaled = this.scale(value);
     if (!Number.isFinite(scaled)) return false;
 
