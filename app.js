@@ -38,7 +38,26 @@ const pwm = PWMDriver(config);
 const fleetClient = require('./fleetmgr-client');
 fleetClient.start(config);
 
-const file = new static.Server();
+// The operator's control UI must never be served from a stale browser cache.
+//
+// node-static defaults to `cache: 3600`, which emitted `Cache-Control: max-age=3600`
+// on socket.html — an hour during which the browser will not even revalidate. Measured
+// consequence: a client-side fix was deployed and verified present in the file the rover
+// serves, the operator reloaded, and kept running the OLD page. We then spent a round
+// chasing a bug in code the browser had never loaded.
+//
+// That is a safety problem, not a caching nit. socket.html carries the fail-safe paths:
+// the input send loop, the panic key, the page-hide handling, the deadzone escape. An
+// operator can be driving a control page whose fail-safe behaviour was fixed and
+// deployed hours ago.
+//
+// `no-cache` rather than `no-store`: the browser must REVALIDATE every load, but ETag
+// and Last-Modified still allow a 304, so an unchanged page costs a round trip and no
+// body. On a LAN that is free, and it makes staleness impossible rather than unlikely.
+const file = new static.Server('.', {
+  cache: false,
+  headers: { 'Cache-Control': 'no-cache' },
+});
 const options = {
   key:  fs.readFileSync('./certs/key.pem'),
   cert: fs.readFileSync('./certs/cert.pem'),
