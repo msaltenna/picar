@@ -1544,6 +1544,9 @@
 
     function deactivateAllControls() {
       window.removeEventListener('deviceorientation', handleOrientation, true);
+      // Leaving tilt control clears the neutral latch: re-entering it must require the
+      // device to be seen at rest again rather than inheriting a stale "it was level once".
+      orientationNeutralSeen = false;
       throttleValue = 0; steeringValue = 0;
     }
 
@@ -1630,11 +1633,98 @@
       }
     }
 
+    // Tilt neutral: the device is held at 45 degrees, and throttle is the deviation
+    // from that over a 50-degree span.
+    const ORIENTATION_NEUTRAL_BETA = 45;
+    const ORIENTATION_BETA_SPAN    = 50;
+    const ORIENTATION_GAMMA_SPAN   = 25;
+    // A phone is never perfectly still. Without a dead band, hand tremor of a fraction
+    // of a degree commands continuous throttle, and 0.06 is also the flight
+    // controller's own RC deadzone (RC3_DZ=30us over a 500us half-span), so anything
+    // smaller could not move the vehicle anyway.
+    const ORIENTATION_THROTTLE_DZ  = 0.06;
+
+    // Pure, so the rule is testable, and ARGUMENT-TAKING so the test drives the same
+    // code the handler does.
+    //
+    // The bug this replaces: `(45 - betadeg) / 50` with betadeg === null evaluates to
+    // 45/50 = 0.9. null coerces to 0 in arithmetic, so a device that fires
+    // `deviceorientation` WITHOUT a usable beta reading — Firefox on desktop, Android
+    // before its first sensor sample, iOS with the sensor briefly unavailable —
+    // commanded 90% FORWARD THROTTLE the instant orientation mode was entered, with no
+    // user input at all. On a rover with a flight battery installed that drives away.
+    // TASKS.md recorded this entry as a hand-tremor risk; the null path is far worse and
+    // needs no tremor.
+    //
+    // Fails to NEUTRAL, not to a last-known value: an absent sensor reading is not
+    // evidence about how the device is being held.
+    function orientationToControls(betadeg, gammadeg, neutralSeen) {
+      const out = { throttle: 0, steering: 0, valid: true, neutralSeen: !!neutralSeen };
+      if (!Number.isFinite(betadeg) || !Number.isFinite(gammadeg)) {
+        out.valid = false;
+        return out;                      // both axes neutral
+      }
+      const raw = (ORIENTATION_NEUTRAL_BETA - betadeg) / ORIENTATION_BETA_SPAN;
+      const thr = Math.max(-1, Math.min(1, raw));
+      const inDeadband = Math.abs(thr) < ORIENTATION_THROTTLE_DZ;
+
+      // NEUTRAL CAPTURE. Removing the null route to 0.9 throttle was not enough: the
+      // DESIGN route is still there. beta=0 is a phone lying flat, screen up, and
+      // (45-0)/50 = +0.9. So setting the phone on a bench, or handing it to someone, and
+      // then pressing Start commanded 90% forward throttle within one 50 ms send tick —
+      // with a perfectly working sensor and no operator input. Same symptom, same
+      // magnitude, same hazard as the null bug; only the cause differs. A review caught
+      // this after the first fix shipped.
+      //
+      // So throttle stays at zero until the device has been observed at rest — one
+      // reading inside the dead band since the last arm. That is an explicit
+      // neutral-at-arm requirement, which is what TASKS.md asked for and what the first
+      // version of this fix did not deliver.
+      //
+      // Steering is deliberately NOT latched: it commands no drive, and locking it out
+      // would surprise an operator who is trying to straighten the wheels.
+      out.neutralSeen = !!neutralSeen || inDeadband;
+      out.throttle = (inDeadband || !out.neutralSeen) ? 0 : thr;
+      out.steering = Math.max(-1, Math.min(1, gammadeg / ORIENTATION_GAMMA_SPAN));
+      return out;
+    }
+
+    let orientationWarned = false;
+    // Cleared whenever tilt control is left or the vehicle is stopped, so re-arming
+    // requires the device to be observed at rest again.
+    let orientationNeutralSeen = false;
+
     function handleOrientation(event) {
-      if (stopped) return;
-      const betadeg = event.beta, gammadeg = event.gamma;
-      throttleValue = Math.max(-1, Math.min(1, (45 - betadeg) / 50));
-      steeringValue = applyCurve(Math.max(-1, Math.min(1, gammadeg / 25)));
+      // controlMode is checked as well as `stopped`, matching keyboardTick. Without it
+      // there is a real race: requestOrientationPermission() adds this listener from an
+      // async .then, so an operator who switches to joystick while the iOS permission
+      // prompt is open gets the tilt handler attached AFTER the switch — and phone
+      // orientation then commands throttle in joystick mode.
+      if (stopped) {
+        // Clearing the latch HERE rather than in toggleStop, because this is reachable
+        // from a test: a mutation deleting the toggleStop reset survived the whole suite.
+        // Orientation events fire at ~60 Hz, so the latch clears within a frame of Stop,
+        // and re-arming then requires the device to be seen at rest again.
+        orientationNeutralSeen = false;
+        return;
+      }
+      if (controlMode !== 'orientation') return;
+      const c = orientationToControls(event.beta, event.gamma, orientationNeutralSeen);
+      orientationNeutralSeen = c.neutralSeen;
+
+      // ASSIGNED FIRST, before anything that can throw. A review deleted the
+      // `orientationWarned` declaration and the suite stayed green — but in a browser the
+      // warn block throws ReferenceError, and with the assignment below it that left the
+      // PREVIOUS throttle live at 20 Hz on a transient bad reading. Same reasoning as
+      // invariant 6: put the safe value where nothing can jump over it.
+      throttleValue = c.throttle;
+      steeringValue = applyCurve(c.steering);
+
+      if (!c.valid && !orientationWarned) {
+        orientationWarned = true;
+        console.warn('deviceorientation fired with no usable beta/gamma reading. ' +
+                     'Throttle and steering held at neutral.');
+      }
     }
 
     // ── Virtual joysticks ─────────────────────────────────────────────────────

@@ -254,14 +254,6 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   4. `socket.html`'s stop paths emit `disarm` and rely on the server primitive. Correct today, but
      the client has no independent guarantee.
 
-- **Orientation control has no throttle deadzone — uncommanded motion** — `socket.html:1388`
-  maps device tilt straight to throttle via `(45 - betadeg) / 50` with no deadzone and no shaping,
-  live whenever the mode is active and `stopped` is false. Steering gets `applyCurve`
-  (`socket.html:1195-1199`, which *does* have `STEERING_DEADZONE`); throttle gets nothing. After a
-  compliant neutral arm, ordinary hand tremor produces nonzero throttle. Fix: explicit neutral
-  calibration at arm, a deadzone, bounded response shaping, and tests before orientation mode is
-  enabled on a vehicle that can move.
-
 - **Private keys are committed to the repository** — `git ls-files certs/` returns `ca.crt`,
   `ca.key`, `ca.srl`, `cert.pem`, `key.pem`. Both `ca.key` and `key.pem` are real
   `-----BEGIN PRIVATE KEY-----` files. Anyone with repo read access holds the CA that every
@@ -681,7 +673,13 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   instant tilt mode was entered. Every desktop browser fires `deviceorientation` without a real
   beta. rover3 has a flight battery and this FC ignores DISARM, so the failure mode is a vehicle
   driving away unbidden. This entry previously described the risk as hand tremor; the null path
-  needs no tremor and is an order of magnitude worse. Fixed on `fix/orientation-null-throttle`
+  needs no tremor and is an order of magnitude worse. Fixed on `fix/orientation-null-throttle` (`60613ef`) — and note the first attempt
+  (`e878b04`) was INCOMPLETE: it removed the null route but left the design route, because a
+  flat phone (`beta=0`) maps to the same +0.9. The shipped fix adds neutral capture at arm,
+  the dead band this entry asked for, a `controlMode` guard closing the async-permission
+  race, and assignment-before-warn so a throw cannot leave the previous throttle live.
+  **Merged; the tilt behaviour itself is still unvalidated on hardware — it needs a phone.**
+  Superseded and removed the duplicate older entry for the same defect. Fixed on
   (`e878b04`): non-finite beta OR gamma yields neutral on both axes, plus the 0.06 dead band this
   entry originally asked for. **Needs review and a phone to validate — tilt control cannot be
   exercised by any host test or on-target script.** Found incidentally by an adversarial review
@@ -701,3 +699,10 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   `MOT_SLEWRATE` is the last thing between a pre-loaded buffer and full throttle, and onset is now
   2.5× faster on a vehicle that can drive. **Land the `fromclient` armed-guard and the control
   lease and this stops being load-bearing.** Until then, treat the value as a safety parameter.
+
+- **[P3] Orientation listener lifecycle is untested** — deleting the
+  `addEventListener`/`removeEventListener('deviceorientation', ...)` calls survives the suite:
+  tilt mode goes entirely inert, or the handler stays attached after leaving the mode, with no
+  test failing. Listener lifecycle needs DOM wiring the current host tests do not have. The
+  `controlMode !== 'orientation'` guard added in `60613ef` defangs the consequence — a leaked
+  listener can no longer command anything outside tilt mode — so this is hygiene, not a hazard.

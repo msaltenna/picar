@@ -92,6 +92,53 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-05 — Tilt mode could command 0.9 throttle unbidden; two causes, both fixed
+
+`fix/orientation-null-throttle`, validated on rover3 at
+`60613ef` — **no-regression only**, see the limit below.
+
+**The hazard.** `socket.html` computed tilt throttle as `(45 - event.beta) / 50`. Two
+independent routes to 90% forward throttle with no operator input:
+
+1. **`event.beta === null`** — `null` coerces to `0` in arithmetic, so the expression is
+   45/50 = 0.9. Produced by any device that fires `deviceorientation` without a usable
+   reading (Firefox on desktop, Android before its first sample, iOS with the sensor
+   briefly unavailable).
+2. **A phone lying flat** — `beta = 0` is a level phone, which maps to the same +0.9. Set
+   the phone on a bench, press Start, and the vehicle had 90% throttle within one 50 ms
+   send tick. **This one survived the first fix** and was caught by review afterwards.
+
+rover3 has a flight battery and this flight controller ignores DISARM, so the failure mode
+is a vehicle driving away. Route 1 was found incidentally while reviewing an unrelated
+branch; route 2 only because the first fix was itself reviewed.
+
+**The fix.** Non-finite beta *or* gamma yields neutral on both axes. Throttle then stays at
+zero until the device has been seen at rest — one reading inside the 0.06 dead band since
+the last arm — so a tilted device cannot command drive on Start. The latch clears on
+leaving tilt mode and on `stopped`. Controls are assigned before anything that can throw.
+`controlMode` is checked as well as `stopped`, which closes a live race: the permission
+grant adds the listener from an async callback, so switching to joystick while the iOS
+prompt is open otherwise attaches the tilt handler *after* the switch.
+
+**VALIDATION LIMIT, stated plainly.** Tilt control cannot be exercised by any host test or
+by anything in `test/on-target/` — it needs a physical phone. On-target work therefore
+shows **no-regression only**: 271/271 on target, 26/26 on-target checks, services active
+`NRestarts=0`. The diff is confined to the orientation handler, so no other control path
+can regress. **The tilt behaviour itself is unvalidated on hardware.** Someone should hold
+a phone, enter tilt mode flat on a table, press Start, and confirm the rover does not move.
+
+**What the review cost, and why it was worth it.** Six mutations survived the first
+version, four on lines that exist for safety: the reverse half of the tilt axis was
+deletable (no test asserted a negative throttle), the `stopped` guard was deletable, the
+warn-once flag's declaration was deletable *because the test supplied it* — which in a
+browser throws ReferenceError and left the previous throttle live at 20 Hz — and the
+neutral latch's reset was deletable because it lived in `toggleStop`, which no test can
+reach. That reset now lives in the handler where a test can drive it.
+
+**Accepted gap:** deleting the add/removeEventListener calls still survives; listener
+lifecycle needs DOM wiring these tests do not have. The `controlMode` guard defangs the
+consequence — a leaked listener can no longer command anything outside tilt mode.
+
 ### 2026-08-05 — Throttle response: FC deadzone escape, snap-to-neutral, MOT_SLEWRATE=250
 
 `fix/throttle-response`, validated on rover3 at
