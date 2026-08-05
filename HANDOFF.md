@@ -92,6 +92,62 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-05 — Throttle response: FC deadzone escape, snap-to-neutral, MOT_SLEWRATE=250
+
+`fix/throttle-response`, validated on rover3 at
+`b17f5a66560fea77346b33db9b073e9ae7978003`. **rover3 HAS A FLIGHT BATTERY** — see the
+Validation section of `CLAUDE.md`, corrected the same day.
+
+**What prompted it and what it actually was.** The operator reported reverse was not
+immediate and "required steering first". The cause turned out to be **the ESC**, not picar: on
+this vehicle the reverse input while rolling forward is BRAKE, and reverse engages only after
+the throttle returns to neutral and is applied again. Reverse → forward has no such gate,
+which is why that direction was always instant. "Steering first" was really *time spent at
+neutral* while the throttle decayed. Confirmed by the operator: reverse now engages on the
+second press, consistently.
+
+Measured, so the next person does not repeat the hunt:
+
+| Observation point | Result |
+| --- | --- |
+| picar → FC, reverse step | commanded value reached in **13–93 ms**, symmetric with forward |
+| FC output, `MOT_SLEWRATE` 100 → 250 | settle time ~667 ms → ~468 ms |
+| Client release → neutral | up to 20 ticks (~1 s) → **one tick, 29–77 ms** |
+| Flight mode / mapping | `MANUAL`, `RCMAP_THROTTLE=3` — direct passthrough |
+
+**What shipped.** The first keyboard step from rest goes to 0.08 instead of 0.05, clearing the
+FC's `RC3_DZ=30us` deadzone (0.06 normalised) that the old first step landed inside. Releasing
+snaps to neutral in one tick instead of decaying for up to a second — safer in its own right,
+and it is what makes the ESC's second press work *consistently* rather than intermittently.
+`MOT_SLEWRATE=250`, plus `RC3_DZ` and `RC3_TRIM` now pushed and verified so the browser's
+deadzone constant is derived from parameters the rover is known to hold rather than from a
+one-off measurement.
+
+**Validation at that SHA:** services active `NRestarts=0`; 257/257 on target; on-target suite
+26 PASS / 0 FAIL; **11/11 critical parameters verified**, `missing: []`, `mismatched: {}`, with
+`PARAM_SET`/`verified` pairs for all three new entries in the journal; the battery guard
+correctly refusing (`7.905 V, 0.42 A, 77%`).
+
+**Not validated at this SHA:** the browser behaviour itself. The deadzone escape and
+snap-to-neutral are covered by host tests that drive the real `keyboardTick` and the real
+`startKeyboardLoop`, but no automated on-target check exercises a browser. The operator drove
+an integration build containing these changes and reported the improvement.
+
+**Two things the reviewer made me correct, worth carrying forward.** First: `MOT_SLEWRATE` is
+*not* merely a control-feel parameter, which is what my commit originally claimed. Because
+`fromclient` has no armed check and no lease, the override loop streams armed or not, `arm()`
+force-arms past ArduPilot's own checks, and this FC ignores DISARM, `MOT_SLEWRATE` is the
+**only** rate limiter between a pre-loaded channel buffer and full throttle — so 250 raises
+throttle onset 2.5× on a vehicle that can drive. Operator-approved with that understood. The
+fail-safe half does hold: the override loop keeps streaming after disarm, so a higher rate
+reaches neutral *sooner*.
+
+Second: the branch's entire behaviour was initially deletable with a green suite — the rule was
+tested, its only call site was not. That is the defect shape `CLAUDE.md` names as dominant here,
+and it appeared in a commit whose tests were written specifically to avoid it. Fixed by
+extracting `keyboardTick()` and making `startKeyboardLoop()` take its scheduler, so the tests
+invoke whatever was actually scheduled.
+
 ### 2026-08-04 — Embedded Validator PASS for `f37cc0610b49801ded4c1c55575e0bcb92257683` (merged SHA)
 
 Revalidation after reconciling `CLAUDE.md` with the skill files. That commit is
