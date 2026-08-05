@@ -10,6 +10,10 @@ WorkingDirectory=/opt/picar
 StandardOutput=inherit
 StandardError=inherit
 Restart=always
+# Without a delay a crash-loop retries every ~100ms, which on a rover means the control
+# plane flapping instead of failing visibly. A crash also now runs a fail-safe first; give
+# those packets time to leave before the next start races them.
+RestartSec=2
 KillMode=mixed
 KillSignal=SIGINT
 TimeoutStopSec=5
