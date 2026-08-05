@@ -123,6 +123,15 @@ const DEFAULT_PARAM_OVERLAY = {
   // set, a reverse command while still rolling forward is BRAKING, so reverse genuinely
   // will not engage until the vehicle has stopped. That is a separate decision.
   MOT_SLEWRATE: 250,
+  // The browser's THROTTLE_DEADZONE (socket.html) is derived from these three: the
+  // deadzone in microseconds over the trim-to-endpoint half-span. They were MEASURED off
+  // rover3 and then hardcoded client-side, which made the derivation coincidental — a
+  // replacement board at factory default, or a calibration leaving trim at 1512, would
+  // silently put the client's escape value back INSIDE the deadzone and reintroduce the
+  // defect with no read-back mismatch and no failing test. Pushing and verifying them is
+  // what makes that fix durable rather than lucky.
+  RC3_DZ: 30,
+  RC3_TRIM: 1500,
   AHRS_GPS_USE: 0,     // no GPS installed
   GPS1_TYPE: 0         // no GPS installed
 };
@@ -142,7 +151,10 @@ const EXPECTED_CRITICAL_PARAMS = {
   // Verified by read-back like the rest: a throttle slew limit that silently failed to
   // apply would leave the operator with the sluggish response this change exists to fix,
   // and no indication of why.
-  MOT_SLEWRATE: 250
+  MOT_SLEWRATE: 250,
+  // Verified because socket.html's deadzone constant is derived from them.
+  RC3_DZ: 30,
+  RC3_TRIM: 1500
 };
 
 const EXPECTED_FLOAT_TOLERANCE = {
