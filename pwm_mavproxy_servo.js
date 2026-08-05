@@ -112,6 +112,17 @@ const DEFAULT_PARAM_OVERLAY = {
   // reported the vehicle verified. A wrong expectation is worse than no expectation:
   // it converts the verification step into a rubber stamp.
   FRAME_CLASS: 1,      // Rover (must be set or steering/throttle outputs are wrong)
+  // Throttle slew limit, %/s. ArduRover's default of 100 means neutral -> 60% takes
+  // 600 ms, which the operator experienced as reverse not engaging: measured on rover3,
+  // a hard reverse STEP sent with the browser bypassed still ramped
+  // 1500 -> 1460 -> 1340 -> 1220 us over ~700 ms. 250 gives ~240 ms to 60%.
+  //
+  // This is a control-feel parameter, not a safety limit — the fail-safe path commands
+  // NEUTRAL, and reaching neutral faster is strictly better. Note ATC_BRAKE=1 and
+  // ATC_ACCEL_MAX=1.0 also shape this and are deliberately left alone: with ATC_BRAKE
+  // set, a reverse command while still rolling forward is BRAKING, so reverse genuinely
+  // will not engage until the vehicle has stopped. That is a separate decision.
+  MOT_SLEWRATE: 250,
   AHRS_GPS_USE: 0,     // no GPS installed
   GPS1_TYPE: 0         // no GPS installed
 };
@@ -127,7 +138,11 @@ const EXPECTED_CRITICAL_PARAMS = {
   SERVO5_FUNCTION: 1,
   SERVO6_FUNCTION: 1,
   FRAME_CLASS: 1,
-  RC_OVERRIDE_TIME: 0.2
+  RC_OVERRIDE_TIME: 0.2,
+  // Verified by read-back like the rest: a throttle slew limit that silently failed to
+  // apply would leave the operator with the sluggish response this change exists to fix,
+  // and no indication of why.
+  MOT_SLEWRATE: 250
 };
 
 const EXPECTED_FLOAT_TOLERANCE = {

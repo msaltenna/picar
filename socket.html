@@ -1704,6 +1704,63 @@
     // ── Keyboard controls ─────────────────────────────────────────────────────
     const keysDown = {};
     const KEY_THROTTLE_STEP = 0.05, KEY_STEERING_STEP = 0.15;
+
+    // The flight controller ignores throttle inside its own RC deadzone. Measured on
+    // rover3: RC3_DZ=30us, and the throttle span is 500us per normalised unit
+    // (RC3_MIN 1000 / RC3_TRIM 1500 / RC3_MAX 2000, and setServoPWM('throttle', 0.8)
+    // puts 1900us on the wire). So 30us = 0.06 units, and a first keyboard step of
+    // 0.05 lands INSIDE the deadzone and commands nothing at all. The second tick
+    // reaches 0.10 and finally escapes — a dead ~100 ms on every press, which the
+    // operator experiences as "reverse doesn't happen immediately".
+    //
+    // 0.08 leaves a 10us margin over the deadzone rather than sitting on its edge,
+    // where trim drift or a different RC3_DZ would put us back inside it.
+    const THROTTLE_DEADZONE   = 0.06;
+    const THROTTLE_DZ_ESCAPE  = 0.08;
+
+    // One step of the keyboard throttle ramp. Pure and exported-by-extraction so the
+    // deadzone-escape rule is testable; the loop below is the only caller.
+    //
+    // Note this makes the vehicle begin moving on the FIRST tick instead of the third.
+    // That is the point — but it IS a change in how quickly a keypress produces motion,
+    // so it escapes the deadzone and no further: 0.08 is a crawl, not a launch. The
+    // normal ramp takes over from there.
+    function nextThrottle(current, direction, step) {
+      // RELEASE SNAPS TO NEUTRAL, it does not coast down.
+      //
+      // This used to decay by one step per tick — from full forward that is a full
+      // second before the command reaches zero. Two reasons that was wrong:
+      //
+      //   1. The ESC gates forward -> reverse. On this vehicle (Traxxas XL-5) the reverse
+      //      input while rolling forward is BRAKE; reverse only engages after the throttle
+      //      has returned to neutral and is applied again. A one-second decay meant that
+      //      pressing reverse during it never presented a clean neutral at all, so reverse
+      //      appeared not to work. The operator's workaround was to steer first — which
+      //      was really just spending time at neutral while the decay finished.
+      //   2. It is the safer direction regardless. Releasing throttle should stop
+      //      commanding drive immediately, not a second later, on a vehicle with a pack
+      //      installed. Snapping to neutral is a coast, not a reversal, and it is what
+      //      releasing a transmitter trigger does.
+      //
+      // Steering still decays gradually — self-centring is desirable there and no gate
+      // depends on it.
+      if (direction === 0) return 0;
+      const target = current + direction * step;
+      // The escape applies ONLY when starting from inside the dead band — that is the
+      // situation where the command produces no output at all. An earlier version tested
+      // `current > -THROTTLE_DEADZONE` for the reverse case, which is true for ANY
+      // forward value, so holding reverse while rolling forward at 0.5 snapped straight
+      // to -0.08 instead of decelerating through zero. A test caught it; the condition is
+      // now on the MAGNITUDE of current, which is what "inside the deadzone" means.
+      if (Math.abs(current) < THROTTLE_DEADZONE) {
+        return direction > 0
+          // max/min, not a bare assignment: if the ordinary step already clears the
+          // deadzone, take it rather than pulling the command back down to the escape.
+          ? Math.min(1, Math.max(target, THROTTLE_DZ_ESCAPE))
+          : Math.max(-1, Math.min(target, -THROTTLE_DZ_ESCAPE));
+      }
+      return Math.max(-1, Math.min(1, target));
+    }
     let keyboardInterval = null;
 
     // True when the UI, not the vehicle, should own the keystroke: a modal is
@@ -1717,19 +1774,40 @@
       return /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(el.tagName) || el.isContentEditable;
     }
 
-    function startKeyboardLoop() {
+    const KEY_TICK_MS = 50;
+
+    function startKeyboardLoop(setIntervalFn = setInterval) {
       if (keyboardInterval) return;
-      keyboardInterval = setInterval(() => {
-        if (stopped || controlMode !== 'keyboard') return;
-        if      (keysDown['KeyW'] || keysDown['ArrowUp'])    throttleValue = Math.min( 1, throttleValue + KEY_THROTTLE_STEP);
-        else if (keysDown['KeyS'] || keysDown['ArrowDown'])  throttleValue = Math.max(-1, throttleValue - KEY_THROTTLE_STEP);
-        else { if (Math.abs(throttleValue) < KEY_THROTTLE_STEP) throttleValue = 0; else throttleValue -= Math.sign(throttleValue) * KEY_THROTTLE_STEP; }
+      keyboardInterval = setIntervalFn(keyboardTick, KEY_TICK_MS);
+    }
 
-        if      (keysDown['KeyA'] || keysDown['ArrowLeft'])  steeringValue = Math.max(-1, steeringValue - KEY_STEERING_STEP);
-        else if (keysDown['KeyD'] || keysDown['ArrowRight']) steeringValue = Math.min( 1, steeringValue + KEY_STEERING_STEP);
-        else { if (Math.abs(steeringValue) < KEY_STEERING_STEP) steeringValue = 0; else steeringValue -= Math.sign(steeringValue) * KEY_STEERING_STEP; }
+    // One tick of keyboard control. Extracted and argument-free-of-timers on purpose:
+    // an adversarial review reverted the three call-site lines that used nextThrottle()
+    // — deleting BOTH the deadzone escape and the snap-to-neutral from the only path
+    // that runs them — and all 248 tests stayed green. The rule was tested; its consumer
+    // was not, which is the defect shape CLAUDE.md names as this repo's dominant one.
+    // Tests now drive THIS, and startKeyboardLoop takes its scheduler so the wiring
+    // between the two is covered as well.
+    function keyboardTick() {
+      if (stopped || controlMode !== 'keyboard') return;
+      const throttleDir = (keysDown['KeyW'] || keysDown['ArrowUp']) ? 1
+                        : (keysDown['KeyS'] || keysDown['ArrowDown']) ? -1 : 0;
+      throttleValue = nextThrottle(throttleValue, throttleDir, KEY_THROTTLE_STEP);
 
-      }, 50);
+      const steerDir = (keysDown['KeyA'] || keysDown['ArrowLeft']) ? -1
+                     : (keysDown['KeyD'] || keysDown['ArrowRight']) ? 1 : 0;
+      steeringValue = nextSteering(steeringValue, steerDir, KEY_STEERING_STEP);
+    }
+
+    // Steering keeps the gradual self-centring decay that throttle deliberately gave up:
+    // nothing gates on steering reaching neutral promptly, and a snap would make the
+    // wheels jerk straight on key release.
+    function nextSteering(current, direction, step) {
+      if (direction === 0) {
+        if (Math.abs(current) < step) return 0;
+        return current - Math.sign(current) * step;
+      }
+      return Math.max(-1, Math.min(1, current + direction * step));
     }
 
     document.addEventListener('keydown', (e) => {
