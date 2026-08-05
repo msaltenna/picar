@@ -319,13 +319,18 @@ test('setParams refuses garbage at the driver, not just in the helper', () => {
   const path = require('path');
   const makeWebrtc = require('../streams/webrtc.js');
 
-  const yml = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'picar-vp-')), 'mediamtx.yml');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'picar-vp-'));
+  const yml = path.join(tmpDir, 'mediamtx.yml');
   const stream = makeWebrtc({
     mediamtx_yml: yml,
     webrtc_width: 480, webrtc_height: 360, webrtc_fps: 20, webrtc_bitrate_kbps: 350,
-    // `true` exits 0 immediately: exercises the real restart path without touching
-    // a service on the machine running the tests.
-    mediamtx_restart_cmd: ['true'],
+  }, {
+    // Injected, NOT config — see RESTART_CMD in streams/webrtc.js for why that
+    // distinction is load-bearing. `true` exits 0 immediately, exercising the real
+    // restart path without touching a service on the machine running the tests. When
+    // this was still a config key the tests spawned `systemctl restart mediamtx` for
+    // real, which on a rover restarts the video stream from `npm test`.
+    restartCmd: ['true'],
   });
   try {
     const before = { ...stream.getStreamConfig() };
@@ -350,6 +355,8 @@ test('setParams refuses garbage at the driver, not just in the helper', () => {
     assert.match(fs.readFileSync(yml, 'utf8'), /rpiCameraBitrate: 200000/);
   } finally {
     if (typeof stream.stop === 'function') stream.stop();
+    // tmpfs is RAM on this fleet, and the on-target run left these behind.
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
@@ -358,8 +365,9 @@ test('a partially valid request applies the good values and reports the bad', ()
   const fs   = require('fs');
   const path = require('path');
   const makeWebrtc = require('../streams/webrtc.js');
-  const yml = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'picar-vp-')), 'mediamtx.yml');
-  const stream = makeWebrtc({ mediamtx_yml: yml, mediamtx_restart_cmd: ['true'] });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'picar-vp-'));
+  const yml = path.join(tmpDir, 'mediamtx.yml');
+  const stream = makeWebrtc({ mediamtx_yml: yml }, { restartCmd: ['true'] });
   try {
     const r = stream.setParams({ width: 320, fps: 999 });
     assert.equal(r.applied.width, 320, 'the valid half must still take effect');
@@ -368,6 +376,8 @@ test('a partially valid request applies the good values and reports the bad', ()
     assert.equal(stream.getStreamConfig().fps, 20, 'fps must hold its previous value');
   } finally {
     if (typeof stream.stop === 'function') stream.stop();
+    // tmpfs is RAM on this fleet, and the on-target run left these behind.
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
