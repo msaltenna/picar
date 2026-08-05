@@ -1630,11 +1630,61 @@
       }
     }
 
+    // Tilt neutral: the device is held at 45 degrees, and throttle is the deviation
+    // from that over a 50-degree span.
+    const ORIENTATION_NEUTRAL_BETA = 45;
+    const ORIENTATION_BETA_SPAN    = 50;
+    const ORIENTATION_GAMMA_SPAN   = 25;
+    // A phone is never perfectly still. Without a dead band, hand tremor of a fraction
+    // of a degree commands continuous throttle, and 0.06 is also the flight
+    // controller's own RC deadzone (RC3_DZ=30us over a 500us half-span), so anything
+    // smaller could not move the vehicle anyway.
+    const ORIENTATION_THROTTLE_DZ  = 0.06;
+
+    // Pure, so the rule is testable, and ARGUMENT-TAKING so the test drives the same
+    // code the handler does.
+    //
+    // The bug this replaces: `(45 - betadeg) / 50` with betadeg === null evaluates to
+    // 45/50 = 0.9. null coerces to 0 in arithmetic, so a device that fires
+    // `deviceorientation` WITHOUT a real beta reading — every desktop browser does —
+    // commanded 90% FORWARD THROTTLE the instant orientation mode was entered, with no
+    // user input at all. On a rover with a flight battery installed that drives away.
+    // TASKS.md recorded this entry as a hand-tremor risk; the null path is far worse and
+    // needs no tremor.
+    //
+    // Fails to NEUTRAL, not to a last-known value: an absent sensor reading is not
+    // evidence about how the device is being held.
+    function orientationToControls(betadeg, gammadeg) {
+      const out = { throttle: 0, steering: 0, valid: true };
+      if (!Number.isFinite(betadeg) || !Number.isFinite(gammadeg)) {
+        out.valid = false;
+        return out;                      // both axes neutral
+      }
+      const raw = (ORIENTATION_NEUTRAL_BETA - betadeg) / ORIENTATION_BETA_SPAN;
+      const thr = Math.max(-1, Math.min(1, raw));
+      out.throttle = Math.abs(thr) < ORIENTATION_THROTTLE_DZ ? 0 : thr;
+      out.steering = Math.max(-1, Math.min(1, gammadeg / ORIENTATION_GAMMA_SPAN));
+      return out;
+    }
+
+    let orientationWarned = false;
+
     function handleOrientation(event) {
       if (stopped) return;
-      const betadeg = event.beta, gammadeg = event.gamma;
-      throttleValue = Math.max(-1, Math.min(1, (45 - betadeg) / 50));
-      steeringValue = applyCurve(Math.max(-1, Math.min(1, gammadeg / 25)));
+      const c = orientationToControls(event.beta, event.gamma);
+      if (!c.valid) {
+        // Say it once. A device with no orientation sensor will fire this event
+        // continuously, and an operator who selected tilt control on such a device needs
+        // to know it will never work rather than wonder why the rover does not move.
+        if (!orientationWarned) {
+          orientationWarned = true;
+          console.warn('deviceorientation fired with no usable beta/gamma reading ' +
+                       '(this device has no orientation sensor). Throttle and steering ' +
+                       'held at neutral.');
+        }
+      }
+      throttleValue = c.throttle;
+      steeringValue = applyCurve(c.steering);
     }
 
     // ── Virtual joysticks ─────────────────────────────────────────────────────
