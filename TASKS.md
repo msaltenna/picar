@@ -675,3 +675,29 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   `Red-teamed-by: fable-5` trailer. Merging that branch would make the step invocable and
   self-documenting; until then the requirement depends on whoever reads the directive noticing it.
 
+- **[P0] Orientation (tilt) mode commanded 0.9 throttle with no input — FIXED on a branch,
+  not yet merged** — `socket.html` computed `(45 - event.beta) / 50`, and `null` coerces to 0
+  in arithmetic, so an absent beta reading yielded **0.9 — ninety percent forward throttle** the
+  instant tilt mode was entered. Every desktop browser fires `deviceorientation` without a real
+  beta. rover3 has a flight battery and this FC ignores DISARM, so the failure mode is a vehicle
+  driving away unbidden. This entry previously described the risk as hand tremor; the null path
+  needs no tremor and is an order of magnitude worse. Fixed on `fix/orientation-null-throttle`
+  (`e878b04`): non-finite beta OR gamma yields neutral on both axes, plus the 0.06 dead band this
+  entry originally asked for. **Needs review and a phone to validate — tilt control cannot be
+  exercised by any host test or on-target script.** Found incidentally by an adversarial review
+  of an unrelated branch, which is the only reason it surfaced.
+
+- **[P2] The joystick path has no throttle dead band either** — `socket.html`'s virtual joystick
+  sets `throttleValue` straight from stick position, so a small deflection sits inside the FC's
+  `RC3_DZ` and commands nothing, while `nextThrottle`'s deadzone escape applies only to the
+  keyboard. Not a hazard like the orientation null path, but it is an inconsistency between input
+  modes that will read as "the joystick is less responsive than the keys".
+
+- **[P1] `MOT_SLEWRATE` is the only rate limiter on an unauthenticated throttle path** — raising
+  it 100 → 250 was operator-approved for control feel, and a review established what that means
+  in context: `fromclient` is accepted with no armed check and no lease (invariant 3, violated),
+  the override loop streams the channel buffer at 20 Hz armed or not, `arm()` force-arms with the
+  21196 magic so ArduPilot's own pre-arm checks are skipped, and this FC ignores DISARM. So
+  `MOT_SLEWRATE` is the last thing between a pre-loaded buffer and full throttle, and onset is now
+  2.5× faster on a vehicle that can drive. **Land the `fromclient` armed-guard and the control
+  lease and this stops being load-bearing.** Until then, treat the value as a safety parameter.
