@@ -41,31 +41,50 @@ function constants() {
 }
 
 function loadRule() {
-  return new Function('beta', 'gamma',
-    `${constants()}\n${grab('orientationToControls')}\nreturn orientationToControls(beta, gamma);`);
+  return new Function('beta', 'gamma', 'neutralSeen',
+    `${constants()}\n${grab('orientationToControls')}\n` +
+    'return orientationToControls(beta, gamma, neutralSeen);');
+}
+// Most tests want the post-neutral-capture behaviour; pass neutralSeen=true so they are
+// not all silently testing the latched-off case.
+function loadRuleArmed() {
+  const f = loadRule();
+  return (beta, gamma) => f(beta, gamma, true);
 }
 
 // Drive the REAL handler, with the page's mutable control state declared in the
 // generated scope so the assignments are observable.
-function runHandler(event, { stopped = false } = {}) {
-  return new Function('event', 'stopped', `
+function runHandler(event, { stopped = false, mode = 'orientation', neutralSeen = true,
+                             times = 1 } = {}) {
+  // `orientationWarned` and `orientationNeutralSeen` are GRABBED from the page, not
+  // re-declared here. A review deleted the page's `orientationWarned` declaration and the
+  // suite stayed green, because this scope was supplying it — while in a browser the warn
+  // block throws ReferenceError before the neutral assignment.
+  const decls = [];
+  for (const name of ['orientationWarned', 'orientationNeutralSeen']) {
+    const m = new RegExp(`let ${name}\\s*=\\s*[^;]+;`).exec(html);
+    assert.ok(m, `page declaration for ${name} not found in socket.html`);
+    decls.push(m[0]);
+  }
+  return new Function('event', 'stopped', 'controlMode', 'seed', 'times', `
     let throttleValue = 999, steeringValue = 999;
     const applyCurve = (v) => v;              // identity: this test is not about the curve
-    let orientationWarned = false;
+    ${decls.join('\n')}
+    orientationNeutralSeen = seed;
     const warnings = [];
     const console = { warn: (m) => warnings.push(m) };
     ${constants()}
     ${grab('orientationToControls')}
     ${grab('handleOrientation')}
-    handleOrientation(event);
-    return { throttleValue, steeringValue, warnings };
-  `)(event, stopped);
+    for (let i = 0; i < times; i++) handleOrientation(event);
+    return { throttleValue, steeringValue, warnings, neutralSeen: orientationNeutralSeen };
+  `)(event, stopped, mode, neutralSeen, times);
 }
 
 // ── The absent-reading case: the actual hazard ───────────────────────────────
 
 test('an absent orientation reading commands NEUTRAL, not 0.9 throttle', () => {
-  const rule = loadRule();
+  const rule = loadRuleArmed();
   for (const beta of [null, undefined, NaN, 'x', {}]) {
     const c = rule(beta, 10);
     assert.equal(c.throttle, 0,
@@ -102,7 +121,7 @@ test('the handler assigns a real tilt through to the control values', () => {
 // ── The dead band: the tracked hand-tremor P0 ───────────────────────────────
 
 test('small tilts inside the dead band command nothing', () => {
-  const rule = loadRule();
+  const rule = loadRuleArmed();
   const m = /const ORIENTATION_THROTTLE_DZ\s*=\s*([0-9.]+)/.exec(html);
   const dz = Number(m[1]);
   const span = Number(/const ORIENTATION_BETA_SPAN\s*=\s*([0-9.]+)/.exec(html)[1]);
@@ -129,7 +148,7 @@ test('the dead band is small enough to be a dead band, not a mode', () => {
 });
 
 test('throttle and steering stay clamped to the normalised range', () => {
-  const rule = loadRule();
+  const rule = loadRuleArmed();
   for (const beta of [-180, -90, 200, 1e6]) {
     const c = rule(beta, 0);
     assert.ok(c.throttle >= -1 && c.throttle <= 1, `throttle out of range for beta=${beta}`);
@@ -138,4 +157,90 @@ test('throttle and steering stay clamped to the normalised range', () => {
     const c = rule(45, gamma);
     assert.ok(c.steering >= -1 && c.steering <= 1, `steering out of range for gamma=${gamma}`);
   }
+});
+
+// ── Neutral capture: the hazard the first fix left open ──────────────────────
+
+test('throttle stays at zero until the device has been seen at rest', () => {
+  // The first version of this fix removed the null route to 0.9 and left the DESIGN
+  // route: beta=0 is a phone lying flat, and (45-0)/50 = +0.9. Setting the phone down and
+  // pressing Start commanded 90% forward throttle within one 50 ms send tick, with a
+  // working sensor and no operator input. Found by review after the fix had shipped.
+  const rule = loadRule();
+
+  // Not yet seen at rest: a flat phone must command NOTHING.
+  const cold = rule(0, 0, false);
+  assert.equal(cold.throttle, 0,
+    'a tilted device must not command throttle before it has been observed at rest');
+  assert.equal(cold.neutralSeen, false, 'and it must not latch on a tilted reading');
+
+  // A reading inside the dead band arms it...
+  const atRest = rule(45, 0, false);
+  assert.equal(atRest.throttle, 0);
+  assert.equal(atRest.neutralSeen, true, 'a reading at rest must satisfy the latch');
+
+  // ...and only then does tilt command throttle.
+  assert.equal(rule(0, 0, true).throttle, 0.9, 'once armed, tilt must work normally');
+});
+
+test('the handler holds throttle until neutral capture, then releases it', () => {
+  // Through the real handler, which is what actually runs.
+  const cold = runHandler({ beta: 0, gamma: 0 }, { neutralSeen: false });
+  assert.equal(cold.throttleValue, 0, 'flat phone before neutral capture must be neutral');
+
+  const armed = runHandler({ beta: 0, gamma: 0 }, { neutralSeen: true });
+  assert.equal(armed.throttleValue, 0.9);
+});
+
+test('steering is NOT latched — it commands no drive', () => {
+  const rule = loadRule();
+  assert.equal(rule(0, 25, false).steering, 1,
+    'locking steering out would surprise an operator straightening the wheels');
+});
+
+// ── Guards that were provably deletable ──────────────────────────────────────
+
+test('the handler does nothing while stopped', () => {
+  // Surviving mutation: delete `if (stopped) return;`. Tilt events then pre-load the
+  // channel buffer while disarmed — the client-side half of invariant 3.
+  const r = runHandler({ beta: 0, gamma: 0 }, { stopped: true });
+  assert.equal(r.throttleValue, 999, 'throttle must be left untouched entirely');
+  assert.equal(r.steeringValue, 999);
+});
+
+test('the handler does nothing in another control mode', () => {
+  // Surviving mutation: no controlMode check. There is a real race —
+  // requestOrientationPermission adds the listener from an async .then, so switching to
+  // joystick while the iOS prompt is open attaches the tilt handler AFTER the switch.
+  const r = runHandler({ beta: 0, gamma: 0 }, { mode: 'joystick' });
+  assert.equal(r.throttleValue, 999, 'tilt must not command throttle in joystick mode');
+});
+
+test('reverse tilt commands reverse throttle', () => {
+  // Surviving mutation: `Math.abs(thr) < DZ` -> `thr < DZ`, which deletes the ENTIRE
+  // reverse half of the axis because every negative value is below +0.06. No test
+  // asserted a negative throttle, so it passed.
+  const rule = loadRuleArmed();
+  assert.equal(rule(95, 0).throttle, -1,   'beta 95 is full reverse');
+  assert.equal(rule(70, 0).throttle, -0.5);
+  assert.equal(Number(rule(60, 0).throttle.toFixed(2)), -0.3);
+  assert.ok(rule(50, 0).throttle < 0, 'just past the dead band must be negative, not zero');
+});
+
+test('the unusable-sensor warning fires once across many events, not per event', () => {
+  // Surviving mutation: `if (!orientationWarned)` -> `if (true)`. The old test called the
+  // handler ONCE, so once-ever and once-per-event were indistinguishable.
+  const r = runHandler({ beta: null, gamma: null }, { times: 5 });
+  assert.equal(r.warnings.length, 1,
+    `five events must produce one warning, got ${r.warnings.length}`);
+  assert.equal(r.throttleValue, 0, 'and every one of them must hold neutral');
+});
+
+test('stopping clears the neutral latch, so re-arming requires rest again', () => {
+  // Surviving mutation: the latch reset used to live in toggleStop, which no test can
+  // reach, so deleting it left the suite green. Consequence: Stop then Start with the
+  // phone still tilted commands throttle immediately, defeating the whole latch.
+  const r = runHandler({ beta: 0, gamma: 0 }, { stopped: true, neutralSeen: true });
+  assert.equal(r.neutralSeen, false, 'a stopped handler must clear the latch');
+  assert.equal(r.throttleValue, 999, 'and still touch nothing');
 });
