@@ -350,10 +350,46 @@ rover3 by the Embedded Validator, which must gather **all** of:
    `test/on-target/`, runnable on the rover, so validation is repeatable rather than ad hoc.
 5. **No regressions** — `npm test` clean, and previously validated behavior still works.
 
-**Rover3 has no flight battery connected.** Motors and servos cannot physically actuate.
-Validate the command path up to the flight controller and say so explicitly; never imply
-mechanical motion was observed. If a change genuinely cannot be proven without actuation,
-report it as **unvalidated** and stop — do not merge and do not soften the claim.
+### Assume rover3 CAN MOVE. Check the battery before commanding anything.
+
+**This section said "Rover3 has no flight battery connected. Motors and servos cannot
+physically actuate" until 2026-08-05. That was false, and it was acted on.** A flight
+battery is installed. Believing otherwise, an on-target probe commanded throttle
+**−0.6 for 1.5 s and +0.6**, three separate runs, on a vehicle that could drive — and each
+run was reported as safe on the strength of this paragraph.
+
+The evidence was available the whole time and went unquestioned: battery telemetry read
+**7.9 V at 0.41 A** from the first validation onward, and reports `pctSource:
+"flightcontroller"`, meaning the autopilot is coulomb-counting a real pack. A config
+comment asserting "no flight battery" was written on the same rover, on the same day, that
+was reporting a live pack voltage.
+
+So the standing rule is now the opposite of what it was:
+
+- **Assume the vehicle can move.** Before any script or manual step commands a non-neutral
+  throttle, check `/status` → `telemetry.battery`. A voltage and a current reading mean a
+  pack is connected and the wheels can turn.
+- **Committed on-target scripts must refuse to command motion by default** and require an
+  explicit opt-in flag, with the operator physically present and the vehicle safe to drive.
+  Throttle-commanding checks are not part of a routine validation run.
+- **Never write "cannot actuate" as a premise.** State what you measured. If a claim
+  depends on the vehicle being unable to move, verify that for the run in question and
+  quote the reading.
+- If a change genuinely cannot be proven without actuation, report it as **unvalidated**
+  and stop — do not merge and do not soften the claim. That part was always right.
+
+Note what this does to the record: every validation entry in `HANDOFF.md` written before
+2026-08-05 that says "no mechanical actuation was observed or implied, because rover3 has
+no flight battery" asserts a safety property that was not true. The command-path evidence
+in those entries stands on its own; the actuation disclaimer does not, and is corrected
+there.
+
+**Compounding factor, and the reason this matters more than a documentation slip:** this
+flight controller ignores DISARM (P0 in `TASKS.md`, demonstrated on rover3 — 222
+consecutive ARMED heartbeats with no `COMMAND_ACK`). Neutral-before-disarm still stops
+motion, so the fail-safe's *stopping* function works. But the vehicle does not actually
+disarm, and it will act on the next command it receives. Under the old false premise that
+was a paperwork problem. With a pack installed it is not.
 
 ---
 

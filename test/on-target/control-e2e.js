@@ -9,9 +9,14 @@
 // emits: arm, fromclient, setDrivetrain, disarm — and then stops sending so the input
 // watchdog fires on its own.
 //
-// NOTE ON SAFETY: rover3 has no flight battery connected, so nothing can actuate. This
-// proves the command path to the flight controller and the server-side fail-safe
-// responses. It does not and cannot observe mechanical motion.
+// SAFETY: ASSUME THE VEHICLE CAN MOVE. An earlier version of this header asserted
+// "rover3 has no flight battery connected, so nothing can actuate" — that was false, a
+// pack is installed, and a sibling probe commanded 60% reverse on the strength of it.
+//
+// This script therefore refuses to run at all if a battery is detected, unless the
+// operator explicitly opts in. It commands steering and a drivetrain change, and holds
+// throttle at ZERO throughout — but steering a live vehicle still moves the wheels, and
+// the drivetrain step shifts a real gearbox.
 
 const https = require('https');
 
@@ -79,8 +84,44 @@ async function emitWithAck(P, name, payload, waitMs = 1500) {
   return acks[id];
 }
 
+// Refuse to run on a vehicle that can drive unless explicitly allowed. The check reads
+// the autopilot's own battery monitor: a voltage AND a current reading mean a pack is
+// connected. Fails CLOSED — if the check cannot be performed, that is a refusal, not a
+// pass, because "I could not tell" must never read as "it is safe".
+async function assertSafeToCommand(allowMotion) {
+  let telemetry = null;
+  try {
+    // req() resolves {status, body} — parse the BODY. The first version parsed the
+    // wrapper object, so the guard refused every run with a bogus "not valid JSON"
+    // message. It failed closed, which is the right direction, but a guard that always
+    // refuses gets disabled by the next person rather than obeyed.
+    const res = await req('GET', '/status');
+    telemetry = JSON.parse(res.body).telemetry;
+  } catch (err) {
+    if (allowMotion) return;
+    console.log(`REFUSING TO RUN: could not read /status to check for a battery (${err.message}).`);
+    console.log('Re-run with --allow-motion only if you have physically confirmed the vehicle is safe.');
+    process.exit(3);
+  }
+  const b = telemetry && telemetry.battery;
+  const live = b && b.voltageV != null && b.voltageV > 3;
+  if (!live) return;                       // no pack reported: safe to proceed
+  if (allowMotion) {
+    console.log(`WARNING: battery present (${b.voltageV} V, ${b.currentA} A) and --allow-motion ` +
+                'was given. The wheels can turn. Proceeding.\n');
+    return;
+  }
+  console.log('REFUSING TO RUN: a flight battery is connected.');
+  console.log(`  battery: ${b.voltageV} V, ${b.currentA} A, ${b.remainingPct}% (${b.pctSource})`);
+  console.log('  This script commands steering and a drivetrain change on a vehicle that can move.');
+  console.log('  Disconnect the pack, or re-run with --allow-motion with the rover safely supported');
+  console.log('  and an operator present.');
+  process.exit(3);
+}
+
 (async () => {
   let failed = 0;
+  await assertSafeToCommand(process.argv.includes('--allow-motion'));
   const ok  = (m) => log(`  PASS ${m}`);
   const bad = (m) => { log(`  FAIL ${m}`); failed = 1; };
 
@@ -137,8 +178,8 @@ async function emitWithAck(P, name, payload, waitMs = 1500) {
   absorb((await req('GET', P)).body);
   ok('arm sent');
 
-  // Neutral first, as the UI does, then a real steering command. Throttle stays at 0
-  // throughout: there is no battery, but there is no reason to command throttle either.
+  // Throttle stays at 0 throughout. Not because the vehicle cannot move — it can — but
+  // because proving the command path never requires commanding drive.
   for (let i = 0; i < 12; i++) {
     await req('POST', P, '42' + JSON.stringify(['fromclient',
       { throttle: 0, steering: i < 4 ? 0 : 0.5 }]));
