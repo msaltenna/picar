@@ -61,17 +61,32 @@ run_check() {
   fi
   if "$@"; then
     PASSED_LIST+=("$name")
-  else
-    local rc=$?
-    printf '  \033[31m>>> %s exited %d\033[0m\n' "$name" "$rc"
-    FAILED_LIST+=("$name (exit $rc)")
-    FAILED=1
+    return 0
   fi
+  local rc=$?
+  # EXIT 3 IS A DELIBERATE SAFETY REFUSAL, not a failure. control-e2e.js exits 3 when it
+  # detects a connected flight battery, because it commands steering and a drivetrain change
+  # and will not do that on a vehicle that can move without an explicit --allow-motion and an
+  # operator present. Counting that as a FAILURE would create a perverse incentive to pass
+  # --allow-motion just to turn the summary green, on a rover with a live pack and a flight
+  # controller that ignores DISARM. It is reported loudly and separately so it can never be
+  # mistaken for coverage either.
+  if [[ $rc -eq 3 ]]; then
+    printf '  \033[33mREFUSED\033[0m %s declined to run for safety (exit 3) — this is correct behaviour\n' "$name"
+    SKIPPED_LIST+=("$name (safety refusal — NOT covered)")
+    return 0
+  fi
+  printf '  \033[31m>>> %s exited %d\033[0m\n' "$name" "$rc"
+  FAILED_LIST+=("$name (exit $rc)")
+  FAILED=1
 }
 
 run_check "telemetry"        bash "${DIR}/telemetry.sh"
 run_check "webrtc-transport" bash "${DIR}/webrtc-transport.sh"
-run_check "video-keyframes"  node "${DIR}/video-keyframes.js" 15
+# video-keyframes.js is NOT listed here. It exercises the h264 WebSocket path, and both the
+# script and the --inline fix it guards live on the shelved fix/video-continuity-over-webrtc-tcp
+# branch. Listing a check this branch does not carry would fail the run for the wrong reason;
+# re-add this line in the same commit that re-lands --inline.
 run_check "control-e2e"      node "${DIR}/control-e2e.js"
 
 hdr "On-target summary"
