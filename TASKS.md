@@ -357,14 +357,35 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   the new value. So `streams/webrtc.js` `setParamsNoRestart()` writes a file that changes nothing
   about the running encoder. `video_adaptive_apply` therefore defaults to `observe` (decide and
   log, apply nothing) with `restart` as a deliberate opt-in that costs the WebRTC session on every
-  step. Neither is the answer. Two things to settle, in order:
-  1. **Does the V4L2 `video_bitrate` control reach `mtxrpicam`'s encoder while streaming?** That
-     would make a rung free. Unverified — `mtxrpicam` owns `/dev/video*`, and V4L2 controls can be
-     per-file-handle, in which case an external write does nothing. ~10 minutes on a rover settles
-     it and it has been deferred three times.
-  2. If not, is there a way to make MediaMTX recreate just the path? There is no `api:` block in
-     the generated config today; enabling the API would allow a targeted path reload instead of a
-     full service restart.
+  step. Neither is the answer.
+
+  **THE V4L2 ROUTE IS CLOSED — measured on rover3 2026-08-06, a definitive negative.**
+  `/dev/video11` is `bcm2835-codec-encode` and `mtxrpicam` holds it open (fd 21). `video_bitrate`
+  exists (min 25000, max 25000000, step 25000) and is settable, but it is **per-file-handle**:
+  - set and get in ONE `v4l2-ctl` invocation (one `open()`) reads back `100000` — accepted;
+  - get from a SEPARATE `open()` reads `10000000`, the driver default — the write is gone;
+  - and a fresh open NEVER reports the ~200 kbps `mtxrpicam` is actually encoding at. That is the
+    clincher, and the one a set-then-get test alone would miss: `mtxrpicam`'s value lives in its
+    own handle, so there is nothing for an outside write to reach.
+  An out-of-process bitrate change is therefore impossible on this SoC, not merely unimplemented.
+  Do not spend more time on it.
+
+  **Every route to retuning the RUNNING encoder is now closed**, so what remains are trade-offs
+  rather than fixes:
+  1. `observe` (current default) — instrument only; fit the thresholds, apply nothing.
+  2. `restart` — works, costs a mediamtx restart and hence a dropped WebRTC session per step.
+  3. **Pick one good fixed bitrate and stop adapting.** Given the constraints this may be the
+     honest engineering answer for this platform, and it deserves judging on its merits rather
+     than being treated as giving up.
+  4. Enabling MediaMTX's HTTP API (no `api:` block is generated today) might allow recreating just
+     the `cam` path instead of restarting the service — cheaper than option 2, still an
+     interruption, and unverified.
+
+  **Worth recording for whoever revisits this:** a respawn is CHEAP on the h264 path and DEAR on
+  WebRTC. When picar spawns `rpicam-vid` itself it can respawn with new argv while the client's
+  WebSocket stays up and the viewer waits one keyframe; a mediamtx restart tears down the WebRTC
+  session and forces renegotiation. That does not redeem the h264 path, which failed for unrelated
+  and worse reasons, but it explains why adaptation is cheap there and expensive here.
 
 - **[P1] Fit the adaptive dBm thresholds to a logged drive** — `LADDER_STEPS` in
   `video-bitrate-controller.js` uses −60/−66/−72 dBm, which are estimates that have never been
