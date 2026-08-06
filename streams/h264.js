@@ -133,6 +133,42 @@ class NalParser {
 // unable to resync at all; only a hard backlog drops everything. Named and
 // exported so the rule itself is testable — a copy of it in a test would not
 // catch an inverted comparison here.
+// Build the camera argv. Extracted from start() so `--inline` is asserted by a test
+// rather than by reading the source — see MEASURED ON ROVER3 below for why that matters.
+//
+// --profile baseline: no B-frames; --intra N: IDR every N frames so a freeze after packet
+// loss is bounded; --bitrate CBR keeps IDR size predictable.
+//
+// --inline IS LOAD-BEARING AND WAS MISSING. MEASURED ON ROVER3, 2026-08-06: rpicam-vid
+// defaults it to 0, so it emits SPS/PPS exactly ONCE at stream start. The NAL types of
+// two consecutive key frames off the live socket were [7,8,5] and then [5] alone. This
+// module's own contract, stated at the top of the file, is that a keyframe packet carries
+// SPS+PPS "so the decoder can (re)configure itself" — and for every keyframe after the
+// first it did not.
+//
+// The consequence is the exact failure this transport was chosen to prevent. New clients
+// wait in wsPending for the first key frame; a client that connects late, or reconnects
+// after the link drops out of range, receives a key frame with no parameter sets and can
+// never configure its VideoDecoder. Video does not come back until the camera itself
+// restarts. Forcing the encoder to repeat the headers on every I-frame is the fix, and it
+// belongs in the encoder rather than in a JS cache of the last SPS/PPS: fewer moving
+// parts, and it cannot go stale on a resolution change.
+function buildCameraArgs({ width, height, fps, bitrate, intra }) {
+  return [
+    '--codec',     'h264',
+    '--width',     String(width),
+    '--height',    String(height),
+    '--framerate', String(fps),
+    '--bitrate',   String(bitrate),
+    '--intra',     String(intra),
+    '--inline',                      // repeat SPS/PPS with every I-frame; see above
+    '--profile',   'baseline',
+    '--nopreview',
+    '-t', '0',
+    '-o', '-',
+  ];
+}
+
 function shouldSendFrame(isKeyframe, backlog, dropDeltaBytes, dropAllBytes) {
   if (backlog > dropAllBytes) return false;
   if (!isKeyframe && backlog > dropDeltaBytes) return false;
@@ -262,21 +298,9 @@ function createH264Stream(config, streamServer) {
     if (!cameraCmd) { console.error('H264: no camera command available'); return; }
 
     let gotFirst = false;
-    // --profile baseline: no B-frames; --intra N: IDR every N frames (~0.5 s at
-    // 30 fps) so freeze after packet loss is bounded; --bitrate CBR keeps IDR
-    // size predictable (≤ ~8 KB at 600 kbps → < 130 ms on air).
-    const args = [
-      '--codec',     'h264',
-      '--width',     String(WIDTH),
-      '--height',    String(HEIGHT),
-      '--framerate', String(FPS),
-      '--bitrate',   String(BITRATE),
-      '--intra',     String(INTRA),
-      '--profile',   'baseline',
-      '--nopreview',
-      '-t', '0',
-      '-o', '-',
-    ];
+    const args = buildCameraArgs({
+      width: WIDTH, height: HEIGHT, fps: FPS, bitrate: BITRATE, intra: INTRA,
+    });
 
     console.log(`H264 starting ${WIDTH}×${HEIGHT}@${FPS}fps ${BITRATE/1000}kbps intra=${INTRA}`);
     cameraProc = spawn(cameraCmd, args);
@@ -377,4 +401,5 @@ module.exports.NalParser = NalParser;
 module.exports.shouldSendFrame = shouldSendFrame;
 module.exports.fanOutToClients = fanOutToClients;
 module.exports.MAX_NAL_BUFFER = MAX_NAL_BUFFER;
+module.exports.buildCameraArgs = buildCameraArgs;
 
