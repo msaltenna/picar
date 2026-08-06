@@ -28,12 +28,35 @@ hdr() { printf '\n\033[1m######## %s\033[0m\n' "$*"; }
 
 # Runs one check and records its outcome. Exit status is what decides — never the presence of
 # the word PASS in the output, which is how a summary comes to disagree with its own detail.
+#
+# THE FIRST VERSION OF THIS FUNCTION REPORTED "ON-TARGET CHECKS PASSED" WHILE RUNNING NOTHING.
+# Caught on rover3, 2026-08-06, first run. Two independent bugs, and both are worth naming
+# because they are the same class of defect this whole suite exists to catch:
+#
+#   1. It tested `[[ ! -e "$1" ]]` AFTER `shift`, so `$1` was the interpreter (`bash`, `node`)
+#      rather than the script path. Neither is a file in the working directory, so every
+#      check took the not-present branch.
+#   2. A missing check was a SKIP, and skips did not set FAILED — so the summary printed a
+#      green PASS having executed not one assertion.
+#
+# So: the script path is validated explicitly, a missing script is a FAILURE rather than a
+# skip (a named check that is absent means absent coverage, not a clean run), and a run in
+# which nothing executed cannot report success.
 run_check() {
   local name="$1"; shift
+  local interpreter="$1"
+  local script="$2"
   hdr "$name"
-  if [[ ! -e "$1" && ! -e "${DIR}/$(basename "$1")" ]]; then
-    printf '  \033[33mSKIP\033[0m %s not present\n' "$1"
-    SKIPPED_LIST+=("$name (missing)")
+  if ! command -v "$interpreter" >/dev/null 2>&1; then
+    printf '  \033[31mFAIL\033[0m interpreter %s is not available\n' "$interpreter"
+    FAILED_LIST+=("$name (no $interpreter)")
+    FAILED=1
+    return 0
+  fi
+  if [[ ! -f "$script" ]]; then
+    printf '  \033[31mFAIL\033[0m %s is missing — a named check that is absent is absent coverage\n' "$script"
+    FAILED_LIST+=("$name (missing $script)")
+    FAILED=1
     return 0
   fi
   if "$@"; then
@@ -59,8 +82,15 @@ for n in "${FAILED_LIST[@]:-}";  do [[ -n "$n" ]] && printf '  \033[31mFAIL\033[
 printf '\n  not run here: video-drop.sh (needs root, restarts services, rewrites the overlay)\n'
 printf '  not run here: any check that commands motion — control-e2e.js ran in its refusing mode\n'
 
+# A run in which nothing executed must never report success. This is the backstop for the
+# bug above: even if some future edit reintroduces a silent skip, an empty pass list fails.
+if [[ ${#PASSED_LIST[@]} -eq 0 ]]; then
+  printf '\n\033[31mON-TARGET CHECKS FAILED\033[0m — no check actually ran\n'
+  exit 1
+fi
+
 if [[ $FAILED -eq 0 ]]; then
-  printf '\n\033[32mON-TARGET CHECKS PASSED\033[0m\n'
+  printf '\n\033[32mON-TARGET CHECKS PASSED\033[0m (%d checks)\n' "${#PASSED_LIST[@]}"
 else
   printf '\n\033[31mON-TARGET CHECKS FAILED\033[0m\n'
 fi
