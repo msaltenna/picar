@@ -49,6 +49,14 @@ function generateMediaMTXConfig(cfg, params) {
   // listener", and an empty string has meant "listen on all interfaces" in some config
   // parsers. Absent is the unambiguous form.
   const iceTcpLine = iceTcp ? `webrtcLocalTCPAddress: :${udpPort}\n` : '';
+  // Cap concurrent viewers. A second reader doubles what the rover transmits over the same
+  // half-duplex airtime the control channel needs, and it is invisible to the operator —
+  // measured 2026-08-06, a forgotten browser tab streamed through the middle of a range test
+  // and logged `reader is too slow, discarding ~42 frames` every second while the operator
+  // was at distance. 0 means unlimited in MediaMTX, so a misconfigured 0 must not silently
+  // become "uncapped": anything that is not a positive integer falls back to 1.
+  const rawReaders = cfg.webrtc_max_readers;
+  const maxReaders = Number.isInteger(rawReaders) && rawReaders > 0 ? rawReaders : 1;
   const keyPath  = cfg.mediamtx_key  || path.join(__dirname, '..', 'certs', 'key.pem');
   const certPath = cfg.mediamtx_cert || path.join(__dirname, '..', 'certs', 'cert.pem');
   const camPath  = (cfg.webrtc_path  || 'cam').replace(/^\/+/, '');
@@ -79,6 +87,7 @@ paths:
   ${camPath}:
     source: rpiCamera
     sourceOnDemand: false
+    maxReaders: ${maxReaders}
     rpiCameraCamID: ${cfg.webrtc_cam_id ?? 0}
     rpiCameraWidth: ${params.width}
     rpiCameraHeight: ${params.height}

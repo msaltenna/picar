@@ -90,3 +90,31 @@ test('the ICE port follows webrtc_udp_port for both transports', () => {
   assert.equal(valueOf(both, 'webrtcLocalTCPAddress'), ':9999',
     'the opt-in TCP listener must use the configured port, not a hardcoded 8189');
 });
+
+// ── maxReaders ───────────────────────────────────────────────────────────────
+//
+// A second viewer doubles the rover's uplink over the airtime the control channel needs.
+// This is not hypothetical: on 2026-08-06 an agent's forgotten browser tab streamed video
+// from a tunnelled address straight through a range test, logging `reader is too slow,
+// discarding ~42 frames` every second while the operator was out at distance, and its
+// discard messages were briefly mistaken for evidence about the operator's own session.
+
+test('the camera path caps concurrent readers at 1 by default', () => {
+  const yml = generateMediaMTXConfig({}, PARAMS);
+  assert.equal(valueOf(yml, '    maxReaders'), '1',
+    'an uncapped path lets a second viewer halve the link the operator is driving on');
+});
+
+test('a valid explicit reader cap is honoured', () => {
+  assert.equal(valueOf(generateMediaMTXConfig({ webrtc_max_readers: 3 }, PARAMS), '    maxReaders'), '3');
+});
+
+// MediaMTX treats maxReaders: 0 as UNLIMITED, so 0 is the one value that must not pass
+// through — it reads like "none" and means "no limit". Same for junk from a hand-edited
+// overlay: the safe direction must be the default.
+test('0, negatives and junk fall back to 1 rather than becoming unlimited', () => {
+  for (const v of [0, -1, 2.5, '5', null, 'many', {}, NaN]) {
+    assert.equal(valueOf(generateMediaMTXConfig({ webrtc_max_readers: v }, PARAMS), '    maxReaders'), '1',
+      `webrtc_max_readers=${JSON.stringify(v)} must fall back to 1, not to MediaMTX's unlimited`);
+  }
+});
