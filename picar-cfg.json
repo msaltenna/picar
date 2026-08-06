@@ -47,8 +47,9 @@
   "light_on_us": 2000,
   "light_off_us": 1000,
 
-  "comment3": "stream_codec: 'webrtc' uses MediaMTX (https://host:8889/cam). Fallbacks: 'h264' or 'mjpeg'.",
-  "stream_codec": "webrtc",
+  "comment3": "stream_codec: 'h264' streams Annex-B over the WebSocket on :8081 and is the DEFAULT for field use. 'webrtc' uses MediaMTX (https://host:8889/cam); 'mjpeg' is the last resort. NOTE 'webrtc' additionally requires mediamtx.service to be running, and it OWNS THE CAMERA — the h264 and mjpeg paths spawn rpicam-vid themselves, so mediamtx.service must be stopped for them to open the camera at all.",
+  "comment_codec_choice": "WHY NOT WEBRTC, measured on rover3 2026-08-06. Out-of-sight video loss was diagnosed from the logs of a real drive: every WebRTC session negotiated ICE over TCP, never UDP (local candidate host/tcp/:8189, remote prflx/tcp on all four sessions). WebRTC over TCP is the worst of both designs - it keeps WebRTC's assumption that it may drop media freely, while running on a transport with head-of-line blocking. When the media path moved onto the tactical radio subnet the TCP connection could not keep up, back-pressure reached the camera through MediaMTX's pipe, and the SHARED HARDWARE ENCODER STARVED: 544 'ioctl(VIDIOC_QBUF) failed' in 112 s, ending in the same second the session was torn down. Offered bitrate was only 200 kbps at the time, so this was NOT the link being saturated by an over-ambitious setting. The failure mode is total - video stops for every viewer and does not recover until the session ends. The h264 path cannot fail that way: Node always drains rpicam-vid's stdout so the encoder is never starved, and backlog is shed per-client by h264_drop_* below, keyframes last. That trades latency for continuity, which is the stated operating priority. TO REVERT: set stream_codec back to 'webrtc' and start mediamtx.service.",
+  "stream_codec": "h264",
 
   "webrtc_protocol": "https",
   "webrtc_port": 8889,
@@ -65,13 +66,14 @@
   "webrtc_h264_level": "4.1",
   "webrtc_denoise": "cdn_fast",
 
-  "h264_width": 640,
-  "h264_height": 480,
-  "h264_framerate": 30,
-  "h264_bitrate_kbps": 600,
-  "h264_intra_period": 15,
+  "comment_h264_params": "Deliberately set to the SAME picture the WebRTC path was serving when it failed (320x240@10, ~200-250 kbps, from rover3's overlay experiment) so that switching transport changes one variable and not two. intra_period 10 at 10 fps is one IDR per second, which bounds how long a frozen picture stays frozen after the link sheds frames - recovery is the point of this path, so pay the keyframe cost.",
+  "h264_width": 320,
+  "h264_height": 240,
+  "h264_framerate": 10,
+  "h264_bitrate_kbps": 250,
+  "h264_intra_period": 10,
 
-  "comment_latency": "Video latency is bounded by DROPPING stale frames rather than queueing them. h264_drop_delta_bytes: per-client WebSocket backlog above which delta frames are dropped (keyframes still sent so the client can resync). h264_drop_all_bytes: hard backlog above which everything is dropped. mjpeg_drop_bytes: socket backlog above which an MJPEG frame is skipped.",
+  "comment_latency": "Video latency is bounded by DROPPING stale frames rather than queueing them. h264_drop_delta_bytes: per-client WebSocket backlog above which delta frames are dropped (keyframes still sent so the client can resync). h264_drop_all_bytes: hard backlog above which everything is dropped. mjpeg_drop_bytes: socket backlog above which an MJPEG frame is skipped. These are the knob that implements continuity-over-latency: shedding deltas while still sending keyframes means a starved link shows a slow, stale picture that keeps refreshing, instead of a stream that stops. Read the code comment before retuning them - bufferedAmount counts only userspace queueing, so the real latency bound is 'kernel socket buffer plus this', not this.",
   "h264_drop_delta_bytes": 49152,
   "h264_drop_all_bytes": 204800,
   "mjpeg_drop_bytes": 65536
