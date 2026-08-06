@@ -33,6 +33,14 @@ function createAdaptiveBitrate({
   sink,
   log = console.log,
   now = () => Date.now(),
+  // Periodic signal trace. WITHOUT THIS AN OBSERVE-MODE DRIVE PRODUCES NOTHING: the loop
+  // otherwise logs only when it DECIDES a step, so if the dBm thresholds are too pessimistic
+  // to ever fire — which is the leading hypothesis, since they have never been exercised —
+  // the journal would record silence and we would be back to impressions. The trace is what
+  // makes the thresholds fittable: signal over time, alongside the rung the controller held
+  // and what it was leaning towards. 5 s is ~12 lines a minute, cheap in the journal and
+  // fine-grained enough to line up against MediaMTX's own session and discard messages.
+  traceEveryMs = 5000,
 } = {}) {
   if (!controller || typeof controller.sample !== 'function') {
     throw new TypeError('createAdaptiveBitrate requires a controller');
@@ -44,6 +52,7 @@ function createAdaptiveBitrate({
   let lastApplied  = null;
   let lastOutcome  = null;
   let applyErrors  = 0;
+  let lastTraceAt  = null;
 
   // Called once per telemetry tick with the snapshot. Returns the controller's decision so
   // a test can assert it; the return value is not used in production.
@@ -54,7 +63,23 @@ function createAdaptiveBitrate({
       // one failed /proc read costs nothing while a persistently unreadable one steps down.
       const wifi = snapshot && snapshot.wifi;
       const signalDbm = wifi && typeof wifi.signalDbm === 'number' ? wifi.signalDbm : null;
-      const decision = controller.sample({ signalDbm, at: now() });
+      const at = now();
+      const decision = controller.sample({ signalDbm, at });
+
+      // Trace first, and unconditionally, so a run that never steps still yields the data.
+      if (traceEveryMs > 0 && (lastTraceAt === null || at - lastTraceAt >= traceEveryMs)) {
+        lastTraceAt = at;
+        try {
+          const rung = controller.current();
+          const pending = decision && decision.pendingTarget !== null && decision.pendingTarget !== undefined
+            ? controller.profiles[decision.pendingTarget].name
+            : 'none';
+          log(`video-adaptive: trace signal=${signalDbm === null ? 'unreadable' : signalDbm + 'dBm'} ` +
+              `rung=${rung.name}(${rung.bitrateKbps}k@${rung.fps}) pending=${pending} ` +
+              `reason=${(decision && decision.reason) || 'none'}`);
+        } catch (_) { /* a trace must never break the loop */ }
+      }
+
       if (!decision || !decision.change) return decision || null;
 
       const profile = decision.change;
@@ -63,7 +88,12 @@ function createAdaptiveBitrate({
       // serialises internally, so overlapping calls cannot interleave writes.
       sink.applyProfile(profile).then((outcome) => {
         lastOutcome = outcome;
-        if (outcome && outcome.applied) {
+        // `=== true`, not truthiness. The sink's contract is a boolean, but an outcome of
+        // `{applied: {}}` — an EMPTY applied set, i.e. nothing was applied — is truthy, and
+        // would be logged as a successful step. Given how much of this session was spent on
+        // things reporting success they had not achieved, the strict comparison is worth the
+        // character count.
+        if (outcome && outcome.applied === true) {
           lastApplied = profile;
           try {
             log(`video-adaptive: stepped ${decision.reason} to ${profile.name} — ` +

@@ -273,3 +273,66 @@ test('constructing without a controller or sink throws immediately', () => {
   assert.throws(() => createAdaptiveBitrate({ sink: { applyProfile() {} } }), TypeError);
   assert.throws(() => createAdaptiveBitrate({ controller: { sample() {} } }), TypeError);
 });
+
+// ── The trace, which is the deliverable of an observe-mode drive ──────────────
+
+test('a periodic trace is emitted even when nothing ever steps', () => {
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+    now: () => t, minApplyIntervalMs: 0 });
+  // A strong, steady signal: the controller holds at the ceiling and decides nothing.
+  for (let i = 0; i < 12; i++) { t += 2000; a.onTelemetry({ wifi: { signalDbm: -41 } }); }
+  const traces = lines.filter((l) => /trace signal=/.test(l));
+  assert.ok(traces.length >= 4,
+    'without a trace an observe run that never steps produces NO data, and fitting the dBm ' +
+    `thresholds becomes guesswork again — got ${traces.length} trace lines`);
+  assert.match(traces[0], /signal=-41dBm/);
+  assert.match(traces[0], /rung=full\(200k@10\)/);
+});
+
+test('the trace records an unreadable signal as such, not as a number', () => {
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+    now: () => t, minApplyIntervalMs: 0 });
+  t += 6000;
+  a.onTelemetry({ wifi: null });
+  assert.match(lines.filter((l) => /trace/.test(l)).join('\n'), /signal=unreadable/,
+    'a missing reading must be distinguishable in the log from a strong one');
+});
+
+test('the trace names what the controller is leaning towards', () => {
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+    now: () => t, minApplyIntervalMs: 0 });
+  // Below 'full' but above 'low': a step is pending but the sustain window has not elapsed.
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -68 } });
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -68 } });
+  const traces = lines.filter((l) => /trace/.test(l));
+  assert.match(traces.join('\n'), /pending=medium/,
+    'the pending target is what tells us whether a threshold was nearly crossed — the most ' +
+    'useful signal for deciding they are too pessimistic');
+});
+
+// A truthy-but-empty applied set must not read as a successful step.
+test('an empty applied set is not a successful step', async () => {
+  const a = createAdaptiveBitrate({
+    controller: {
+      sample: () => ({ change: { name: 'x', width: 1, height: 1, fps: 1, bitrateKbps: 1 }, reason: 'down' }),
+      current: () => ({ name: 'x', bitrateKbps: 1, fps: 1 }), currentIndex: () => 0, profiles: [],
+    },
+    sink: { applyProfile: () => Promise.resolve({ applied: {} }) },
+    log: quiet,
+    traceEveryMs: 0,
+  });
+  a.onTelemetry({ wifi: { signalDbm: -90 } });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(a.state().lastApplied, null,
+    '{applied: {}} is truthy but means nothing was applied');
+  assert.equal(a.state().applyErrors, 1);
+});
