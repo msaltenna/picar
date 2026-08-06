@@ -26,6 +26,41 @@
 
 const { createBitrateController, buildLadder } = require('./video-bitrate-controller');
 const { createBitrateSink } = require('./video-bitrate-sink');
+const { spawn } = require('child_process');
+
+// Read the negotiated tx rate from `iw`, or null. This is the one useful number that is not
+// already in /proc/net/wireless, and it separates two failure modes the 2026-08-06 drive could
+// not distinguish: a weak-but-fast link (loss) from a strong-but-collapsed one (MCS fallback).
+//
+// spawn, not exec: no shell, and no buffering of output nobody reads. Called at the TRACE
+// interval (0.2 Hz), never per tick. It resolves null on every failure path — a missing `iw`,
+// a non-zero exit, unparseable output, or the timeout — because an absent number must never
+// look like a good one.
+function makeTxBitrateReader(iface = 'wlan0', timeoutMs = 2000) {
+  return function readTxBitrate() {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      let child;
+      try {
+        child = spawn('iw', ['dev', iface, 'link'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      } catch (_) { return finish(null); }
+      // Bounded: a hung `iw` must not leak a child per trace for the life of the process.
+      const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(null); }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+      let out = '';
+      // Bound the buffer too. `iw link` output is a few hundred bytes; anything larger means
+      // something is wrong and is not worth accumulating on the control process's heap.
+      child.stdout.on('data', (d) => { if (out.length < 8192) out += d; });
+      child.on('error', () => { clearTimeout(timer); finish(null); });
+      child.on('close', () => {
+        clearTimeout(timer);
+        const m = /tx bitrate:\s*([0-9.]+\s*[A-Za-z/]+)/i.exec(out);
+        finish(m ? m[1].replace(/\s+/g, '') : null);
+      });
+    });
+  };
+}
 
 // The decision half, with no knowledge of where samples come from.
 function createAdaptiveBitrate({
@@ -41,6 +76,12 @@ function createAdaptiveBitrate({
   // and what it was leaning towards. 5 s is ~12 lines a minute, cheap in the journal and
   // fine-grained enough to line up against MediaMTX's own session and discard messages.
   traceEveryMs = 5000,
+  // Reads the negotiated tx rate, or null. Injected so this module never reaches for a
+  // subprocess itself and so tests can drive it. It is called at the TRACE interval (0.2 Hz),
+  // never per tick — spawning is cheap at that rate and asynchronous either way, but the
+  // history of pwm_libgpiod spawning ~200 processes a second on this platform is the reason
+  // to state the rate explicitly rather than leave it to be discovered.
+  readTxBitrate = null,
 } = {}) {
   if (!controller || typeof controller.sample !== 'function') {
     throw new TypeError('createAdaptiveBitrate requires a controller');
@@ -53,6 +94,8 @@ function createAdaptiveBitrate({
   let lastOutcome  = null;
   let applyErrors  = 0;
   let lastTraceAt  = null;
+  let lastRetries  = null;      // cumulative counter; the RATE is what means anything
+  let txBitrate    = null;      // refreshed asynchronously, so a trace may show the prior value
 
   // Called once per telemetry tick with the snapshot. Returns the controller's decision so
   // a test can assert it; the return value is not used in production.
@@ -68,16 +111,41 @@ function createAdaptiveBitrate({
 
       // Trace first, and unconditionally, so a run that never steps still yields the data.
       if (traceEveryMs > 0 && (lastTraceAt === null || at - lastTraceAt >= traceEveryMs)) {
+        const elapsedMs = lastTraceAt === null ? null : at - lastTraceAt;
         lastTraceAt = at;
         try {
           const rung = controller.current();
           const pending = decision && decision.pendingTarget !== null && decision.pendingTarget !== undefined
             ? controller.profiles[decision.pendingTarget].name
             : 'none';
+
+          // Retries per second, differenced here because the kernel counter is cumulative.
+          // A counter that only ever goes up tells you nothing at a glance; a rate does.
+          const nowRetries = wifi && typeof wifi.retries === 'number' ? wifi.retries : null;
+          let retryRate = 'n/a';
+          if (nowRetries !== null && lastRetries !== null && elapsedMs > 0) {
+            const d = nowRetries - lastRetries;
+            // A negative delta means the counter reset (interface reinit); report rather than
+            // print a nonsensical negative rate.
+            retryRate = d < 0 ? 'reset' : `${(d / (elapsedMs / 1000)).toFixed(1)}/s`;
+          }
+          if (nowRetries !== null) lastRetries = nowRetries;
+
           log(`video-adaptive: trace signal=${signalDbm === null ? 'unreadable' : signalDbm + 'dBm'} ` +
+              `tx=${txBitrate === null ? 'n/a' : txBitrate} retries=${retryRate} ` +
               `rung=${rung.name}(${rung.bitrateKbps}k@${rung.fps}) pending=${pending} ` +
               `reason=${(decision && decision.reason) || 'none'}`);
         } catch (_) { /* a trace must never break the loop */ }
+
+        // Refresh the tx rate for the NEXT trace. Deliberately not awaited: this runs inside
+        // the telemetry tick, and a subprocess must never put its latency on the path that
+        // also feeds the fail-safe's event loop.
+        if (typeof readTxBitrate === 'function') {
+          try {
+            Promise.resolve(readTxBitrate())
+              .then((v) => { txBitrate = typeof v === 'string' && v ? v : null; }, () => { txBitrate = null; });
+          } catch (_) { txBitrate = null; }
+        }
       }
 
       if (!decision || !decision.change) return decision || null;
@@ -145,6 +213,7 @@ function buildAdaptiveBitrate({
   log = console.log,
   now,
   minApplyIntervalMs,
+  readTxBitrate,          // test seam; production builds one from `iw` below
 } = {}) {
   const enabled = config.video_adaptive_bitrate !== false;   // opt-out, not opt-in
   if (!enabled) {
@@ -257,7 +326,10 @@ function buildAdaptiveBitrate({
           + 'produces the data to fit the dBm thresholds.'
         : '. APPLY VIA MEDIAMTX RESTART: each step drops the WebRTC session.'));
 
-  return createAdaptiveBitrate({ controller, sink, log, now });
+  return createAdaptiveBitrate({
+    controller, sink, log, now,
+    readTxBitrate: readTxBitrate || makeTxBitrateReader(config.wifi_iface || 'wlan0'),
+  });
 }
 
-module.exports = { createAdaptiveBitrate, buildAdaptiveBitrate };
+module.exports = { createAdaptiveBitrate, buildAdaptiveBitrate, makeTxBitrateReader };

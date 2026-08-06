@@ -336,3 +336,86 @@ test('an empty applied set is not a successful step', async () => {
     '{applied: {}} is truthy but means nothing was applied');
   assert.equal(a.state().applyErrors, 1);
 });
+
+// ── Retry rate and tx bitrate in the trace ───────────────────────────────────
+//
+// dBm alone could not explain the 2026-08-06 freeze: it happened at −67 dBm on a link whose
+// nominal tx rate was 72 Mbit/s. These two fields separate the hypotheses — retries/s measures
+// airtime burned on retransmission, tx bitrate measures MCS collapse.
+
+test('the trace reports retries as a RATE, differenced from the cumulative counter', () => {
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+    now: () => t, minApplyIntervalMs: 0, readTxBitrate: () => Promise.resolve(null) });
+  // First trace has no previous sample to difference against.
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50, retries: 1000 } });
+  // 60 more retries over 6 s = 10/s.
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50, retries: 1060 } });
+  const traces = lines.filter((l) => /trace/.test(l));
+  assert.match(traces[0], /retries=n\/a/, 'the first sample has nothing to difference against');
+  assert.match(traces[1], /retries=10\.0\/s/,
+    'a cumulative counter means nothing at a glance; the rate is the diagnostic');
+});
+
+test('a retry counter that resets is reported as such, not as a negative rate', () => {
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+    now: () => t, minApplyIntervalMs: 0, readTxBitrate: () => Promise.resolve(null) });
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50, retries: 5000 } });
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50, retries: 12 } });   // interface reinit
+  assert.match(lines.filter((l) => /trace/.test(l))[1], /retries=reset/,
+    'an interface reinit must not print a nonsensical negative rate');
+});
+
+test('a missing retry field degrades to n/a rather than NaN', () => {
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+    now: () => t, minApplyIntervalMs: 0, readTxBitrate: () => Promise.resolve(null) });
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50 } });
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50 } });
+  assert.doesNotMatch(lines.join('\n'), /NaN/, 'NaN in a log poisons any later arithmetic on it');
+});
+
+test('the tx bitrate appears once the reader has resolved, and n/a until then', async () => {
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+    now: () => t, minApplyIntervalMs: 0,
+    readTxBitrate: () => Promise.resolve('72.2MBit/s') });
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50, retries: 1 } });
+  await new Promise((r) => setImmediate(r));
+  t += 6000; a.onTelemetry({ wifi: { signalDbm: -50, retries: 2 } });
+  const traces = lines.filter((l) => /trace/.test(l));
+  assert.match(traces[0], /tx=n\/a/, 'the first trace fires before any read has resolved');
+  assert.match(traces[1], /tx=72\.2MBit\/s/);
+});
+
+// The reader runs a subprocess on the box that also runs the fail-safe. It must never reject,
+// never throw, and never let a failure masquerade as a reading.
+test('a failing tx-bitrate reader never breaks the trace and never invents a value', async () => {
+  for (const bad of [() => Promise.reject(new Error('no iw')),
+                     () => { throw new Error('spawn failed'); },
+                     () => Promise.resolve(undefined),
+                     () => Promise.resolve(''),
+                     () => Promise.resolve(42)]) {
+    const lines = [];
+    let t = 0;
+    const a = buildAdaptiveBitrate({
+      config: BASE, stream: stubStream(), log: (...m) => lines.push(m.join(' ')),
+      now: () => t, minApplyIntervalMs: 0, readTxBitrate: bad });
+    t += 6000;
+    assert.doesNotThrow(() => a.onTelemetry({ wifi: { signalDbm: -50, retries: 1 } }));
+    await new Promise((r) => setImmediate(r));
+    t += 6000;
+    assert.doesNotThrow(() => a.onTelemetry({ wifi: { signalDbm: -50, retries: 2 } }));
+    assert.match(lines.filter((l) => /trace/.test(l))[1], /tx=n\/a/,
+      'an unavailable tx rate must read as n/a, never as a stale or fabricated number');
+  }
+});

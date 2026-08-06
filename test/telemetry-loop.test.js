@@ -153,7 +153,7 @@ test('the wifi read is asynchronous — a tick never waits on /proc', async () =
   await new Promise((r) => setImmediate(r));
   h.loop.tick();
   assert.deepEqual(h.calls.emits[1][1].wifi,
-    { iface: 'wlan0', qualityPct: 93, signalDbm: -58 },
+    { iface: 'wlan0', qualityPct: 93, signalDbm: -58, retries: null },
     'and the next tick must carry the reading the async read produced');
 });
 
@@ -191,7 +191,7 @@ test('parseWirelessProc reads a real /proc/net/wireless', () => {
     ' wlan0: 0000   65.  -58.  -95.       0      0      0      0     41        0',
   ].join('\n');
   assert.deepEqual(parseWirelessProc(real),
-    { iface: 'wlan0', qualityPct: 93, signalDbm: -58 });
+    { iface: 'wlan0', qualityPct: 93, signalDbm: -58, retries: 0 });
 });
 
 test('parseWirelessProc returns null when no interface is present', () => {
@@ -494,4 +494,32 @@ test('buildTelemetryWiring forwards onTick rather than dropping it', () => {
   assert.strictEqual(wiring.onTick, fn,
     'app.js passes onTick through this builder; dropping it here would silently disable ' +
     'adaptive bitrate with every unit test still green');
+});
+
+
+// ── The retry counter ────────────────────────────────────────────────────────
+//
+// Free to collect — /proc/net/wireless is already read once a second — and it measures what
+// dBm cannot: airtime burned on retransmission. The drive on 2026-08-06 froze at −67 dBm on a
+// link whose nominal tx rate was 72 Mbit/s, so signal strength alone could not explain it, and
+// there was no retry record for the window to check against.
+
+test('parseWirelessProc reads the retry counter from column 7', () => {
+  const real = [
+    'Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE',
+    ' face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22',
+    ' wlan0: 0000   63.  -47.  -256        0      0      0    747      0        0',
+  ].join('\n');
+  const w = parseWirelessProc(real);
+  assert.equal(w.retries, 747,
+    'column 7 is retry; picking a neighbouring column would silently report nwid, frag or misc');
+  // Pinned together so an off-by-one in the column index cannot pass by coincidence.
+  assert.equal(w.signalDbm, -47);
+  assert.equal(w.qualityPct, 90);
+});
+
+test('a short /proc line with no retry column yields null, not NaN', () => {
+  const w = parseWirelessProc('x\ny\nwlan0: 0000 65. -58. -95.');
+  assert.equal(w.retries, null,
+    'NaN would render as "NaN" in the trace and silently poison any rate arithmetic');
 });

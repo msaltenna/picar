@@ -42,11 +42,19 @@ function parseWirelessProc(text) {
   // status, link quality, signal level (dBm), noise level
   const quality = parseFloat(cols[1]);
   const signal  = parseFloat(cols[2]);
+  // Column 7 is the cumulative "discarded: retry" counter. It is FREE — this file is already
+  // being read once a second — and it measures something dBm cannot: how much airtime the
+  // link is burning on retransmissions. A drive on 2026-08-06 froze at −67 dBm on a link
+  // whose nominal tx rate was 72 Mbit/s, so signal strength alone could not explain it and
+  // there was no record of retries during the window to check against.
+  const retries = parseFloat(cols[7]);
   return {
     iface: iface.trim(),
     // Quality is reported out of 70 by most drivers.
     qualityPct: Number.isFinite(quality) ? Math.round((quality / 70) * 100) : null,
     signalDbm:  Number.isFinite(signal) ? signal : null,
+    // Cumulative since boot; a rate is what matters, so consumers difference it themselves.
+    retries:    Number.isFinite(retries) ? retries : null,
   };
 }
 
