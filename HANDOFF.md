@@ -92,6 +92,95 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-06 — Out-of-sight video loss diagnosed; video moved off WebRTC-over-TCP
+
+`fix/video-continuity-over-webrtc-tcp`, **deployed to rover3, NOT merged and NOT field-tested.**
+Deployed at `5df17f0`. The operating priority was given as continuity: laggy video and laggy
+input are acceptable, a stream that stops is not.
+
+**The diagnosis came from the logs of the failed drive, and it was not the suspected cause.**
+The suspicion was the frame-dropping "latency code". That code (`h264_drop_*`, `mjpeg_drop_bytes`)
+exists only in the h264 and mjpeg streamers, and `stream_codec` was `webrtc` — **it was not in
+the active path at all and could not have contributed.** It is the fix, not the fault.
+
+What the logs actually showed, in the window the clock skew hides (NTP jumped ~18.7 h mid-boot,
+so the drive is logged as `Aug 05 23:57`–`Aug 06 00:02` but happened ~18:39–18:44 real time):
+
+1. **The control link never failed.** Three input-watchdog trips across five minutes and no
+   reconnect storm. Input was not the casualty — a useful correction to the earlier assumption
+   that command loss was the primary symptom.
+2. **Every WebRTC session negotiated ICE over TCP, never UDP** — all four sessions logged
+   `local candidate: host/tcp/…:8189, remote candidate: prflx/tcp/…`. UDP 8189 was bound and
+   listening and the rover has no firewall, so this is candidate gathering, not a blocked port.
+   Filed in `TASKS.md`.
+3. **The media path migrated onto the tactical radio mid-session.** Local candidate changed from
+   `192.168.31.223` (wlan0) to `192.168.10.224` (eth0). The radio was a DHCP router on
+   `192.168.10.0/24` renewing every ~99 s, and it became the default route. Its carrier dropped
+   at the end of the test.
+4. **The shared hardware encoder then starved:** 544 `ioctl(VIDIOC_QBUF) failed` inside 112 s,
+   ending in the *same second* the session was torn down. Video stops for every viewer and does
+   not recover until the session ends.
+5. **Offered bitrate was only 200 kbps at the time**, so this was not an over-ambitious setting
+   saturating the link. Lowering bitrate further would not have prevented it.
+
+WebRTC over TCP is the worst of both designs: it keeps WebRTC's assumption that it may shed media
+freely, on a transport with head-of-line blocking that will not let it. The h264 path cannot fail
+that way — Node always drains `rpicam-vid`'s stdout so the encoder is never starved, and backlog
+is shed per-client with keyframes shed last.
+
+**A second, worse defect was found while validating the fix, and it was hiding inside it.**
+`rpicam-vid` defaults `--inline` to 0, so it emitted SPS/PPS exactly once at stream start.
+Measured off the live socket: consecutive key frames carried NAL types `[7,8,5]` then `[5]`
+alone. New clients wait in `wsPending` for a key frame, so a client that connects late — or
+reconnects after the link drops out of range — got a key frame with no parameter sets, could
+never configure its `VideoDecoder`, and would show nothing. **Out of range is exactly when
+clients reconnect, so this would have fired on the next field test.** Fixed with `--inline`.
+
+**On-rover evidence at `5df17f0`:**
+
+- `310/310` host tests on target, 0 cancelled.
+- `test/on-target/video-keyframes.js` (new): **PASS** — 20/20 key frames carry SPS+PPS+IDR and
+  the first delivered frame is a key frame. 10.7 fps, ~268 kbps at 320x240.
+- **Late-join case, which is the reconnect case:** client B joined a camera already streaming for
+  client A. Both PASS; B's first frame was a decodable key frame.
+- **Negative control run, so the check is known not to be vacuous:** with `--inline` removed on
+  target, both clients FAIL and every key frame after the first reports
+  `missing SPS(7)+PPS(8) — nal types [5]`. Restored, PASS again.
+- `video-drop.sh h264`: **ALL CHECKS PASSED.** With thresholds forced to 1024/4096 the server
+  shed 19 frames at a time while the slow client **still received key frames** — continuity under
+  extreme backlog, demonstrated on hardware. Cleanup correctly left mediamtx stopped.
+- `telemetry.sh`: PASSED WITH WARNINGS (pre-existing; absent subsystems). Footer now reports
+  `BATTERY MEASURED AT 7.526 V drawing 0.39 A`.
+- Autopilot heartbeat up, all 11 critical params verified, `NRestarts=0`, both control-port P0s
+  still hold (secrets 404, Range 200 with the PID unchanged).
+
+**WHAT IS NOT VALIDATED, and it is the thing that matters:** the out-of-sight drive that motivated
+this. Everything above is bench evidence on a strong link (−37 to −47 dBm). Also **the browser has
+never decoded this stream** — the Chrome extension was unavailable, so WebCodecs end-to-end is
+unverified. `socket.html` has the decode path and key frames now carry SPS+PPS, but a real browser
+has not been pointed at it. **Check that before driving.**
+
+**ROVER3 IS LEFT IN A NON-DEFAULT STATE — read this before the next session:**
+
+- On branch `fix/video-continuity-over-webrtc-tcp` at `5df17f0`, **not `main`**.
+- **`mediamtx.service` is stopped AND disabled.** This is required: it owns the camera, and
+  `rpicam-vid` cannot open it otherwise. Nothing in the code enforces this coupling.
+- To revert to WebRTC: set `stream_codec` back to `"webrtc"`, then
+  `sudo systemctl enable --now mediamtx && sudo systemctl restart picar`.
+- The untracked overlay was cleaned: the 2026-08-04 `webrtc_*` bandwidth experiment is **removed**
+  (video now comes from the tracked config, per invariant 8), and its `_comment_battery` no longer
+  claims rover3 has no flight battery. A pack is installed and live.
+- Untracked `field-log.sh` is left in `/opt/picar` from an earlier session.
+
+Also on this branch: `telemetry.sh` printed the false "rover3 has no flight battery connected, so
+no mechanical actuation is observed or implied" on **every run**, and `video-drop.sh`'s cleanup ran
+`systemctl start mediamtx` unconditionally — which with h264 as the default would hand the camera
+back to a stopped service on every run, from the script whose purpose is safe restoration. Both
+fixed.
+
+**Review gate NOT yet satisfied.** No Second Opinion review has run on this branch. It must not
+merge until one does.
+
 ### 2026-08-05 — Two P0s on the unauthenticated control port: crash-without-fail-safe, and served private keys
 
 `fix/crash-failsafe` and `fix/no-secrets-over-http`, both merged. Found by an adversarial

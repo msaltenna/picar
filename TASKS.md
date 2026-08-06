@@ -350,6 +350,51 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **Field-validate the h264 video transport out of sight** — `fix/video-continuity-over-webrtc-tcp`
+  is deployed on rover3 and has bench evidence only, all of it on a strong link (−37 to −47 dBm).
+  The drive that motivated it — out of the building, beyond line of sight, on the tactical radio —
+  has not been run. Until it has, the change is **unvalidated** and must not merge. Pin down one
+  thing the logs could not settle: which link the video actually crossed. The operator's laptop had
+  addresses on both subnets (`192.168.31.141` over WiFi, `192.168.10.10` behind the radio) and
+  signalling always came from the radio side while the first two sessions' media went over WiFi.
+  Connect explicitly to the radio-side address so the next test measures one path.
+
+- **The browser has never decoded the h264 stream** — the Chrome extension was unavailable during
+  validation, so WebCodecs end-to-end is unverified. Key frames now carry SPS+PPS (proven on
+  target) and `socket.html` has the decode path, but no real browser has been pointed at it. Note
+  the client-side risk this leaves: WebCodecs is fine on Chrome, and **iOS Safari only gained it in
+  17** — the tilt-control phone workflow may not decode at all. Check a phone as well as a laptop.
+
+- **WebRTC never negotiated ICE over UDP, only TCP** — all four sessions on 2026-08-06 logged
+  `local candidate: host/tcp/…:8189, remote candidate: prflx/tcp/…`. UDP 8189 was bound and
+  listening (`ss -lunp`) and the rover has no firewall, so the port was reachable and this is
+  candidate gathering. `mediamtx.yml` has `webrtcAdditionalHosts: []` and
+  `webrtcIPsFromInterfaces: true`; the client is multi-homed and `prflx` on every session says its
+  own candidates were never usable. WebRTC over TCP is what turned a weak link into a starved
+  encoder, so this must be fixed **before webrtc is ever made the default again**. Low priority
+  while the h264 path is in use, and a blocker for reverting.
+
+- **The camera-ownership coupling is not enforced anywhere in code** — `mediamtx.service` and
+  `rpicam-vid` cannot both hold the camera, so a non-webrtc `stream_codec` requires mediamtx
+  stopped. Nothing checks this: with mediamtx running, `rpicam-vid` fails to open the camera and
+  the operator gets no video and no message naming the cause. Currently documented only in
+  `picar-cfg.json`'s `comment3` (asserted by a test) and in `HANDOFF.md`. It should be a startup
+  check that logs loudly, or `install.sh` should manage the unit's enablement from the codec.
+
+- **The adaptive bitrate sink targets MediaMTX and is now aimed at the wrong encoder** —
+  `video-bitrate-sink.js` on `feature/runtime-video-bitrate` applies a profile by rewriting
+  `mediamtx.yml` and letting MediaMTX reload it. With `stream_codec` now `h264`, MediaMTX is
+  stopped and that mechanism does nothing. The controller (`video-bitrate-controller.js`) is
+  transport-independent and unaffected; only the sink needs re-pointing at `rpicam-vid`, which has
+  no runtime bitrate control — it needs either a camera respawn with new argv (cheap-ish, one
+  `SIGTERM` and the existing auto-restart) or the unverified V4L2 `video_bitrate` control. Neither
+  branch is merged, so decide this before wiring the loop.
+
+- **rover3 is not on `main`** — left on `fix/video-continuity-over-webrtc-tcp` at `5df17f0` with
+  `mediamtx.service` stopped and **disabled**. Either merge that branch after a field test and a
+  review, or restore `main` and re-enable mediamtx. Do not leave the fleet's only development
+  target on an unmerged branch indefinitely.
+
 - **`app.js` has no test file at all, and five safety mutants survive because of it** — measured
   2026-08-03. `grep` over `test/` finds no coverage of `io.on`, `socket.on`, `setDrivetrain` or
   `failSafeStop`, so every Socket.IO handler is unverified. Each of these can be applied to `main`
