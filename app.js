@@ -36,6 +36,7 @@ const PWMDriver = require('./pwm_servo');
 const pwm = PWMDriver(config);
 
 const fleetClient = require('./fleetmgr-client');
+const { installCrashFailSafe, serveStatic } = require('./crash-failsafe');
 fleetClient.start(config);
 
 const file = new static.Server();
@@ -102,7 +103,12 @@ const appServer = https.createServer(options, (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
     res.end(JSON.stringify(manifest));
   } else {
-    file.serve(req, res);
+    // serveStatic strips Range first. node-static's 206 path calls res.writeHead() again
+    // after the body has streamed, which throws ERR_HTTP_HEADERS_SENT out of this handler
+    // — one unauthenticated `curl -H 'Range: bytes=0-99'` was enough to kill the control
+    // plane. Nothing on this port needs byte ranges: one HTML page, a service worker, a
+    // manifest and PNG icons.
+    serveStatic(file, req, res, { describe: () => parsed.pathname });
   }
 });
 
@@ -374,6 +380,13 @@ function failSafeStop(reason) {
     `neutral=${result.neutralSent} disarm=${result.disarmSent}`);
   return result;
 }
+
+// A crash must not leave the vehicle armed with throttle applied. SIGINT was the only
+// path that ran a fail-safe; every uncaught exception took the process down silently.
+installCrashFailSafe({
+  failSafeStop,
+  stopStream: () => stream.stop(),
+});
 
 process.on('SIGINT', () => {
   failSafeStop('process shutdown');
