@@ -350,6 +350,29 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **[P1] Adaptive bitrate cannot ENFORCE a rung — only observe** — measured on rover3 2026-08-06.
+  Writing `rpiCameraBitrate` into `mediamtx.yml` makes MediaMTX log
+  `reloading configuration (file changed)` and **not** recreate the rpiCamera source: the
+  `mtxrpicam` child kept the same PID at 14 s, 20 s and 40 s after the write while the file held
+  the new value. So `streams/webrtc.js` `setParamsNoRestart()` writes a file that changes nothing
+  about the running encoder. `video_adaptive_apply` therefore defaults to `observe` (decide and
+  log, apply nothing) with `restart` as a deliberate opt-in that costs the WebRTC session on every
+  step. Neither is the answer. Two things to settle, in order:
+  1. **Does the V4L2 `video_bitrate` control reach `mtxrpicam`'s encoder while streaming?** That
+     would make a rung free. Unverified — `mtxrpicam` owns `/dev/video*`, and V4L2 controls can be
+     per-file-handle, in which case an external write does nothing. ~10 minutes on a rover settles
+     it and it has been deferred three times.
+  2. If not, is there a way to make MediaMTX recreate just the path? There is no `api:` block in
+     the generated config today; enabling the API would allow a targeted path reload instead of a
+     full service restart.
+
+- **[P1] Fit the adaptive dBm thresholds to a logged drive** — `LADDER_STEPS` in
+  `video-bitrate-controller.js` uses −60/−66/−72 dBm, which are estimates that have never been
+  exercised: every failure measured so far was indoors at −37 to −47 dBm. An `observe`-mode run
+  produces exactly the needed data at no cost to the operator's video — signal against the rung
+  the controller *would* have chosen. Do this before enabling `restart`, or the steps will fire at
+  the wrong distances.
+
 - **[P0-adjacent] `requestKeyframe` is an unauthenticated all-viewers camera kill** — found by
   both reviewers, 2026-08-06. Any client on `wss://rover:8081/stream` — no auth exists anywhere
   (invariant 1) — can send `{"type":"requestKeyframe"}`, and `forceKeyframe()` SIGTERMs
