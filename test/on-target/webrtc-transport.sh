@@ -158,6 +158,33 @@ else
   fi
 fi
 
+# ── 4. Adaptive bitrate is actually wired in ─────────────────────────────────
+#
+# THIS IS THE ONLY CHECK THAT CAN SEE IT. The host suite proves buildAdaptiveBitrate() and
+# the onTick forwarding, but the single line in app.js that connects them is unverifiable —
+# replacing `onTick: adaptiveVideo ? adaptiveVideo.onTelemetry : null` with `onTick: null`
+# leaves all 367 host tests green, measured. app.js has no test file, so the wiring is
+# observable only from the running process. That is exactly the "correct rule, untouched
+# consumer" shape CLAUDE.md names as this repo's dominant defect.
+say "Adaptive bitrate wiring"
+AB="$(journalctl -u picar -b --no-pager 2>/dev/null | grep -F 'video-adaptive:' | head -3 || true)"
+if [[ -z "$AB" ]]; then
+  bad "picar logged NOTHING from video-adaptive at startup — the module is not being built, so adaptation is silently absent"
+else
+  while IFS= read -r l; do [[ -n "$l" ]] && note "${l##*node?[0-9]*]: }"; done <<<"$AB"
+  if grep -q 'video-adaptive: active' <<<"$AB"; then
+    ok "adaptive bitrate is active, with its ladder logged"
+  elif grep -qE 'video-adaptive: (disabled|inactive|NOT running)' <<<"$AB"; then
+    warn "adaptive bitrate is NOT running — the reason is logged above; this is a deliberate refusal, not a crash"
+  else
+    bad "unrecognised video-adaptive startup line — cannot tell whether adaptation is running"
+  fi
+fi
+# A step actually taken is the proof it works end to end, but it only happens on a degrading
+# link, so absence here is expected indoors and must not read as a failure.
+STEPS="$(journalctl -u picar -b --no-pager 2>/dev/null | grep -cF 'video-adaptive: stepped' || true)"
+note "rung changes since boot: ${STEPS:-0} (0 is expected on a strong link — it starts at the ceiling)"
+
 say "Not covered by this script"
 note "whether UDP survives the TACTICAL RADIO path — that needs a drive, and it is the"
 note "open question: UDP works on lab WiFi and lost its connectivity checks over the radio"

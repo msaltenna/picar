@@ -180,11 +180,29 @@ const batteryWarnCfg = batteryWarnCfgFrom(config);
 const warnability = batteryWarnabilityWarning(config, pwm.batteryRange);
 if (warnability) console.error(warnability);
 
+// Adaptive video bitrate. Built here because it needs the live stream module, but every
+// decision it makes lives in video-adaptive-bitrate.js where tests can drive it — this is a
+// null check and a callback, nothing more.
+//
+// It rides the telemetry tick rather than owning a timer: telemetry already reads
+// /proc/net/wireless once a second and already carries wifi.signalDbm, so a second interval
+// would mean a second /proc read and another timer on the event loop that runs the input
+// watchdog, for no benefit (invariant 9).
+//
+// Returns null — a logged no-op — when disabled, when the ladder cannot be built, or when
+// the active stream module cannot change bitrate without restarting a service. Only the
+// WebRTC path can; h264 and mjpeg spawn rpicam-vid themselves.
+const { buildAdaptiveBitrate } = require('./video-adaptive-bitrate');
+const adaptiveVideo = buildAdaptiveBitrate({ config, stream });
+
 // One call, and every lambda it used to inline is now covered by
 // telemetry-loop.test.js. See buildTelemetryWiring() for the two mutations that
 // survived while those lambdas lived here.
 const telemetryLoop = startTelemetryLoop(
-  buildTelemetryWiring({ pwm, io, fleetClient, fs, config }));
+  buildTelemetryWiring({
+    pwm, io, fleetClient, fs, config,
+    onTick: adaptiveVideo ? adaptiveVideo.onTelemetry : null,
+  }));
 const currentTelemetry = telemetryLoop.current;
 
 io.on('connection', (socket) => {

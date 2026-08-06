@@ -413,3 +413,85 @@ test('the TRACKED config ships a pack that can actually raise a warning', () => 
     'count changed, update this bound with it rather than deleting it');
   assert.equal(warn.warnOnNoReading, true, 'and an unreadable monitor must still warn');
 });
+
+// ── onTick: the hook adaptive video rides ────────────────────────────────────
+//
+// Adaptive bitrate consumes this rather than owning a second timer and a second /proc read
+// on the event loop that runs the input watchdog (invariant 9). Two properties matter, and
+// the second matters more: the hook must fire, and a broken subscriber must NOT be able to
+// take telemetry down with it. Everything before onTick in the tick body is load-bearing —
+// the Fleet Manager battery-trouble bit and the operator's telemetry broadcast — and under
+// the crash fail-safe an escaping exception would end the process.
+
+test('onTick receives the same snapshot that was broadcast', () => {
+  const seen = [];
+  const emitted = [];
+  const loop = startTelemetryLoop({
+    getFcTelemetry: () => ({ linkUp: true }),
+    fleetClient: { setStatusBit: () => {}, setTelemetry: () => {} },
+    emit: (ev, payload) => emitted.push([ev, payload]),
+    readWifi: () => Promise.resolve(''),
+    config: {},
+    batteryWarnCfg: { warnLevel: 20, warnVolts: null, warnOnNoReading: true },
+    onTick: (t) => seen.push(t),
+    setIntervalFn: () => 0,
+  });
+  const returned = loop.tick();
+  assert.equal(seen.length, 1, 'the hook must be called once per tick');
+  assert.strictEqual(seen[0], returned,
+    'the subscriber must see the SAME object the loop returned and broadcast, or the ' +
+    'controller and /status can disagree about the signal');
+  assert.strictEqual(seen[0], emitted.find(([ev]) => ev === 'telemetry')[1]);
+});
+
+test('a throwing onTick does not stop the broadcast or the fleet update', () => {
+  const emitted = [];
+  const bits = [];
+  const loop = startTelemetryLoop({
+    getFcTelemetry: () => ({ linkUp: true }),
+    fleetClient: {
+      setStatusBit: (i, v) => bits.push([i, v]),
+      setTelemetry: () => {},
+    },
+    emit: (ev, payload) => emitted.push([ev, payload]),
+    readWifi: () => Promise.resolve(''),
+    config: {},
+    batteryWarnCfg: { warnLevel: 20, warnVolts: null, warnOnNoReading: true },
+    onTick: () => { throw new Error('subscriber exploded'); },
+    setIntervalFn: () => 0,
+  });
+  assert.doesNotThrow(() => loop.tick(),
+    'a video-quality subscriber must never be able to end the telemetry loop');
+  assert.ok(emitted.some(([ev]) => ev === 'telemetry'),
+    'the operator UI must still receive its frame');
+  assert.equal(bits.length, 1, 'the fleet battery-trouble bit must still be set');
+});
+
+test('a null onTick is a no-op, not a crash', () => {
+  const loop = startTelemetryLoop({
+    getFcTelemetry: () => ({}),
+    fleetClient: { setStatusBit: () => {}, setTelemetry: () => {} },
+    emit: () => {},
+    readWifi: () => Promise.resolve(''),
+    config: {},
+    batteryWarnCfg: { warnLevel: 20, warnVolts: null, warnOnNoReading: true },
+    onTick: null,
+    setIntervalFn: () => 0,
+  });
+  assert.doesNotThrow(() => loop.tick());
+});
+
+test('buildTelemetryWiring forwards onTick rather than dropping it', () => {
+  const fn = () => {};
+  const wiring = buildTelemetryWiring({
+    pwm: { getTelemetry: () => ({}) },
+    io: { emit: () => {} },
+    fleetClient: { setStatusBit: () => {}, setTelemetry: () => {} },
+    fs: { promises: { readFile: () => Promise.resolve('') } },
+    config: {},
+    onTick: fn,
+  });
+  assert.strictEqual(wiring.onTick, fn,
+    'app.js passes onTick through this builder; dropping it here would silently disable ' +
+    'adaptive bitrate with every unit test still green');
+});

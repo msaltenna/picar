@@ -73,8 +73,14 @@ function parseWirelessProc(text) {
 //
 // So the wiring itself is a unit now. What remains untestable in app.js is one call
 // passing the real pwm/io/fs/config, which is as small as this boundary gets.
-function buildTelemetryWiring({ pwm, io, fleetClient, fs, config = {} }) {
+function buildTelemetryWiring({ pwm, io, fleetClient, fs, config = {}, onTick = null }) {
   return {
+    // Forwarded, not called here. Adaptive video bitrate rides this tick rather than owning
+    // a second timer and a second /proc read on the event loop that runs the input
+    // watchdog. Passing it through the wiring builder keeps app.js to one call and keeps
+    // the forwarding itself inside a tested function — the untested-consumer shape this
+    // repo keeps rediscovering.
+    onTick,
     // A driver with no telemetry support must yield an empty snapshot, not throw —
     // four of the five drivers are GPIO and have no getTelemetry at all.
     // A driver with no telemetry support yields fcSupported:false rather than {}.
@@ -135,6 +141,7 @@ function startTelemetryLoop({
   batteryWarnCfg,
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  onTick = null,
 }) {
   const intervalMs = clampTelemetryInterval(config.telemetry_interval_ms);
   let wifi = null;
@@ -181,6 +188,18 @@ function startTelemetryLoop({
       autopilotHeartbeat: !!t.autopilotHeartbeat,
     });
     emit('telemetry', t);
+
+    // Subscribers ride this tick. WRAPPED, because everything above it is load-bearing:
+    // an exception escaping a subscriber would stop telemetry broadcasts and the Fleet
+    // Manager battery-trouble bit, and under the crash fail-safe it would take the process
+    // down. No subscriber's feature is worth that.
+    if (onTick) {
+      try { onTick(t); }
+      catch (err) {
+        try { console.error('telemetry: onTick subscriber threw:', err && err.message); }
+        catch (_) { /* ignore */ }
+      }
+    }
     return t;
   }
 

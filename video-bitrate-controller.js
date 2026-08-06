@@ -47,6 +47,75 @@ const DEFAULT_PROFILES = [
   { name: 'high',    bitrateKbps: 800, width: 640, height: 480, fps: 20, upAtDbm: -54 },
 ];
 
+// ── Building a ladder from the CONFIGURED baseline ───────────────────────────
+//
+// The absolute table above is a starting point for reasoning. What actually ships is a
+// ladder derived from whatever `picar-cfg.json` configures, with that configuration as the
+// **ceiling** — adaptation only ever reduces. Two reasons, both learned the hard way:
+//
+//   * Lowering offered load is the only lever that helps this link. MediaMTX's rpicamera
+//     source does not act on WebRTC congestion feedback, so nothing else responds to a
+//     degrading radio. A ladder that could exceed the tracked config would be raising
+//     offered load on a link that is already failing.
+//   * A tracked, reviewed number stays authoritative. On 2026-08-06 cleaning the untracked
+//     overlay silently RAISED offered load ~75% immediately before a range test, because
+//     two places disagreed about the baseline. One source of truth prevents a repeat.
+//
+// RESOLUTION IS DELIBERATELY CONSTANT across every rung. Applying a rung costs a camera
+// respawn (~1-2 s of no video) whichever field changes, so there is nothing to save by
+// holding resolution fixed — but changing it ALSO forces the browser's decoder to
+// reconfigure, which is a second, independent hitch on top of the respawn. Only bitrate and
+// frame rate move.
+//
+// THE dBm THRESHOLDS ARE STILL ESTIMATES. They have not been fitted to a logged drive;
+// rover3's failures have all been measured indoors at −37 to −47 dBm, which is nowhere near
+// these boundaries. They are deliberately pessimistic — stepping down early costs picture
+// quality, while stepping down late costs the video and the control channel together.
+// Fitting them to real data is tracked in TASKS.md.
+const LADDER_STEPS = [
+  { name: 'floor',  bitrateScale: 0.40, fpsScale: 0.6, upAtDbm: -Infinity },
+  { name: 'low',    bitrateScale: 0.60, fpsScale: 0.8, upAtDbm: -72 },
+  { name: 'medium', bitrateScale: 0.80, fpsScale: 1.0, upAtDbm: -66 },
+  { name: 'full',   bitrateScale: 1.00, fpsScale: 1.0, upAtDbm: -60 },
+];
+
+const MIN_LADDER_FPS = 5;
+
+// Derive the ladder from a baseline. Throws rather than returning a subtly broken ladder:
+// a ladder whose bitrates do not strictly ascend would make the controller step the wrong
+// way under load, which is worse than refusing to adapt at all.
+function buildLadder(baseline, steps = LADDER_STEPS) {
+  const { width, height, fps, bitrateKbps } = baseline || {};
+  for (const [name, v] of [['width', width], ['height', height], ['fps', fps],
+                           ['bitrateKbps', bitrateKbps]]) {
+    if (!Number.isFinite(v) || v <= 0) {
+      throw new TypeError(`buildLadder needs a positive finite ${name}, got ${v}`);
+    }
+  }
+
+  const rungs = steps.map((s) => ({
+    name:        s.name,
+    width,                                   // constant by design — see above
+    height,
+    fps:         Math.max(MIN_LADDER_FPS, Math.round(fps * s.fpsScale)),
+    bitrateKbps: Math.max(1, Math.round(bitrateKbps * s.bitrateScale)),
+    upAtDbm:     s.upAtDbm,
+  }));
+
+  // A low baseline can round two rungs onto the same bitrate (a 3 kbps baseline collapses
+  // 0.6 and 0.8 both onto 2). Detect it here with a message naming the cause, rather than
+  // letting createBitrateController throw its generic ordering error.
+  for (let i = 1; i < rungs.length; i++) {
+    if (!(rungs[i].bitrateKbps > rungs[i - 1].bitrateKbps)) {
+      throw new RangeError(
+        `baseline ${bitrateKbps} kbps is too low to build a ladder: rungs ` +
+        `'${rungs[i - 1].name}' and '${rungs[i].name}' both round to ` +
+        `${rungs[i].bitrateKbps} kbps. Raise the baseline or widen the scales.`);
+    }
+  }
+  return rungs;
+}
+
 const DEFAULTS = {
   downSustainMs: 8000,    // a bad link is urgent, but not so urgent that one dip counts
   upSustainMs:   45000,   // recovery is not urgent, and each step costs video
@@ -196,6 +265,9 @@ function createBitrateController({
 module.exports = {
   createBitrateController,
   profileForSignal,
+  buildLadder,
   DEFAULT_PROFILES,
+  LADDER_STEPS,
+  MIN_LADDER_FPS,
   DEFAULTS,
 };
