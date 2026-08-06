@@ -59,11 +59,17 @@ run_check() {
     FAILED=1
     return 0
   fi
-  if "$@"; then
+  # Capture the status AT THE CALL, not after an `if`. `if cmd; then ...; fi` completes with
+  # status 0 when cmd fails and there is no else branch, so reading $? afterwards reports 0 —
+  # which this did, printing "control-e2e exited 0" while treating it as a failure and losing
+  # the 3 that marks a deliberate safety refusal. Same class as every other bug on this
+  # branch: the summary measured something other than what it claimed.
+  local rc=0
+  "$@" || rc=$?
+  if [[ $rc -eq 0 ]]; then
     PASSED_LIST+=("$name")
     return 0
   fi
-  local rc=$?
   # EXIT 3 IS A DELIBERATE SAFETY REFUSAL, not a failure. control-e2e.js exits 3 when it
   # detects a connected flight battery, because it commands steering and a drivetrain change
   # and will not do that on a vehicle that can move without an explicit --allow-motion and an
