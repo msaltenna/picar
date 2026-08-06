@@ -101,7 +101,20 @@ paths:
 `;
 }
 
-module.exports = function createWebRTCStream(config /*, streamServer not used */) {
+// `deps` is a test-only injection point, never populated from config — a config-supplied
+// argv would let the untracked overlay name a binary picar spawns (invariant 8).
+module.exports = function createWebRTCStream(config /*, streamServer not used */, deps = {}) {
+  // Injected so a test can prove the RUNTIME write never uses writeFileSync. Invariant 9:
+  // adaptive bitrate writes this file while the vehicle is driving, on the same event loop
+  // as the 20 Hz override stream and the fail-safe timers. A mutation swapping the async
+  // write for a synchronous one survived the whole suite until this seam existed.
+  const fsdep = deps.fs || fs;
+  // Array form, so there is no shell and no quoting to get wrong. Injectable so a test can
+  // prove setParamsNoRestart does NOT restart the service — the property the whole
+  // mechanism-1 sink depends on.
+  const RESTART_CMD = Array.isArray(deps.restartCmd) && deps.restartCmd.length
+    ? deps.restartCmd
+    : ['systemctl', 'restart', 'mediamtx'];
   const PROTOCOL  = config.webrtc_protocol || 'https';
   const PORT      = config.webrtc_port     || 8889;
   const PATH_NAME = (config.webrtc_path    || 'cam').replace(/^\/+/, '');
@@ -120,6 +133,55 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     const content = generateMediaMTXConfig(config, params);
     fs.writeFileSync(YML_PATH, content, 'utf8');
     console.log(`WebRTC: wrote ${YML_PATH}`);
+  }
+
+  // Async twin of writeYml, for the RUNTIME path.
+  //
+  // writeYml is synchronous and that is tolerable exactly once, at startup, before the
+  // control loops exist. Adaptive bitrate writes this file while the vehicle is driving,
+  // on the same event loop as the 20 Hz override stream and the fail-safe timers, so it
+  // must not be synchronous — invariant 9.
+  // Minimal validation for the runtime path.
+  //
+  // A general sanitiser with a key whitelist and bounds already exists on the unmerged
+  // feature/persist-video-params branch (video-params.js). Duplicating it here would be a
+  // second source of truth for the same rules, so this checks only the four fields this
+  // path can send — they come from our own profile ladder, not from an operator — and
+  // refuses anything else. When that branch merges, this should be replaced by the shared
+  // sanitiser rather than kept alongside it. Filed in TASKS.md.
+  const RUNTIME_BOUNDS = {
+    width:   [160, 1920],
+    height:  [120, 1080],
+    fps:     [1, 60],
+    bitrate: [50, 8000],
+  };
+
+  function validateCameraParams(input) {
+    const out = {};
+    const rejected = [];
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return { params: out, rejected: ['request is not an object'] };
+    }
+    for (const name of Object.keys(input)) {
+      if (!Object.prototype.hasOwnProperty.call(RUNTIME_BOUNDS, name)) {
+        rejected.push(`${name} is not settable on the runtime path`);
+        continue;
+      }
+      const [min, max] = RUNTIME_BOUNDS[name];
+      const n = typeof input[name] === 'number' ? input[name] : NaN;
+      if (!Number.isFinite(n) || Math.round(n) < min || Math.round(n) > max) {
+        rejected.push(`${name}=${JSON.stringify(input[name])} is not an integer in ${min}..${max}`);
+        continue;
+      }
+      out[name] = Math.round(n);
+    }
+    return { params: out, rejected };
+  }
+
+  function writeYmlAsync() {
+    const content = generateMediaMTXConfig(config, params);
+    return fsdep.promises.writeFile(YML_PATH, content, 'utf8')
+      .then(() => { console.log(`WebRTC: wrote ${YML_PATH} (no restart)`); });
   }
 
   // Generate the YAML on startup so mediamtx.yml always reflects picar-cfg.json
@@ -155,7 +217,7 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     restartQueued = false;
     console.log('WebRTC: restarting mediamtx…');
     // spawn, not exec: no shell, and no buffering of output we do not read.
-    const child = spawn('systemctl', ['restart', 'mediamtx'], { stdio: 'ignore' });
+    const child = spawn(RESTART_CMD[0], RESTART_CMD.slice(1), { stdio: 'ignore' });
     restartChild = child;
 
     restartTimer = setTimeout(() => {
@@ -213,6 +275,32 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
         return;
       }
       restartMediamtx();
+    },
+
+    // Apply params WITHOUT restarting mediamtx.
+    //
+    // MediaMTX watches its config file and reloads it, respawning only the camera child.
+    // Evidenced on 2026-08-05: picar's startup wrote the yml and MediaMTX logged
+    // `configuring streams: (0) 320x240` with a new child PID while its systemd
+    // ActiveEnterTimestamp stayed at 18:30:42 — the service was never restarted. So a
+    // change costs a camera respawn (~1-2 s of video), not a service restart, and the
+    // explicit `systemctl restart mediamtx` in setParams() is a strictly LARGER
+    // interruption than the reload it would get for free.
+    //
+    // This path is for adaptive bitrate, which changes the file while the operator is
+    // driving. It deliberately does not touch the restart machinery at all: nothing here
+    // spawns a process, so it cannot coalesce with, cancel, or be blocked by an in-flight
+    // restart from the UI path.
+    setParamsNoRestart(newParams) {
+      const { params: clean, rejected } = validateCameraParams(newParams);
+      for (const bad of rejected) console.error(`setParamsNoRestart: REJECTED ${bad}`);
+      if (Object.keys(clean).length === 0) {
+        return Promise.resolve({ applied: {}, rejected, restarted: false });
+      }
+      Object.assign(params, clean);
+      return writeYmlAsync()
+        .then(() => ({ applied: clean, rejected, restarted: false }))
+        .catch((err) => ({ applied: {}, rejected, restarted: false, error: err.message }));
     },
 
     getStreamConfig() {
