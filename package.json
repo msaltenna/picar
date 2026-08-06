@@ -11,6 +11,6 @@
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "test:on-target": "node test/on-target/control-e2e.js"
+    "test:on-target": "bash test/on-target/run-all.sh"
   }
 }
