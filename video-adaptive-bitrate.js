@@ -124,9 +124,13 @@ function buildAdaptiveBitrate({
   // Only the WebRTC path can apply a bitrate without restarting a service. The h264 and
   // mjpeg paths spawn rpicam-vid themselves and would need a camera respawn with new argv,
   // which is not implemented — so this reports rather than pretending to adapt.
-  if (!stream || typeof stream.setParamsNoRestart !== 'function') {
-    log(`video-adaptive: inactive — the active stream module has no setParamsNoRestart, ` +
-        `so there is no way to change bitrate without a service restart`);
+  // Any stream module that can change camera params at runtime at all. WebRTC can; the h264
+  // and mjpeg paths spawn rpicam-vid themselves and would need a respawn with new argv, which
+  // is not implemented.
+  if (!stream || (typeof stream.setParamsNoRestart !== 'function' &&
+                  typeof stream.setParams !== 'function')) {
+    log(`video-adaptive: inactive — the active stream module cannot change camera params at ` +
+        `runtime, so there is nothing to adapt`);
     return null;
   }
 
@@ -159,16 +163,69 @@ function buildAdaptiveBitrate({
     hysteresisDb:  config.video_adaptive_hysteresis_db,
   });
 
+  // ── HOW A RUNG IS APPLIED, and why the default applies nothing ─────────────
+  //
+  // MEASURED ON ROVER3, 2026-08-06, AND IT REFUTES THE MECHANISM THIS WAS BUILT ON.
+  // Writing a new `rpiCameraBitrate` into mediamtx.yml makes MediaMTX log
+  // `reloading configuration (file changed)` — and NOT recreate the rpiCamera source. The
+  // `mtxrpicam` child kept the same PID at 14 s, 20 s and 40 s after the write while the
+  // file plainly held the new value. **The encoder never sees it.**
+  //
+  // The earlier evidence for a free hot reload was a camera respawn that coincided with
+  // picar's own STARTUP yml write, which is a different situation, and generalising from it
+  // was wrong. So `setParamsNoRestart` writes a file that changes nothing about the running
+  // encoder, and a sink built on it would report `applied` for a step that never happened —
+  // the exact lie the sink exists to prevent, one layer below where it can see.
+  //
+  // Hence two modes, and the default does not pretend:
+  //
+  //   'observe' (DEFAULT) — decide and LOG, apply nothing. This is not a placeholder: the
+  //       dBm thresholds have never been fitted to a real drive, and a run in observe mode
+  //       produces exactly the data needed to fit them, at zero cost to the operator's
+  //       video. An honest instrument beats a broken actuator.
+  //   'restart' — apply by restarting mediamtx, which is proven to work because the UI
+  //       video-params path already does it. THE COST IS REAL AND THE OPERATOR MUST CHOOSE
+  //       IT: a service restart drops the WebRTC session, so the browser has to renegotiate
+  //       — on a degrading link, which is precisely when this fires. That may be worse than
+  //       the freeze it is trying to avoid, which is why it is not the default.
+  //
+  // A respawn-free path remains the right answer and remains unbuilt: the V4L2 encoder's
+  // `video_bitrate` control is settable while streaming, but `mtxrpicam` owns the device and
+  // whether an external write reaches it is unverified. Tracked in TASKS.md.
+  const applyMode = config.video_adaptive_apply === 'restart' ? 'restart' : 'observe';
+
+  const applyFn = applyMode === 'restart'
+    ? (p) => stream.setParams(p)
+    : (p) => {
+        // Report honestly that nothing was applied. The sink treats an empty `applied` as a
+        // failure, which is correct here — a rung was decided and deliberately not enforced.
+        log(`video-adaptive: OBSERVE ONLY — would apply ${p.width}x${p.height}@${p.fps} ` +
+            `${p.bitrate}kbps, but video_adaptive_apply is 'observe' so the encoder is ` +
+            `unchanged. Set 'restart' to actually apply it (costs a mediamtx restart).`);
+        return Promise.resolve({ applied: {}, rejected: [], restarted: false });
+      };
+
+  if (applyMode === 'restart' && typeof stream.setParams !== 'function') {
+    log('video-adaptive: NOT running — video_adaptive_apply is \'restart\' but the stream ' +
+        'module has no setParams');
+    return null;
+  }
+
   const sink = createBitrateSink({
-    apply: (p) => stream.setParamsNoRestart(p),
+    apply: applyFn,
     minApplyIntervalMs,
     now,
     log,
   });
 
-  log(`video-adaptive: active — ladder ` +
+  log(`video-adaptive: active [apply=${applyMode}] — ladder ` +
       profiles.map((p) => `${p.name}:${p.bitrateKbps}k@${p.fps}`).join(' ') +
-      `, ceiling is the tracked ${baseline.bitrateKbps}kbps`);
+      `, ceiling is the tracked ${baseline.bitrateKbps}kbps` +
+      (applyMode === 'observe'
+        ? '. OBSERVE ONLY: rungs are decided and logged but NOT applied, because writing '
+          + 'mediamtx.yml does not reach the encoder (measured 2026-08-06). This run '
+          + 'produces the data to fit the dBm thresholds.'
+        : '. APPLY VIA MEDIAMTX RESTART: each step drops the WebRTC session.'));
 
   return createAdaptiveBitrate({ controller, sink, log, now });
 }

@@ -21,13 +21,21 @@ const { buildLadder, LADDER_STEPS, MIN_LADDER_FPS } = require('../video-bitrate-
 const BASE = { webrtc_width: 320, webrtc_height: 240, webrtc_fps: 10, webrtc_bitrate_kbps: 200 };
 const quiet = () => {};
 
+// Both entry points, recorded separately, because the whole point of the apply modes is
+// WHICH one gets called — and observe mode must call neither.
 function stubStream() {
-  const calls = [];
+  const noRestart = [];
+  const restart = [];
   return {
-    calls,
+    noRestart,
+    restart,
     setParamsNoRestart(p) {
-      calls.push(p);
+      noRestart.push(p);
       return Promise.resolve({ applied: p, rejected: [], restarted: false });
+    },
+    setParams(p) {
+      restart.push(p);
+      return { applied: p, rejected: [], restarted: true };
     },
   };
 }
@@ -106,8 +114,8 @@ test('only literal false disables it', () => {
   }
 });
 
-test('a stream that cannot change bitrate without a restart is refused, not faked', () => {
-  for (const s of [undefined, null, {}, { setParams: () => {} }]) {
+test('a stream that cannot change camera params at all is refused, not faked', () => {
+  for (const s of [undefined, null, {}, { getStreamConfig: () => ({}) }]) {
     assert.equal(buildAdaptiveBitrate({ config: BASE, stream: s, log: quiet }), null,
       'h264 and mjpeg spawn rpicam-vid themselves; pretending to adapt would be a lie');
   }
@@ -134,16 +142,55 @@ test('the refusal is logged in every case — a silent no-op looks like it is wo
 
 // ── Behaviour on the tick ────────────────────────────────────────────────────
 
-test('a sustained weak signal steps down and applies it', async () => {
+// OBSERVE IS THE DEFAULT, and it must apply NOTHING. Writing mediamtx.yml does not reach the
+// encoder — measured on rover3, the mtxrpicam child kept its PID 40 s after the write — so a
+// mode that called setParamsNoRestart would report a step it did not take.
+test('the default mode decides a step but applies nothing', async () => {
+  const stream = stubStream();
+  const lines = [];
+  let t = 0;
+  const a = buildAdaptiveBitrate({
+    config: BASE, stream, log: (...m) => lines.push(m.join(' ')), now: () => t,
+    minApplyIntervalMs: 0 });
+  for (let i = 0; i < 20; i++) { t += 1000; a.onTelemetry({ wifi: { signalDbm: -80 } }); }
+  await new Promise((r) => setImmediate(r));
+  assert.equal(stream.noRestart.length, 0,
+    'writing the yml does not reach the encoder, so calling it would be a no-op that lies');
+  assert.equal(stream.restart.length, 0, 'observe mode must not restart mediamtx either');
+  assert.match(lines.join('\n'), /OBSERVE ONLY/,
+    'the decision must still be logged — that log IS the deliverable in observe mode, since ' +
+    'it is the data needed to fit the dBm thresholds');
+  assert.match(lines.join('\n'), /would apply 320x240@10 160kbps/);
+  assert.equal(a.state().lastApplied, null, 'nothing was applied, so nothing may be recorded as applied');
+});
+
+test("apply='restart' routes to setParams, the only mechanism proven to reach the encoder", async () => {
   const stream = stubStream();
   let t = 0;
   const a = buildAdaptiveBitrate({
-    config: BASE, stream, log: quiet, now: () => t, minApplyIntervalMs: 0 });
-  // Well past the 8 s down-sustain window.
+    config: { ...BASE, video_adaptive_apply: 'restart' }, stream, log: quiet,
+    now: () => t, minApplyIntervalMs: 0 });
   for (let i = 0; i < 20; i++) { t += 1000; a.onTelemetry({ wifi: { signalDbm: -80 } }); }
   await new Promise((r) => setImmediate(r));
-  assert.equal(stream.calls.length, 1, 'exactly one rung should be applied per decision');
-  assert.deepEqual(stream.calls[0], { width: 320, height: 240, fps: 10, bitrate: 160 });
+  assert.equal(stream.restart.length, 1, 'exactly one rung applied per decision');
+  assert.deepEqual(stream.restart[0], { width: 320, height: 240, fps: 10, bitrate: 160 });
+  assert.equal(stream.noRestart.length, 0, 'the yml-only path must not be used — it does not work');
+});
+
+// Only the exact string opts in. A typo must land on the safe mode, not on a mode that drops
+// the operator's video session on every step.
+test("only the exact string 'restart' selects the restarting mode", async () => {
+  for (const v of ['Restart', 'RESTART', true, 1, 'yes', 'observe', undefined]) {
+    const stream = stubStream();
+    let t = 0;
+    const a = buildAdaptiveBitrate({
+      config: { ...BASE, video_adaptive_apply: v }, stream, log: quiet,
+      now: () => t, minApplyIntervalMs: 0 });
+    for (let i = 0; i < 20; i++) { t += 1000; a.onTelemetry({ wifi: { signalDbm: -80 } }); }
+    await new Promise((r) => setImmediate(r));
+    assert.equal(stream.restart.length, 0,
+      `video_adaptive_apply=${JSON.stringify(v)} must NOT restart mediamtx`);
+  }
 });
 
 test('a strong signal applies nothing at all', async () => {
@@ -153,7 +200,7 @@ test('a strong signal applies nothing at all', async () => {
     config: BASE, stream, log: quiet, now: () => t, minApplyIntervalMs: 0 });
   for (let i = 0; i < 60; i++) { t += 1000; a.onTelemetry({ wifi: { signalDbm: -35 } }); }
   await new Promise((r) => setImmediate(r));
-  assert.equal(stream.calls.length, 0,
+  assert.equal(stream.noRestart.length + stream.restart.length, 0,
     'already at the configured ceiling — every apply costs a camera respawn');
 });
 
@@ -164,16 +211,18 @@ test('a missing wifi reading is passed through as null, not as 0 dBm', async () 
   const stream = stubStream();
   let t = 0;
   const a = buildAdaptiveBitrate({
-    config: BASE, stream, log: quiet, now: () => t, minApplyIntervalMs: 0 });
+    config: { ...BASE, video_adaptive_apply: 'restart' }, stream, log: quiet,
+    now: () => t, minApplyIntervalMs: 0 });
   t += 1000;
   a.onTelemetry({ wifi: null });
   await new Promise((r) => setImmediate(r));
   // 0 dBm would be the strongest possible signal and would hold at the ceiling forever.
-  assert.equal(stream.calls.length, 0, 'one unreadable sample must not change anything yet');
+  assert.equal(stream.restart.length, 0, 'one unreadable sample must not change anything yet');
+  assert.equal(a.state().current.bitrateKbps, 200, 'still at the ceiling after one bad read');
   for (let i = 0; i < 20; i++) { t += 1000; a.onTelemetry({}); }
   await new Promise((r) => setImmediate(r));
-  assert.equal(stream.calls.length, 1, 'a SUSTAINED unreadable signal must step down');
-  assert.ok(stream.calls[0].bitrate < 200);
+  assert.equal(stream.restart.length, 1, 'a SUSTAINED unreadable signal must step down');
+  assert.ok(stream.restart[0].bitrate < 200);
 });
 
 // ── It must never throw into the telemetry tick ──────────────────────────────
