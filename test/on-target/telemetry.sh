@@ -283,6 +283,25 @@ elif [[ $FAILED -eq 0 ]]; then
 else
   printf '\n\033[31mCHECKS FAILED\033[0m\n'
 fi
-printf 'NOTE: this validates the command and telemetry path only. rover3 has no flight battery\n'
-printf 'connected, so no mechanical actuation is observed or implied by any check above.\n'
+# SCOPE, stated from what was measured rather than from a premise about the vehicle.
+#
+# This footer used to read "rover3 has no flight battery connected, so no mechanical
+# actuation is observed or implied". That was FALSE, it was printed on every validation
+# run, and it was acted on — throttle was commanded on a vehicle that could drive, three
+# times, each run reported safe on the strength of it. The contradiction was in this
+# script's own output the whole time: it prints the pack voltage a dozen lines above.
+#
+# So report the reading instead of asserting a capability. CLAUDE.md: "Never write
+# 'cannot actuate' as a premise. State what you measured."
+printf '\nNOTE: this validates the command and telemetry path only — it commands no motion.\n'
+if [[ -n "${bv:-}" && "${bv:-ABSENT}" != "ABSENT" ]]; then
+  printf 'BATTERY MEASURED AT %s V' "$bv"
+  ca="$(jget telemetry.battery.currentA <<<"${S1:-}" 2>/dev/null || true)"
+  [[ -n "$ca" && "$ca" != "ABSENT" ]] && printf ' drawing %s A' "$ca"
+  printf '. A PACK IS CONNECTED — ASSUME THE WHEELS CAN TURN.\n'
+  printf 'Do not conclude from a pass here that the vehicle cannot move.\n'
+else
+  printf 'No battery voltage was readable. That is NOT evidence the vehicle cannot move —\n'
+  printf 'an unreadable monitor and an absent pack look identical from here. Check physically.\n'
+fi
 exit $FAILED

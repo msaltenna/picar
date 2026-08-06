@@ -3,11 +3,12 @@
 #
 # Run ON a rover:  sudo test/on-target/video-drop.sh [h264|mjpeg]
 #
-# Why this exists. rover3 runs stream_codec "webrtc", where picar never touches a
-# video frame — MediaMTX owns the whole path — so the drop logic cannot execute at
-# all in the default configuration. That is why it stayed unvalidated: the host
-# tests cover the rules, but nothing had run them against a real camera. The h264
-# path was verified by hand on 2026-07-31; mjpeg never has been.
+# Why this exists. It was written when stream_codec was "webrtc", where picar never
+# touches a video frame — MediaMTX owns the whole path — so the drop logic could not
+# execute at all in the default configuration. Since 2026-08-06 the default IS "h264",
+# which means the drop path is now on the live video path for every operator, and this
+# script validates the shipping configuration rather than a hypothetical one. mjpeg has
+# still never been validated.
 #
 # This script switches the codec through the UNTRACKED per-rover overlay, drives a
 # deliberately slow client, and restores the original state on every exit path
@@ -28,6 +29,12 @@ note() { printf '  ---- %s\n' "$*"; }
 if [[ $EUID -ne 0 ]]; then echo "must run as root (systemctl restart)"; exit 2; fi
 case "$CODEC" in h264|mjpeg) ;; *) echo "codec must be h264 or mjpeg"; exit 2 ;; esac
 
+# Sampled BEFORE anything is changed, and before the cleanup trap is armed, so cleanup
+# restores what was really there. `is-active` prints inactive/failed/unknown as well as
+# active, and any of those means "do not start it".
+MEDIAMTX_WAS="$(systemctl is-active mediamtx 2>/dev/null || true)"
+[[ -z "$MEDIAMTX_WAS" ]] && MEDIAMTX_WAS="unknown"
+
 # ── Restore FIRST, so a failure below cannot leave the rover on a non-default
 # codec with mediamtx stopped. This is the whole reason the script exists rather
 # than a sequence of hand-typed commands.
@@ -35,7 +42,18 @@ cleanup() {
   say "Restoring original state"
   cp "$BACKUP" "$OVERLAY" 2>/dev/null || true
   rm -f "$BACKUP"
-  systemctl start mediamtx 2>/dev/null || true
+  # Restore mediamtx to the state it was ACTUALLY in, not to a state this script assumes.
+  # It used to `systemctl start mediamtx` unconditionally, which was right only while
+  # webrtc was the default. Since the default became h264 — a path where rpicam-vid opens
+  # the camera directly — starting mediamtx here hands the camera back to a service that
+  # is meant to be stopped, and every run of this script would silently break video until
+  # the next restart.
+  if [[ "$MEDIAMTX_WAS" == "active" ]]; then
+    systemctl start mediamtx 2>/dev/null || true
+  else
+    systemctl stop mediamtx 2>/dev/null || true
+    note "left mediamtx ${MEDIAMTX_WAS} — it was not running when this script started"
+  fi
   systemctl restart picar
   sleep 6
   local codec_now
