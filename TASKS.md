@@ -706,3 +706,18 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   test failing. Listener lifecycle needs DOM wiring the current host tests do not have. The
   `controlMode !== 'orientation'` guard added in `60613ef` defangs the consequence — a leaked
   listener can no longer command anything outside tilt mode — so this is hygiene, not a hazard.
+
+- **[P1] Re-deploy `main` to rover3 and confirm the two P0 fixes at that SHA** — both were
+  verified on `test/p0-verify`, whose tree is byte-identical to `main` after the merges, but
+  `main`'s own SHA has never run on the rover: it went off the network mid-deploy. rover3 is
+  currently left on `test/p0-verify`, a throwaway branch. Re-run: the four secret paths must
+  404, the four UI paths must 200, a `Range` request must return 200 and leave picar's PID
+  unchanged, and `RestartUSec` must read 2s.
+
+- **[P2] `app.js` still has no test file, and this is now the fifth branch it has cost** —
+  the wiring for the crash fail-safe, the Range strip, the static allowlist, the telemetry
+  loop and the video-param persistence were each deletable with a green suite until a
+  reviewer or a mutation pass caught them. Two are now pinned only by source-text assertions,
+  which catch deletion but not a rename or a behaviour-preserving refactor. The durable fix is
+  to make `app.js` require-able — export a factory that takes its ports and collaborators —
+  so its request handler and its top-level wiring can be driven by a test.

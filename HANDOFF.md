@@ -92,6 +92,59 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-05 — Two P0s on the unauthenticated control port: crash-without-fail-safe, and served private keys
+
+`fix/crash-failsafe` and `fix/no-secrets-over-http`, both merged. Found by an adversarial
+review of an unrelated branch that happened to touch the same `node-static` construction;
+both were pre-existing on `main` and tracked nowhere.
+
+**P0 #1 — one request killed the control plane with no fail-safe.** node-static's
+`finish()` calls `res.writeHead()` again after a 206 has streamed, so
+`curl -k -H 'Range: bytes=0-99' https://rover3:8443/socket.html` threw
+ERR_HTTP_HEADERS_SENT out of the request handler. `app.js` registered only
+`process.on('SIGINT')`, so **no neutral RC_CHANNELS_OVERRIDE packet and no DISARM reached
+the link** — invariant 6 lists "process shutdown" and only the polite half was covered.
+With `Restart=always` and no `RestartSec` that was a ~100 ms crash-restart loop, each cycle
+leaving the vehicle armed with the last throttle in the channel buffer, on a rover with a
+flight battery and an FC that ignores DISARM.
+
+Fixed both ways: `Range`/`If-Range` stripped before node-static sees a request
+(prevention), and `uncaughtException`/`unhandledRejection` now run the real `failSafeStop`
+before exiting non-zero (containment), with `RestartSec=2`.
+
+**P0 #2 — the port served its own TLS private keys.** The static root defaulted to the
+working directory, which systemd sets to `/opt/picar`. Measured on rover3:
+`GET /certs/ca.key` → **200** and the CA private key that `README.md` tells every operator
+device to trust — a fleet-wide MITM key from one unauthenticated GET. `/certs/key.pem`,
+`/picar-cfg.local.json`, `/.git/config` and `/mediamtx.yml` likewise. Fixed with a
+fail-closed **allowlist** (`/socket.html`, `/sw.js`, `/icons/*.png`), so a secret added
+later is not served by default.
+
+**Validation — read this carefully, it is not the usual shape.** Both fixes were verified
+on rover3 on a combined branch `test/p0-verify`, at a tree that `git diff --quiet` confirms
+is **byte-identical to `main` after both merges** (the merge commits changed no files).
+Measured there:
+
+| Check | Result |
+| --- | --- |
+| `/certs/ca.key`, `/certs/key.pem`, `/picar-cfg.local.json`, `/.git/config`, `/mediamtx.yml`, `/app.js` | **404** |
+| `/socket.html`, `/sw.js`, `/manifest.json`, `/icons/fleet-192.png` | **200** |
+| `Range: bytes=0-99` on `/socket.html` | **200**, not 206 |
+| picar PID across the Range request | **unchanged — survived** |
+| `RestartUSec` | 2s |
+| Services / suites | active `NRestarts=0`, 302/302 on target, 26/26 on-target |
+
+**What is NOT done:** `main`'s own SHA has not been deployed. rover3 went off the network
+before the confirming run — it resolves to 192.168.31.223 but answers neither ping nor SSH.
+The evidence above stands on tree equality, not on a run of this SHA. **Re-deploy `main` and
+re-run the four checks when the rover is back**, and note that rover3 is currently left on
+`test/p0-verify`, a throwaway branch.
+
+**One methodological note.** The Range crash was reproduced locally against the same
+node-static the rovers run, and deliberately **not** on rover3 until the fix was in —
+crashing a control plane on a vehicle with a live pack is not worth the information. It was
+only exercised on target afterwards, to prove the fix.
+
 ### 2026-08-05 — Tilt mode could command 0.9 throttle unbidden; two causes, both fixed
 
 `fix/orientation-null-throttle`, validated on rover3 at
