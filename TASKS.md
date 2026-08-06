@@ -350,6 +350,86 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **[P0-adjacent] `requestKeyframe` is an unauthenticated all-viewers camera kill** — found by
+  both reviewers, 2026-08-06. Any client on `wss://rover:8081/stream` — no auth exists anywhere
+  (invariant 1) — can send `{"type":"requestKeyframe"}`, and `forceKeyframe()` SIGTERMs
+  `rpicam-vid` and respawns it. The rate limit is one global 5 s window, so a single attacker
+  holds the camera in a restart loop indefinitely, killing video for every viewer. Latent on
+  `main` only because `stream_codec` is `webrtc` and `streams/webrtc.js` creates no WebSocket
+  server — **making h264 the default is what exposes it**, so this gates any future h264 work.
+  `--inline` has removed the original need for it: prefer deleting the camera-restart mechanism
+  over rate-limiting it. Note the self-amplifying loop: dropped keyframe → client decode error →
+  `requestKeyframe` → camera restart → longer outage → more decode errors.
+
+- **`video-drop.sh` counts the frame counter, not keyframes — its continuity evidence is void** —
+  `test/on-target/video-drop.sh` computes `d[4] & 0x1f` as a NAL type, but the wire format from
+  `broadcast()` is `[flag][frameCount:uint32BE][Annex-B…]`, so `d[4]` is the **low byte of the
+  frame counter**. It counts `frameCount & 0x1f ∈ {5,7}` — exactly 2 of every 32 frames,
+  independent of keyframe-ness. The first NAL header byte is at `d[8]` or `d[9]`. Any claim of
+  the form "the slow client still received key frames" derived from this script is unsupported;
+  one such claim was made and is struck in `HANDOFF.md`. **Live on `main` today.**
+
+- **`shouldSendFrame` drops keyframes at the hard threshold, and a test pins that as correct** —
+  `streams/h264.js` checks `backlog > dropAllBytes` first and unconditionally, so above it the
+  client receives nothing and cannot resync, the keyframe being both the largest packet and the
+  only means of recovery. There is no low-water mark, so a congested client oscillates across the
+  threshold — the mechanism behind the observed 0↔264 kbps readout. Worse, nothing marks a client
+  as needing a keyframe after a drop, so deltas referencing shed reference frames are sent anyway.
+  Note `test/video-latency.test.js` asserts this behaviour as intended, so any correct fix must
+  delete that test: it is the "asserted the defect outright, pinning it" variant CLAUDE.md lists.
+  Fix direction: reserve keyframe budget above the hard threshold, or move the client back to
+  `wsPending` and require a keyframe before resuming deltas; add hysteresis.
+
+- **`ws.bufferedAmount` cannot bound latency, so the h264 drop thresholds do not either** — the
+  module already records the measurement (`streams/h264.js`): with `tcp_wmem` autotuning to 4 MB,
+  a paused receiver accepted **~2.7 MB before the threshold tripped at all**. Steady state on a
+  starved link is therefore a full kernel buffer plus ~200 KB of userspace — minutes of standing
+  delay at a degraded rate. Nothing on the wire lets the operator detect it: the 5-byte header
+  carries a frame counter, not a timestamp. A stale picture that keeps refreshing is worse than a
+  black screen for teleoperation, because the operator cannot tell and will steer on it. Needs a
+  small `writableHighWaterMark`/`SO_SNDBUF` so `bufferedAmount` is meaningful, plus an enqueue
+  timestamp and a client-side staleness indicator. **Blocks any future h264-as-default attempt.**
+
+- **`install.sh` silently reverts the video codec and re-enables mediamtx** — `install.sh:251`
+  writes `stream_codec` = `webrtc` into the **tracked** `picar-cfg.json` and `:373` runs
+  `systemctl enable --now mediamtx.service`, both gated on a prompt that defaults to `y`. CLAUDE.md
+  advertises the installer as idempotent and re-runnable, so re-running it rewrites tracked config
+  and leaves the rover's tree dirty relative to git. Derive `USE_WEBRTC` from the existing
+  `stream_codec` instead of overwriting it. Found by review after the branch under review asserted
+  the opposite — that nothing in code enforces the coupling.
+
+- **`test/video-config.test.js` checks git contents, not effective configuration** — invariant 8.
+  It requires `../picar-cfg.json` while `app.js:24-32` shallow-merges untracked
+  `picar-cfg.local.json` over it, so every assertion is defeatable at runtime with no branch or
+  review: a reviewer demonstrated `{"stream_codec":"nonsense"}` passing the suite while
+  `streams/index.js` falls through to h264 with only a `console.error` — the exact failure the
+  test's own header says it prevents. `video-drop.sh` writes those very keys into that overlay, so
+  this is routine, not hypothetical. It also permits absurd magnitudes: 500 MB / 900 MB thresholds
+  pass, and a 900 MB per-client backlog OOMs the process that owns the input watchdog. This test
+  lives only on the abandoned branch — fix it before any of that branch is re-landed.
+
+- **A vacuous test asserted a config comment string** — `test/video-config.test.js` ends with
+  `assert.match(config.comment3, /mediamtx/i)`, presented as the camera-ownership coupling being
+  "asserted by a test". Both reviewers broke it: replacing `comment3` with `main`'s text (deleting
+  the warning entirely) passes, and so does text saying the **opposite** — that mediamtx must
+  always run. Regex-over-source-text is the canonical vacuous shape CLAUDE.md enumerates, and it
+  was written in the same file as a comment about avoiding vacuous tests. Assert behaviour or
+  delete it. Abandoned branch only.
+
+- **`--inline` has no tested consumer** — `test/h264-camera-args.test.js` asserts
+  `buildCameraArgs()`, but replacing the call site in `start()` with a literal argv omitting
+  `--inline` leaves the suite green at 310/310 (verified independently by both reviewers). Also
+  the "`--inline` is a bare flag" test **passes when `--inline` is absent entirely**:
+  `indexOf` returns −1, so it inspects `args[0]` = `'--codec'`, which starts with `-`. Fix by
+  injecting the spawn function and asserting the argv actually spawned. Required before the
+  `--inline` commit is re-landed.
+
+- **Authoring and adversarial review shared one working tree** — 2026-08-06. Mutations and branch
+  switches ran in `/home/bimansantoso/picar` while both reviewers were reading it; one observed
+  HEAD moving and `streams/h264.js` transiently missing `--inline`, and correctly reported that any
+  `npm test` result from that window is untrustworthy. Use `EnterWorktree` or a `git archive`
+  export for review, and have DevOps verify a clean tree at the reviewed SHA before committing.
+
 - **`app.js` has no test file at all, and five safety mutants survive because of it** — measured
   2026-08-03. `grep` over `test/` finds no coverage of `io.on`, `socket.on`, `setDrivetrain` or
   `failSafeStop`, so every Socket.IO handler is unverified. Each of these can be applied to `main`

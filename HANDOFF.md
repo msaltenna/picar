@@ -92,6 +92,99 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-06 — WebRTC now requires ICE over UDP; the h264-transport attempt is ABANDONED
+
+`fix/webrtc-require-udp`, deployed to rover3 at `8dbdb52`. Two adversarial reviews and one
+failed field drive sit behind this entry, and the useful content is what was got wrong.
+
+**THE ROOT CAUSE, and it was in front of us the whole time.** Every WebRTC session on the
+failed out-of-sight drive negotiated ICE over **TCP**, never UDP — `webrtcLocalTCPAddress`
+was hardcoded in the generated `mediamtx.yml`, so the silent fallback always existed. UDP
+8189 was bound, listening, and unfirewalled, so UDP was available on the rover's side and
+simply lost its connectivity checks across that path. TCP is the wrong transport for
+real-time video: it keeps WebRTC's assumption that media may be shed freely while running on
+a transport with head-of-line blocking that will not permit it. Fixed by omitting the TCP
+line; `webrtc_ice_tcp: true` restores it deliberately, and the check is `=== true` so a
+stray `"true"` in the overlay cannot re-enable it by coercion.
+
+**Validated at `8dbdb52`:** generated yml has no TCP line; UDP 8189 listening and TCP 8189
+not; MediaMTX logs `listener opened on :8889 (HTTP), :8189 (ICE/UDP)` where it previously
+logged both; all 5 recent `peer connection established` lines classify as UDP; browser
+`getStats()` shows nominated pair `prflx/udp ↔ host/udp/192.168.31.223:8189` with
+`anyTcpRemote: false`, 383 frames decoded, packetsLost 0, jitter 8 ms. 308/308 host tests,
+0 cancelled. New `test/on-target/webrtc-transport.sh`: **ALL CHECKS PASSED**.
+
+**STILL UNPROVEN, and it is the whole question:** whether UDP survives the **tactical radio**
+path. It works on lab WiFi. Some verification sessions came from a tunnel address
+(`100.96.0.60`), so they do not even prove the LAN path in isolation. If UDP cannot cross the
+radio, video will now fail *visibly and immediately* rather than degrading — that is the
+intended behaviour and it is better than the alternative, but it means the radio's UDP
+handling is the next thing to fix, on the radio.
+
+#### The h264 transport switch is abandoned. `fix/video-continuity-over-webrtc-tcp` must NOT merge.
+
+It was deployed, driven, and it **failed worse than what it replaced.** 16 consecutive
+5-second windows shed 1, 49, 47, 48, 34, 50, 40, 26, 24, 49, 36, 50, 49, 48, 40, 2 frames —
+77 s of near-total video loss — and **12 `no input for 1000 ms` fail-safe trips in ~100 s
+against 3 in 300 s under WebRTC, a ~12× regression on the control path.** Both reviewers
+independently identified the mechanism, and it is the sharp lesson here: under WebRTC the
+starved encoder *stopped the video flow*, which accidentally freed airtime for control. The
+h264 path deliberately removes that limiter by always draining stdout, so a multi-megabyte
+video TCP flow stays permanently in flight, competing with control over the same half-duplex
+radio. **It never collapses, so it never yields.**
+
+**Four claims I made about that branch were wrong, and are struck here:**
+
+1. **"Keyframes shed last" / "the h264 path cannot fail that way" — FALSE.** `shouldSendFrame`
+   tests `backlog > dropAllBytes` first and unconditionally, so keyframes die with everything
+   else. The arithmetic settles it: at `intra_period` 10 and 10 fps a 5 s window holds ~50
+   frames of which ~5 are keyframes, so the maximum drop with keyframes preserved is 45.
+   Eight of sixteen windows exceeded 45. Keyframes were shed, repeatedly.
+2. **The `video-drop.sh` "still received key frames" evidence is invalid.** Its keyframe
+   counter reads `d[4] & 0x1f`, but the wire format is `[flag][frameCount:uint32BE][Annex-B…]`
+   — so `d[4]` is the **low byte of the frame counter**, not a NAL type. It counts
+   `frameCount & 0x1f ∈ {5,7}`, i.e. 2 of every 32 frames regardless of keyframe-ness. My
+   "continuity under extreme backlog, demonstrated on hardware" claim rested on a counter
+   that cannot observe keyframes. **Bug pre-dates the branch and is still live in `main`.**
+3. **The desktop-Chrome browser check could not validate `--inline`.** `avc1.428028` is the
+   hardcoded fallback `parseSPSCodec` returns *when no SPS is found*, so a parse and a parse
+   failure log identically; and a fresh connection's first keyframe carries SPS/PPS even
+   without `--inline`. Both reviewers agreed the on-target late-join test plus its negative
+   control **is** sound proof — that stands; the browser paragraph does not.
+4. **"Nothing in code enforces the camera-ownership coupling" — wrong, and in the dangerous
+   direction.** `install.sh:251` sets `stream_codec` to `webrtc` and `:373` enables
+   `mediamtx.service`. Re-running the installer and accepting the default `y` silently
+   reverts the codec in the **tracked** config and re-enables mediamtx. I never checked
+   `install.sh`.
+
+**Worth keeping from that branch, and it should be re-landed separately:** the `--inline`
+fix (`4067c91`) is a real, measured defect fix with a sound negative control, and the
+`telemetry.sh` false-"no flight battery" footer removal (`5df17f0`) is unrelated to video and
+overdue. Both reviewers said keep them. They need the `d[4]` counter fixed and a host test
+reaching `start()` via a spawn stub first, since replacing the `buildCameraArgs()` call site
+with a bad literal argv leaves the suite green.
+
+**Reviewers:** `opus-fallback` **and** a Fable 5 red team. Codex did not run — verbatim:
+`ERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to
+continue.` It produced no findings at all, which is a permitted fallback condition. Both
+reviews reached NO-SHIP independently, and convergence across model families is the evidence
+CLAUDE.md asks for. Their remaining findings — an unauthenticated `requestKeyframe` camera-kill
+newly exposed by making h264 default, unbounded drop thresholds, a vacuous comment-string
+test, and `test/video-config.test.js` checking git contents rather than effective config — are
+in `TASKS.md`.
+
+**PROCESS FAILURE, mine, recorded because it invalidates evidence.** I ran mutations and
+switched branches in `/home/bimansantoso/picar` **while both reviewers were reading that same
+working tree.** One observed HEAD moving and `streams/h264.js` transiently missing `--inline`,
+and reported that any `npm test` result produced in that tree during the window is
+untrustworthy. Authoring and review must not share a worktree; use `EnterWorktree` or a
+`git archive` export next time. Nothing shipped from the dirty window, but that was luck.
+
+**Rover3 state:** on `fix/webrtc-require-udp` @ `8dbdb52`, **not `main`**. `stream_codec` is
+`webrtc`, `mediamtx.service` is active **and enabled again**, `picar` `NRestarts=0`, autopilot
+heartbeat up, 11/11 critical params verified, battery live at ~7.5 V. `npm run test:on-target`
+now runs every read-only check rather than one of five.
+
 ### 2026-08-05 — Two P0s on the unauthenticated control port: crash-without-fail-safe, and served private keys
 
 `fix/crash-failsafe` and `fix/no-secrets-over-http`, both merged. Found by an adversarial
