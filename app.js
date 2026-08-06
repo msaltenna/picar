@@ -37,6 +37,7 @@ const pwm = PWMDriver(config);
 
 const fleetClient = require('./fleetmgr-client');
 const { installCrashFailSafe, serveStatic } = require('./crash-failsafe');
+const { isServable } = require('./static-allowlist');
 fleetClient.start(config);
 
 const file = new static.Server();
@@ -102,6 +103,14 @@ const appServer = https.createServer(options, (req, res) => {
     };
     res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
     res.end(JSON.stringify(manifest));
+  } else if (!isServable(parsed.pathname)) {
+    // Fail closed. The static root is the whole repository, so without this the port
+    // served certs/ca.key — the CA private key every operator device is told to trust —
+    // along with picar-cfg.local.json, .git and mediamtx.yml, to anyone who could reach
+    // it. See static-allowlist.js.
+    console.error(`picar: refused static request for ${parsed.pathname} (not on the allowlist)`);
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found\n');
   } else {
     // serveStatic strips Range first. node-static's 206 path calls res.writeHead() again
     // after the body has streamed, which throws ERR_HTTP_HEADERS_SENT out of this handler
