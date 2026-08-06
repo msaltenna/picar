@@ -359,11 +359,24 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   signalling always came from the radio side while the first two sessions' media went over WiFi.
   Connect explicitly to the radio-side address so the next test measures one path.
 
-- **The browser has never decoded the h264 stream** — the Chrome extension was unavailable during
-  validation, so WebCodecs end-to-end is unverified. Key frames now carry SPS+PPS (proven on
-  target) and `socket.html` has the decode path, but no real browser has been pointed at it. Note
-  the client-side risk this leaves: WebCodecs is fine on Chrome, and **iOS Safari only gained it in
-  17** — the tilt-control phone workflow may not decode at all. Check a phone as well as a laptop.
+- **The h264 stream is verified in desktop Chrome but NOT on a phone** — Chrome DevTools confirmed
+  it end-to-end on 2026-08-06: `VideoDecoder configured: avc1.428028`, `H264 WS connected`, and
+  `liveCanvas` painting live content (736/768 non-black pixels, checksum changing between samples
+  1.2 s apart, so moving video and not a stuck frame). **iOS Safari only gained WebCodecs in 17**,
+  so the tilt-control phone workflow may not decode at all — that is the remaining gap and it
+  matters because tilt mode is a phone-only feature. Check a phone before relying on it. If iOS
+  cannot decode, the fallback is `stream_codec: "mjpeg"` for phones, which has never been validated
+  on target either.
+
+- **The rovers' systemd units are symlinks into the git working tree** — measured 2026-08-06:
+  `/usr/lib/systemd/system/picar.service -> /opt/picar/systemd/picar.service`, same for
+  `mavproxy.service`. So **a branch checkout on a rover silently rewrites live systemd units**, and
+  systemd keeps running the old definition until someone happens to run `daemon-reload`. This is
+  not hypothetical: while the rover's disk sat at `86272ed` the live unit had **no `RestartSec`**,
+  and resetting to `948cdcc` added it — the unit changed as a side effect of a git command, with
+  only a warning buried in `systemctl restart` output. A deploy should `daemon-reload` as a matter
+  of course, and `install.sh` should copy the units rather than symlink them so a checkout cannot
+  reach into the running init system.
 
 - **WebRTC never negotiated ICE over UDP, only TCP** — all four sessions on 2026-08-06 logged
   `local candidate: host/tcp/…:8189, remote candidate: prflx/tcp/…`. UDP 8189 was bound and

@@ -154,11 +154,23 @@ clients reconnect, so this would have fired on the next field test.** Fixed with
 - Autopilot heartbeat up, all 11 critical params verified, `NRestarts=0`, both control-port P0s
   still hold (secrets 404, Range 200 with the PID unchanged).
 
-**WHAT IS NOT VALIDATED, and it is the thing that matters:** the out-of-sight drive that motivated
-this. Everything above is bench evidence on a strong link (−37 to −47 dBm). Also **the browser has
-never decoded this stream** — the Chrome extension was unavailable, so WebCodecs end-to-end is
-unverified. `socket.html` has the decode path and key frames now carry SPS+PPS, but a real browser
-has not been pointed at it. **Check that before driving.**
+**Browser end-to-end: VERIFIED in desktop Chrome** (via Chrome DevTools, after the extension route
+was unavailable). Console reports `H264 WS connected` and `VideoDecoder configured: avc1.428028`;
+`liveCanvas` paints live content — 736/768 non-black pixels with the checksum changing between
+samples 1.2 s apart, so moving video rather than one stuck frame. The `webrtcVideo` element is inert
+(`readyState: 0`, no src), confirming the WebRTC path is genuinely out of use. Telemetry and the
+control overlay render (`Batt: 7.5V 57% 0.4A`, `FC: ok`).
+
+**WHAT IS STILL NOT VALIDATED, and it is the thing that matters:** the out-of-sight drive that
+motivated this. Everything above is bench evidence on a strong link (−37 to −47 dBm). And **no
+phone has decoded this stream** — iOS Safari only gained WebCodecs in 17, and tilt mode is
+phone-only, so that combination is untested. Both are in `TASKS.md`.
+
+**Note for anyone deploying by checkout:** the rovers' systemd units are **symlinks into the git
+working tree** (`/usr/lib/systemd/system/picar.service -> /opt/picar/systemd/picar.service`). A
+branch checkout therefore rewrites the live unit, and systemd keeps running the old definition until
+a `daemon-reload`. This bit during this session: at `86272ed` the live unit had no `RestartSec`, and
+resetting to `948cdcc` added it. `daemon-reload` was run; the hazard is filed in `TASKS.md`.
 
 **ROVER3 IS LEFT IN A NON-DEFAULT STATE — read this before the next session:**
 
