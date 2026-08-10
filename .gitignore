@@ -6,3 +6,13 @@ picar-cfg.local.json
 mediamtx.yml
 mav.tlog
 *.tlog
+# MAVProxy writes mav.tlog.raw alongside mav.tlog, and *.tlog does not match it —
+# so the raw log was tracked in git for months despite the rule against committing
+# tlogs. Same for parameter dumps: mav.parm was tracked, and it was a PX4
+# quadcopter dump, not rover3's ArduRover baseline (see the removal commit).
+# Deliberately NOT "not this fleet": the fleet runs both firmwares — rover1's
+# Pixhawk 6C was converted and runs PX4 — so a PX4 dump is foreign to rover3, not
+# to the fleet, and treating PX4 as necessarily alien is its own mistake.
+*.tlog.raw
+*.parm
+*.param
