@@ -92,6 +92,57 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+### 2026-08-11 — Control-path and Pixhawk-config audit; five branches open, NONE reviewed or validated
+
+Two audits (server/client control path, then flight-controller configuration), both fanned out
+across parallel agents, followed by the first read-only on-target parameter survey this project
+has done. Five branches came out of it. **All five are local, unmerged, unpushed, carry no
+`Reviewed-by:` trailer, and have no Embedded Validator pass.** Do not merge any of them on the
+strength of this entry.
+
+| Branch | SHA | What |
+| --- | --- | --- |
+| `fix/systemd-restart-limits` | `b2ef26e` | mavproxy `RestartSec=2` + widened finite start-limit; `test/systemd-units.test.js`; `test/on-target/service-boot.sh` |
+| `chore/remove-px4-param-dump` | `345f300` | delete `mav.parm`/`mav.tlog`/`mav.tlog.raw`, fix the comment naming them, extend `.gitignore` |
+| `fix/verify-gps-disable-params` | `66df00c` | read back `AHRS_GPS_USE`/`GPS1_TYPE`; test that every pushed param is verified |
+| `feature/fc-failsafe-params` | `376fec2`, `583f18c` | decode `COMMAND_ACK`; push+verify `FS_ACTION=2` and `FS_GCS_ENABLE=1` |
+| `fix/align-steering-rc-range` | `add9294` | own `RC1_MIN/MAX` and `RC3_MIN/MAX`; assert against `pwm_min_us`/`pwm_max_us` |
+
+**Review status, stated plainly because the trailers cannot say it.** Codex reviewed the first,
+over-scoped version of the systemd change and returned **8 findings, all of which were accepted**;
+that change was reverted whole and re-scoped from four concerns to one. Codex then produced **no
+verdict at all** on anything else: one foreground run hit the 10-minute timeout, and a
+`--background` re-run terminated after dumping the diff without reviewing. Per
+`.claude/skills/second-opinion-validator/SKILL.md` a timeout is **not** a fallback condition, so
+the Opus fallback was not used and the stage is **escalated, not satisfied**.
+
+**On-target work was read-only.** `PARAM_REQUEST_READ` and tlog parsing only; no `PARAM_SET`, no
+arm, no disarm, no motion, nothing written to the FC. rover3 was left as found: throttle 0,
+steering 0, all three services active, `params.missing []`, temp files removed.
+
+What the parameter survey established is in `## Environment` above — firmware version, the 918-param
+baseline, both FC failsafe triggers disabled, all battery failsafes disabled, the v2-only autopilot,
+the armed state, and the broken battery voltage sense. Open work from it is in `TASKS.md`.
+
+**Three process failures in this session, recorded because the pattern recurs here:**
+
+1. **A commit message asserted mutations were dead when one had survived.** The `sed` matched no
+   line, so the mutation never ran; run properly it survived and exposed a real gap —
+   `FS_GCS_ENABLE` could be dropped from `EXPECTED_CRITICAL_PARAMS` with no test failing. Amended,
+   and a test now closes it. `CLAUDE.md` already warns that two past commit messages did this;
+   make three.
+2. **A commit went in with a failing test.** `not ok 47` — the new test looped over RC1 and RC3
+   assuming both were pushed, and `RC3_MIN/MAX` were not in the overlay. Adding them was the right
+   fix and closed a tracked P2, but the commit should not have been made first.
+3. **Four proposed corrections to this file and `TASKS.md` were drafted, then all four were
+   refuted** by an adversarial pass before being written. The most serious was a claim that
+   `TASKS.md`'s 2026-08-03 DISARM entry was factually wrong: this session measured
+   `COMMAND_ACK cmd=400 result=4` in a **different capture** (~24 min, 1434 heartbeats,
+   `base_mode 193`, ArduRover 4.6.3) than the entry describes (3 m 40 s, 222 heartbeats,
+   `base_mode 129`, SHA `268561f`). Different session, so it corroborates nothing about that one.
+   The new measurement is recorded as its own dated observation instead. **The refute pass is the
+   only reason a wrong "correction" did not land in a file everyone trusts — keep doing it.**
+
 ### 2026-08-05 — Two P0s on the unauthenticated control port: crash-without-fail-safe, and served private keys
 
 `fix/crash-failsafe` and `fix/no-secrets-over-http`, both merged. Found by an adversarial
@@ -1096,9 +1147,36 @@ Rover returned to `main` @ `8271d14` after this merge. *(No longer the current b
 ## Environment
 
 **Rovers.** `rover1`, `rover2`, `rover3` exist. **`rover3` is the development target** and
-the only rover to deploy to unless told otherwise. It is powered and running; **its flight
-battery is not connected**, so motors and servos cannot physically actuate. Validate the
-command path up to the flight controller and never imply mechanical motion was observed.
+the only rover to deploy to unless told otherwise.
+
+> **ASSUME rover3 CAN MOVE. Measure the battery for your own run; do not inherit a premise.**
+>
+> This paragraph said "its flight battery is not connected, so motors and servos cannot
+> physically actuate" until 2026-08-11. `CLAUDE.md` reversed that standing premise on
+> 2026-08-05 after an on-target probe commanded throttle −0.6 for 1.5 s and +0.6, three
+> separate runs, on the strength of it — but this section, which reads as live standing
+> guidance rather than a dated record, was never updated. That is the more dangerous half of
+> the mistake: a frozen historical entry misleads whoever reads that entry, while
+> `## Environment` misleads everybody.
+>
+> **And the reading you would measure it with is not currently trustworthy.** Measured on
+> rover3 2026-08-11 16:5x BST: `/status` `telemetry.battery` is
+> `voltageV: 0.007, currentA: 0.54, remainingPct: 95, pctSource: "flightcontroller"`, with
+> `telemetry.power.servoV: 0`. Voltage reads essentially zero *while current reads 0.54 A* —
+> those cannot both be right, so **"0.007 V" is not evidence of a disconnected pack.** The FC
+> is on an analog sense (`BATT_MONITOR=4`, `BATT_VOLT_PIN=8`, `BATT_VOLT_MULT=18.18`) and the
+> voltage side of it appears dead. `remainingPct` is arithmetic from `BATT_CAPACITY=3300`
+> against unmeasured consumption, so it is not an independent reading either, and MAVProxy
+> logs "Flight battery 100 percent" from the same non-fact.
+>
+> Consequence for the on-target scripts: `test/on-target/control-e2e.js:107` gates motion on
+> `b.voltageV > 3`. With the sense reading 0.007 V that guard concludes "no battery" and skips
+> — which fails safe for the script, but means **the guard cannot currently distinguish a
+> disconnected pack from a broken sense.** Do not reason from it, and do not reason from
+> `/status` voltage, until the sense is fixed. Both are open in `TASKS.md`.
+>
+> What to do instead: look at the pack and the connector, physically. If a change cannot be
+> proven without actuation, report it unvalidated and stop.
 
 **The fleet is NOT homogeneous — this constrains what can be validated where.**
 
@@ -1125,28 +1203,108 @@ appears as `rover3.Saltenna.local`). The dev workstation and the rovers share
 rover's `authorized_keys`; ask the operator to run `ssh-copy-id` in a real terminal — from a
 non-TTY shell it fails on a missing `ssh-askpass`, and it needs `sudo`.
 
-**rover3 checkout state — verified 2026-08-03: it is NOT on `main`.**
+**rover3 checkout state — measured 2026-08-11 16:5x BST. It is NOT on `main`.**
 
 ```
-branch  feature/battery-and-radio-telemetry
-HEAD    a979b599e17cd4091ac1050fd7df6a8f21bae9e8
-dirty   (clean)
+branch  fix/webrtc-require-udp
+HEAD    370d39da
+dirty   untracked field-log.sh only
 units   picar active · mavproxy active · mediamtx active
-model   Raspberry Pi Compute Module 4 Rev 1.1 · Debian 13 (trixie) · Node v20.19.2
-config  pwm_method mavproxy · stream_codec webrtc · picar-cfg.local.json {"rover_id": 3}
+model   Raspberry Pi Compute Module 4 Rev 1.1 · Linux 6.12.62+rpt-rpi-v8
+uptime  18 h (mavproxy up since Mon 2026-08-10 21:32:06 BST, NRestarts=0)
+clock   Europe/London (BST, +0100) — agrees with the workstation in UTC
+params  11/11 critical verified · missing [] · mismatched {}
 ```
 
-So the dev rover has been running **unmerged** code — the finished-but-unlanded telemetry branch
-— and earlier notes in this file claiming it was "returned to `main` @ `8271d14`" are stale. This
-matters twice over: any future validation must state which SHA the rover actually ran, and
-deploying a new branch to rover3 will move it off `a979b59`, so note the branch it came from
-before switching. Identity is via untracked `picar-cfg.local.json` and survives checkouts. The
-`fleet_enabled` flag from the abandoned `d816a7d` is gone; no code on `main` reads it.
+Before this, the block above claimed `feature/battery-and-radio-telemetry` @ `a979b59`
+(2026-08-03), and the change log separately asserted `fix/webrtc-require-udp` @ `8dbdb52` and
+`test/p0-verify` — **three different checkouts asserted at once in one file.** The dev rover has
+never been left on `main`. Any validation must state the SHA the rover actually ran, and
+deploying a branch moves it, so record what it came from first. Identity is untracked
+`picar-cfg.local.json` and survives checkouts.
 
-**rover1 and rover2 are not reachable from this workstation (2026-08-03).** `rover1` does not
-resolve (mDNS), `rover2` refuses SSH `publickey`. Both hold the high/low gearbox, so the
-gear/throttle P0 has no validation path until that is fixed — ask the operator to run `ssh-copy-id`
-in a real terminal (from a non-TTY shell it fails on a missing `ssh-askpass`, and it needs `sudo`).
+**The rover's clock is Europe/London (BST, +0100); the dev workstation is EDT (−0400).** Both
+agree in UTC. Local timestamps in journals and `ls` output are therefore **five hours ahead of
+workstation local time** — a log line reading "Aug 10 23:09" is 18:09 EDT the same day. Reading a
+rover timestamp as workstation-local makes a fresh file look ~5 h stale, and this session very
+nearly recorded a live tlog as frozen on exactly that mistake.
+
+**MAVProxy's tlogs are 450 MB in tmpfs and growing (measured 2026-08-11).**
+`/tmp/mav.tlog` 272 MB + `/tmp/mav.tlog.raw` 178 MB, growing ~3–4 KB/s (measured by sampling the
+size 6 s apart), against a 3.9 GB `/tmp` at 11% used. MAVProxy is simultaneously emitting
+**"Out of space for logging" ~118 times per 10 minutes** — which cannot be the tmpfs, so it is
+most likely the autopilot's own log volume relayed as STATUSTEXT, meaning the FC is not writing
+its own dataflash logs. That matters because those logs are what would explain a refused DISARM.
+Not yet run down; open in `TASKS.md`.
+
+`/var/log/mavproxy/` still holds a genuinely stale set from **May 21** (`mav.tlog` 3.3 MB,
+`mav.tlog.raw` 2.2 MB, `mav.parm` 19.7 kB). Do not parse those believing they are current — the
+live logs are the two in `/tmp`.
+
+**rover1 and rover2 are not reachable from this workstation (re-measured 2026-08-11).** Neither
+hostname **resolves** any more: both fail with `Name or service not known`. That is a change from
+2026-08-03, when `rover1` did not resolve but `rover2` resolved and refused SSH `publickey` —
+`rover2`'s failure has moved one layer down the stack, so `ssh-copy-id` is no longer the fix for
+it. Both hold the high/low gearbox, so the gear/throttle P0 still has no validation path, and
+neither can be diffed against rover3's parameter baseline. Establishing whether they are powered,
+on the network, or advertising over mDNS at all is the first step, ahead of any key exchange.
+
+**Flight controller firmware, measured 2026-08-11 — recorded here because it was written down
+nowhere before.**
+
+```
+ArduRover V4.6.3 (3fc7011a) · ChibiOS 88b84600
+Pixhawk6C 002E002F 30345119 31303434
+918 distinct parameters
+```
+
+Read out of MAVProxy's own startup parameter fetch in `/tmp/mav.tlog`, which needs no extra
+MAVLink client — useful because **MAVProxy's `--out=tcpin:127.0.0.1:5760` is single-client and
+picar owns it**: a second client gets a connection but no traffic and `wait_heartbeat` times out.
+Parse the tlog instead of attaching. The version matters because parameter *names* move between
+releases: `GPS1_TYPE` exists and `GPS_TYPE` does not, and `SYSID_MYGCS` exists while
+`MAV_GCS_SYSID` does not, so 4.6.3 is the naming era this fleet is in.
+
+**The autopilot speaks MAVLink v2 only.** In a 200 kB live tail: 48 autopilot HEARTBEATs as v2
+(`0xFD`), **zero** as v1. picar's own traffic is v1 (`0xFE`, msgid 70 `RC_CHANNELS_OVERRIDE`
+×955). MAVProxy is therefore translating v2→v1 for picar's link, which is the only reason picar —
+whose parser drops v2 — sees heartbeats at all. Anything that changes MAVProxy's link handling can
+silently take picar's telemetry with it.
+
+**rover3's measured parameter baseline (2026-08-11).** Keep this: it is the first real baseline
+this project has had, and it replaces `mav.parm`, which was a **PX4 quadcopter dump** (1101
+params, `MAV_TYPE 2`, zero ArduPilot-only names) that a code comment used to invite operators to
+load by hand.
+
+```
+FS_ACTION 2      FS_TIMEOUT 1.5   FS_THR_ENABLE 0   FS_GCS_ENABLE 0
+FS_OPTIONS 0     FS_CRASH_CHECK 0 FENCE_ENABLE 0
+SYSID_MYGCS 255  SYSID_ENFORCE 0  ARMING_CHECK 1    ARMING_REQUIRE 0
+MODE_CH 8        INITIAL_MODE 0   MODE1..MODE6 all 0 (all MANUAL)
+RCMAP_ROLL 1  PITCH 2  THROTTLE 3  YAW 4            RC_PROTOCOLS 1
+RC3_MIN/MAX 1000/2000   RC1/RC2/RC4/RC5/RC6_MIN/MAX 1100/1900
+SERVO3_MIN/MAX 1000/2000  SERVO1/2/4/5/6_MIN/MAX 1100/1900
+MOT_THR_MAX 100  MOT_THR_MIN 0    MOT_SLEWRATE 250  CRUISE_THROTTLE 50
+ATC_BRAKE 1      ATC_ACCEL_MAX 1  WP_SPEED 2        SPEED_MAX 0
+BATT_MONITOR 4   BATT_CAPACITY 3300  BATT_VOLT_PIN 8  BATT_VOLT_MULT 18.18
+BATT_LOW_VOLT 0  BATT_CRT_VOLT 0  BATT_FS_LOW_ACT 0  BATT_FS_CRT_ACT 0  BATT_ARM_VOLT 0
+```
+
+Two readings from it are load-bearing and are open in `TASKS.md`: **both FC failsafe triggers are
+disabled** (`FS_THR_ENABLE`/`FS_GCS_ENABLE` = 0, so `FS_ACTION=2` Hold is configured but
+unreachable), and **every battery failsafe is disabled**. One is reassuring and worth not
+re-litigating: `INITIAL_MODE=0` with `MODE1..MODE6` all 0 means the mode switch cannot take the
+vehicle out of MANUAL, and `RCMAP_*` is at defaults so picar's channel map is correct.
+
+**The vehicle is ARMED as of 2026-08-11 16:5x** — autopilot `base_mode=193` (`SAFETY_ARMED` set)
+across all 48 heartbeats in the live tail, `custom_mode=0` (MANUAL). It has been armed
+continuously, and picar's `neutralizeAndDisarm()` on connect has not changed that.
+
+**Verified-independently note on `mavproxy_arm.py`.** MAVProxy's own arm module on rover3
+(`/opt/venvs/mavproxy/lib/python3.13/site-packages/MAVProxy/modules/mavproxy_arm.py`) uses
+`p2 = 2989` for `arm force` (:143) and `p2 = 21196` for `disarm force` (:188). That is on-disk
+evidence, on the target, that **2989 is the force-ARM magic and 21196 is the force-DISARM magic** —
+which bears directly on a `TASKS.md` P0 and is why that entry has been corrected.
 
 Rollback point, if ever needed: branch `fleet-manager` @
 `cdf4ae16dc9e105acf4cd711b33c416f52ae7739`, with the pre-change working-tree diff and the

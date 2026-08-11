@@ -13,12 +13,35 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ## In progress
 
+- **[P0] Five branches are open, unmerged, and NONE is reviewed or validated** (2026-08-11). All
+  local, none pushed, none carrying a `Reviewed-by:` trailer, none with an Embedded Validator pass.
+  Merging any of them requires clearing the Second Opinion stage first — see the next entry.
+  - `fix/systemd-restart-limits` (`b2ef26e`) — mavproxy `RestartSec=2` + widened finite
+    start-limit; `test/systemd-units.test.js`; `test/on-target/service-boot.sh`.
+  - `chore/remove-px4-param-dump` (`345f300`) — deletes `mav.parm`/`mav.tlog`/`mav.tlog.raw` and
+    the comment inviting operators to load the first. **The repo-bloat entry under P3 must not be
+    narrowed until this merges** — the files are still on `main`.
+  - `fix/verify-gps-disable-params` (`66df00c`) — read back `AHRS_GPS_USE`/`GPS1_TYPE`, plus a test
+    that every pushed parameter is verified.
+  - `feature/fc-failsafe-params` (`376fec2`, `583f18c`) — decode `COMMAND_ACK`; push and verify
+    `FS_ACTION=2` and `FS_GCS_ENABLE=1`. **Touches invariants 6 and 7.**
+  - `fix/align-steering-rc-range` (`add9294`) — own `RC1_MIN/MAX` and `RC3_MIN/MAX`. Changes
+    steering feel; needs a WebUI drive.
+- **[P0] The Second Opinion stage is ESCALATED, not satisfied** — Codex reviewed the first,
+  over-scoped systemd change and returned 8 findings, all accepted (that change was reverted whole
+  and re-scoped). It then produced **no verdict at all** on any other work this session: one
+  foreground run timed out at 10 minutes, and a `--background` re-run terminated after dumping the
+  diff without reviewing. `.claude/skills/second-opinion-validator/SKILL.md` states a timeout is
+  **not** a fallback condition, so the Opus fallback was not used. This needs an operator decision
+  or a working Codex before anything merges.
 - **[P0] Close the unauthenticated attack surface** — the RCE, the missing Origin check, and the
   Fleet Manager XSS below. These are reachable today from any device that can open a socket to a
   rover, with no credential. Scheduled as Phase 1.
 - **[P0] Root-cause the gear/throttle defect** — see the P0 entry below. **Still blocked on
-  geared-rover access:** as of 2026-08-03 `rover1` does not resolve over mDNS and `rover2`
-  refuses SSH `publickey`. rover3 has no gearbox, so this cannot be reproduced there at all.
+  geared-rover access, and it got worse:** re-measured 2026-08-11, **neither `rover1` nor `rover2`
+  resolves** (`Name or service not known`). On 2026-08-03 `rover2` at least resolved and refused
+  `publickey`, so `ssh-copy-id` is no longer the fix — establish whether they are powered and on
+  the network first. rover3 has no gearbox, so this cannot be reproduced there at all.
 
 ## Backlog
 
@@ -121,17 +144,89 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   theoretical gap ("a successful `write()` is not proof of delivery") into a demonstrated
   failure of the platform's core safety primitive.
 
-  Root cause not yet identified. Candidates: MAVProxy not forwarding picar's v1 `COMMAND_LONG`
-  to the serial link; the FC silently rejecting the frame; or a framing detail rejected without
-  ACK. ArduPilot normally ACKs every `COMMAND_LONG`, so the total absence of an ACK for 400
-  suggests the FC never accepted a valid frame. **Diagnosing this requires COMMAND_ACK parsing,
-  which requires the v2 parser** — so it is gated behind the telemetry-branch merge. Do that
-  first, then re-test.
+  Root cause not yet identified for **this** capture. Candidates: MAVProxy not forwarding picar's
+  v1 `COMMAND_LONG` to the serial link; the FC silently rejecting the frame; or a framing detail
+  rejected without ACK.
 
-  Corollary, and it supersedes the older note that "`main` never disarms it": `main` *does* send
-  a disarm on connect (`pwm_mavproxy_servo.js:149`) — it simply does not work. **Assume any rover
-  may be armed at any time, including after a picar restart, a crash, or a reboot.** No actuation
-  was possible during this test; rover3's flight battery is disconnected.
+  **Two corrections to this entry, 2026-08-11 — neither changes its finding.**
+
+  1. The gate is gone. This said "**Diagnosing this requires COMMAND_ACK parsing, which requires
+     the v2 parser** — so it is gated behind the telemetry-branch merge." The telemetry branch is
+     merged, and COMMAND_ACK parsing turned out **not** to need the v2 parser at all: it needed a
+     `MSG_CRC_EXTRA[77] = 143` and `MSG_PAYLOAD_LEN[77] = 3` entry, which is what unmerged
+     `feature/fc-failsafe-params` (`376fec2`) adds. The blocker was two table entries, and
+     believing it was a parser rewrite is why this sat undiagnosed.
+  2. The closing sentence read "No actuation was possible during this test; rover3's flight
+     battery is disconnected." Removed. `CLAUDE.md` ruled on 2026-08-05 that this premise must
+     never be written as a standing fact, and the measured `/status` voltage that would be used to
+     re-establish it is itself broken (see the battery-sense entry below).
+
+  Corollary, unchanged: `main` *does* send a disarm on connect — it simply does not work.
+  **Assume any rover may be armed at any time, including after a picar restart, a crash, or a
+  reboot.** Measured 2026-08-11: rover3 is armed (`base_mode=193`) and has been continuously.
+
+- **A SECOND capture, 2026-08-11: the autopilot ACKed the disarm and REFUSED it** — recorded as a
+  separate observation rather than folded into the 2026-08-03 entry above, because it is a
+  **different capture and does not corroborate or refute that one**. From `/tmp/mav.tlog` on
+  rover3, ArduRover V4.6.3, ~24-minute window, 1434 autopilot heartbeats at `base_mode 193`:
+
+  - `COMMAND_LONG` cmd=400 `param1=0 param2=21196` from sysid 255, ×1 — picar's disarm.
+  - **`COMMAND_ACK` cmd=400 `result=4` (`MAV_RESULT_FAILED`) from sysid 1, ×1.**
+  - `COMMAND_ACK` cmd=410 `result=4`, ×712 (`GET_HOME_POSITION`, expected with GPS disabled).
+  - No `COMMAND_LONG` 176 (`DO_SET_MODE`) in the window at all.
+
+  So in **this** capture the frame reached the autopilot, was parsed, and was actively rejected —
+  a different mechanism from "never accepted", and it points at why `AP_Arming` refuses rather
+  than at framing or transport. picar could not observe it either way: msgId 77 had no
+  `CRC_EXTRA` entry, so every ack was discarded a byte at a time.
+
+  Note the 2026-08-03 entry's numbers (3 m 40 s, 222 heartbeats, `base_mode 129`, ~110 cmd-410
+  acks, SHA `268561f`) and these do not describe the same run. **Do not merge the two.** Whether
+  the FC's behaviour changed, or the earlier capture simply missed an ack, is open. Settling it
+  needs one repeat: send ~20 disarms with the ack decode in place and count the acks — consistent
+  `result=4` indicts `AP_Arming`; intermittent silence indicts the transport.
+
+- **[P0] Both flight-controller failsafe triggers are disabled, so nothing stops the vehicle when
+  picar dies** — measured on rover3 2026-08-11 (ArduRover V4.6.3, 918 params):
+  `FS_THR_ENABLE=0`, `FS_GCS_ENABLE=0`, `FS_CRASH_CHECK=0`. `FS_ACTION=2` (Hold) and
+  `FS_TIMEOUT=1.5` are configured but unreachable with both triggers off. When picar stops
+  transmitting for any reason — Pi power loss, SIGKILL, a blocked event loop — the override stream
+  stops, `RC_OVERRIDE_TIME=0.2` releases the overrides after 200 ms, the FC reverts to RC input
+  with no receiver fitted, no failsafe bit is set, and the throttle **holds its last commanded
+  value**. With an autopilot that refuses DISARM, that is a runaway with no operator link and
+  nothing to stop it. Addressed for the GCS-loss half only on unmerged
+  `feature/fc-failsafe-params` (`583f18c`, `FS_GCS_ENABLE=1` + `FS_ACTION=2` pushed and verified).
+  `FS_THR_ENABLE` deliberately left at 0 — see the Hold-recovery entry below.
+
+- **[P0] Every battery failsafe on the flight controller is disabled** — measured 2026-08-11:
+  `BATT_LOW_VOLT=0`, `BATT_CRT_VOLT=0`, `BATT_FS_LOW_ACT=0`, `BATT_FS_CRT_ACT=0`,
+  `BATT_ARM_VOLT=0`. A flat pack triggers nothing on the FC, and `batteryWarnVolts` in
+  `picar-cfg.json` is a display warning on the companion computer, not a vehicle action. Compounded
+  by the broken voltage sense below: the one input a battery failsafe would key on is unreliable.
+
+- **[P0] The battery voltage sense is broken, and the on-target motion guard depends on it** —
+  measured 2026-08-11: `/status` `telemetry.battery` = `voltageV 0.007, currentA 0.54,
+  remainingPct 95, pctSource "flightcontroller"`, with `telemetry.power.servoV 0`. Voltage reads
+  ~0 while current reads 0.54 A; both cannot be right. FC params are `BATT_MONITOR=4`,
+  `BATT_VOLT_PIN=8`, `BATT_VOLT_MULT=18.18`, so it is an analog sense whose voltage side appears
+  dead. `remainingPct` is arithmetic from `BATT_CAPACITY=3300` against unmeasured consumption, so
+  it is not independent, and MAVProxy logs "Flight battery 100 percent" from the same non-fact.
+  **`test/on-target/control-e2e.js:107` gates motion on `b.voltageV > 3`** — with the sense at
+  0.007 V that guard reads "no battery" and skips. It fails safe for the script, but it cannot
+  distinguish a disconnected pack from a broken sense, which is the exact reasoning error that
+  produced the 2026-08-05 throttle probe. Fix the sense, and make the guard require a *positive*
+  determination rather than treating an implausible reading as "safe".
+
+- **[P0] picar releases the mode channel, so it cannot recover the vehicle from Hold** —
+  `pwm_mavproxy_servo.js:298` allocates `channels = new Uint16Array(8)` and assigns only indices
+  0–5; `buildRCOverride` maps `0 → 65535`, the MAVLink "release this channel" sentinel. So RC7 and
+  RC8 go out released — and measured `MODE_CH=8`. picar therefore cannot drive the mode switch,
+  and its `MAV_CMD_DO_SET_MODE` sends `base_mode=1` whose acceptance is unconfirmed (no 176 appears
+  in any capture). Consequence: **enabling `FS_THR_ENABLE` today risks parking the rover in Hold
+  with no way back**, trading uncommanded motion for a vehicle that cannot be driven. Mitigating
+  factor, measured: `MODE1..MODE6` are all 0 (MANUAL) and `INITIAL_MODE=0`, so the switch cannot
+  take it *out* of MANUAL — which also means driving RC8 to any value would command MANUAL, a
+  possible recovery path worth testing. Blocks the `FS_THR_ENABLE` half of the failsafe work.
 
 - **Two ways the input watchdog is defeated, both leaving throttle applied** —
   1. **Window blur latches held keys.** `socket.html:1514` is
@@ -181,15 +276,34 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   `install.sh` selects this driver on a board it cannot identify. Fix: drop the driver or
   reimplement it without per-edge process spawning.
 
-- **`arm()` force-arms, disabling the flight controller's own pre-arm checks** —
-  `pwm_mavproxy_servo.js:555` sends `MAV_CMD_COMPONENT_ARM_DISARM` with `param2 = 21196`,
-  ArduPilot's force magic, which routes to `AP_Arming::arm()` with checks disabled and skips both
-  `pre_arm_checks` and `arm_checks`: INS/gyro/accel health and consistency, compass, barometer,
-  EKF/AHRS health, RC-failsafe state, battery failsafe, and the params-still-loading guard. So
-  `main` has no arm gate of its own (invariant 7) **and** switches off the independent one running
-  on the hardware. Fix: drop the force flag from `arm()` and surface the resulting
-  `COMMAND_ACK` rejection to the operator. Keep it on `disarm()` — a forced disarm is correct for
-  a fail-safe.
+- **`arm()` sends the force-DISARM magic on an ARM command** — `pwm_mavproxy_servo.js:1209`
+  sends `MAV_CMD_COMPONENT_ARM_DISARM` with `param1 = 1, param2 = 21196`, commented "(force)".
+  21196 is the force-**disarm** magic; the force-**arm** magic is **2989**. Corroborated on
+  target 2026-08-11 from MAVProxy's own arm module on rover3,
+  `.../MAVProxy/modules/mavproxy_arm.py:143` (`arm force` → `p2 = 2989`) and `:188`
+  (`disarm force` → `p2 = 21196`). ArduPilot's arm branch compares `param2` against the
+  force-**arm** value, so 21196 on an arm leaves checks **enabled** — consistent with the
+  measured `ARMING_CHECK=1` on rover3. `disarm()` at `:1257` uses 21196 correctly.
+
+  **This entry previously claimed the opposite** — that the force magic "routes to
+  `AP_Arming::arm()` with checks disabled and skips both `pre_arm_checks` and `arm_checks`",
+  citing a stale `:555`. That claim is withdrawn: it overstated the hazard and pointed
+  remediation at the wrong thing. The same wrong claim still appears at `TASKS.md:697`,
+  `CLAUDE.md` invariant 7 ("tells ArduPilot to skip *its own* pre-arm checks") and the
+  invariant-7 row of `CLAUDE.md`'s "which hold on `main` today" table; all three need the same
+  correction, and `CLAUDE.md` is a separate change.
+
+  **The half that stands, and is still P0:** `main` has no arm gate of its own (invariant 7) —
+  no `isSafetyReady()`, nothing gates on `EXPECTED_CRITICAL_PARAMS`. And `arm()` returns `true`
+  unconditionally (`:1212`) while `COMMAND_ACK` was undecodable, so a *refused* arm reported
+  success. Fix: use 2989 or drop the magic entirely, gate arming on verified params, and surface
+  the `COMMAND_ACK` result. Note the ack decode landed on unmerged `feature/fc-failsafe-params`
+  (`376fec2`), which is what makes the rest of this diagnosable.
+
+  Not yet confirmed against ArduPilot source — MAVProxy's convention is strong corroboration,
+  not the firmware itself. Settles definitively on target with no motion: make a pre-arm check
+  fail, send `COMMAND_LONG 400 param1=1 param2=21196`, and read the `COMMAND_ACK` —
+  `MAV_RESULT_FAILED` plus a `PreArm:` STATUSTEXT means checks ran.
 
 - **Gear change engages throttle and it cannot be turned off** — operator-reported, 2026-07-30.
   On the two rovers fitted with a high/low gearbox, selecting **high gear** engages throttle and
@@ -221,24 +335,6 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   **Blockers:** (1) geared-rover access — see `## In progress`. (2) It is still unknown what code
   rover1/rover2 run; get `git rev-parse HEAD` and `git status --porcelain` from both before
   designing a fix.
-
-- **[P0] `FRAME_CLASS: 2` (Boat) is still what `main` pushes** — `pwm_mavproxy_servo.js`
-  sets it in `DEFAULT_PARAM_OVERLAY` behind the comment `// Rover`, re-asserts `2` in
-  `EXPECTED_CRITICAL_PARAMS` so read-back "verifies" the wrong value, and the mismatch warning
-  text tells the reader to check `FRAME_CLASS=2 (Rover)`. In ArduRover `1` = Rover and `2` = Boat.
-  Confirmed live in rover3's journal (`PARAM_SET FRAME_CLASS=2`, 2026-08-03 23:34:09).
-  **Fixed on `feature/battery-and-radio-telemetry` (`a8808c8`), all three sites together, plus a
-  test asserting every `EXPECTED_CRITICAL_PARAMS` entry matches what the overlay pushes — the
-  drift between the two tables is what made read-back a rubber stamp. This entry stays open until
-  that branch merges.**
-  Disputed and not yet settled: whether the parameter is `@RebootRequired`. An earlier revision of
-  this file asserted "the Pixhawk needs a power-cycle to take the new frame class" with no source;
-  a 2026-08-04 review of ArduPilot's own source found Rover's `FRAME_CLASS` carries no
-  `@RebootRequired` and `is_boat()` reads it live, while a second reviewer asserted the opposite.
-  It matters because if a reboot IS required, read-back confirms the stored and not the active
-  value, and a validation pass would be unearned. **Settle it by measurement on rover3** — set it,
-  read it back, and check whether the HEARTBEAT's `MAV_TYPE` changes from `SURFACE_BOAT` (12) to
-  `GROUND_ROVER` (10) without a power-cycle — not by argument.
 
 - **Fail-safe wire order is fixed on the server; four residuals remain** — as of `c6043d7`,
   operator stop, input timeout, process shutdown, MAVProxy reconnect and drivetrain changes all
@@ -350,6 +446,73 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **[P1] No `SIGTERM` handler — the safety of `systemctl restart` rests on one unit-file line** —
+  `app.js:418-424` handles only `SIGINT`, and `crash-failsafe.js` only `uncaughtException` /
+  `unhandledRejection`. Node's default disposition for `SIGTERM` is immediate termination with no
+  handler run, so `kill`, `pkill -f app.js`, a deploy script's `killall node`, or any rover whose
+  installed unit predates `KillSignal=SIGINT` (`systemd/picar.service:18`) kills picar with the
+  last throttle still in the channel buffer, no neutral packet and no DISARM. Invariant 6 names
+  "process shutdown" as a path that must put neutral on the wire first. Handle `SIGTERM`
+  identically to `SIGINT` rather than relying on a non-obvious unit-file line.
+
+- **[P1] The input watchdog is one module-scope timer shared by every socket** — `app.js:143`
+  declares `let lastAction = null;` at module scope, and every socket's `fromclient` handler
+  (`:387-393`) closes over it. With two clients connected — which needs no attacker, a stale second
+  tab suffices, since the control plane is unauthenticated — client B's traffic keeps calling
+  `clearTimeout(lastAction)` and the watchdog protecting client A's dead link never fires. The "no
+  input" condition is evaluated across the union of all sockets rather than per session. Violates
+  invariants 2 and 5. Make it per-socket, or gate on a monotonic arrival check per session.
+
+- **[P1] `test/on-target/control-e2e.js` cannot fail on the checks that matter** —
+  `:125` defines `const ok = (m) => log("  PASS " + m);` — an unconditional print that never
+  touches `failed`. The input-watchdog block (`:219-226`) sends one `fromclient`, sleeps 3 s,
+  drains the poll and prints PASS; the disarm step (`:212-216`) and the disconnect step verify
+  nothing. **Delete `app.js:387-393` — the whole watchdog — and this script still prints
+  `E2E PASSED`.** The assertion is nearly free: `failSafeStop` resets `old_throttle`/`old_steering`
+  (`app.js:400-402`) and `/status` serves them, so a `GET /status` after the silence proving
+  `throttle === 0` would make this the one check that catches the highest-severity path on the
+  platform. This is the "test unable to fail" pattern `CLAUDE.md` documents, in the on-target
+  suite rather than the host suite.
+
+- **[P1] The autopilot's armed bit is decoded and then discarded** — `pwm_mavproxy_servo.js:1109`
+  sets `this.telemetry.heartbeat = { at, armed: (payload[6] & 0x80) !== 0 }`, and no production
+  code reads `armed` — the only consumer is `test/telemetry.test.js`. So `/status`, the UI and the
+  fleet dashboard cannot show that the vehicle is still armed after a fail-safe, and `disarm()`
+  has no confirmation and no retry: it writes one packet and declares victory. The platform's
+  worst known defect (a refused disarm) has its evidence sitting decoded and unused. Compare
+  intent against `telemetry.heartbeat.armed`, re-send on disagreement, and expose it.
+
+- **[P1] picar's RC output range is wider than the flight controller's input range on five of six
+  channels** — measured on rover3 2026-08-11: `RC3_MIN/MAX` are 1000/2000 and match picar's global
+  `pwm_min_us`/`pwm_max_us`, but `RC1`, `RC2`, `RC4`, `RC5` and `RC6` are all **1100/1900**.
+  `scale()` uses one global pair for every channel, so steering commands spanning 1000–2000 land in
+  a channel ArduPilot normalises over 1100–1900: full lock is reached at 1100/1900 and the outer
+  ~12.5% of stick travel at each end does nothing. Nothing detected this — no read-back complained
+  and no test failed, because the overlay owned `RC3_DZ`/`RC3_TRIM` but not the endpoints. The
+  discrete channels (shift, both diff locks, light) clamp harmlessly. Addressed on unmerged
+  `fix/align-steering-rc-range` (`add9294`); needs a WebUI drive to confirm the mapping is better
+  rather than merely different.
+
+- **[P1] MAVProxy's tlogs are 450 MB in tmpfs and it is logging "Out of space for logging"** —
+  measured on rover3 2026-08-11: `/tmp/mav.tlog` 272 MB plus `/tmp/mav.tlog.raw` 178 MB, growing
+  ~3–4 KB/s, against a 3.9 GB `/tmp` at 11% used. So the message is **not** the tmpfs, which means
+  it is most likely the autopilot's own log volume relayed as STATUSTEXT — i.e. the FC is not
+  writing its dataflash logs. That matters directly: those logs are what would explain a refused
+  DISARM, and `LOG_DISARMED=0` was also measured. Run it down; the existing tmpfs-growth entry
+  under P1 covers the disk half but not this.
+
+- **[P1] TASKS.md's own line citations have drifted file-wide** — the preamble pins every citation
+  to `main` @ `4580209` (2026-08-03), but `main` has taken seven merges since. Spot-checked and
+  wrong today: the `arm` handler is `app.js:204` (cited as 133-144), `fromclient` is `:358-394`
+  (cited 236-272), `failSafeStop` is `:399-409` (cited 277-287), `io.emit('controlStopped')` is
+  `:304` (cited 215), the config overlay merge is `:26` (cited 24-32), `keyup` is
+  `socket.html:1930` (cited 1514), the send loop is `socket.html:1577` (cited 1326),
+  `visibilitychange` is `:1592` (cited 1341-1343), `touchcancel` is `:1772-1781` (cited 1434-1439),
+  and `arm()` is `pwm_mavproxy_servo.js:1195-1212` (cited 555). The preamble's own rule — "cite a
+  line you have actually opened" — is being violated by the file that states it, which is exactly
+  how the ~20 wrong citations it was written to fix got established. Re-verify and re-pin, and
+  prefer symbol names over line numbers where a name exists.
+
 - **`app.js` has no test file at all, and five safety mutants survive because of it** — measured
   2026-08-03. `grep` over `test/` finds no coverage of `io.on`, `socket.on`, `setDrivetrain` or
   `failSafeStop`, so every Socket.IO handler is unverified. Each of these can be applied to `main`
@@ -429,34 +592,6 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   3. `install.sh:88` calls `prompt_yes_no` 38 lines before it is defined, so run-user creation is
      dead code that dies with `command not found`.
   4. `uninstall.sh` never removes the polkit rule installed at `install.sh:331`.
-
-- **[P0] Merge the battery/radio telemetry work — blocked on a Codex review** —
-  `feature/battery-and-radio-telemetry`. It implements battery V/A and a voltage-derived
-  percentage, board and servo rails, radio RSSI and Wi-Fi link quality, a MAVLink v2 parser with
-  CRC validation, param-overlay validation and reassert-until-verified, and the operator-facing FC
-  status indicator. 236 host tests pass.
-  **The blocker is not the code.** `CLAUDE.md` and
-  `.claude/skills/second-opinion-validator/SKILL.md` both state that the `opus-fallback` reviewer
-  runs but does not authorise a merge for a change touching the ten safety invariants, and this one
-  touches 6 (fail-safe timing: `RC_OVERRIDE_TIME` moved to overlay position 0 and reasserted), 7
-  (it builds the read-back machinery invariant 7 names), 8 (six new overlay-reachable keys, all
-  bounded) and 9 (a new interval doing a `/proc` read on the control event loop). Codex reports
-  `ERROR: Your workspace is out of credits.` **Restore credits, review this diff, and merge with a
-  `Reviewed-by: codex` trailer.** Eight review rounds have run: rounds 1-6 and 8 by
-  `opus-fallback`, round 8 additionally by a Fable 5 red team — the only different-model-family
-  review the branch has had. Every round found real defects in the previous round's fixes,
-  including nine tests that could not fail and two commit messages that claimed mutations were
-  dead when they were not.
-  **Embedded Validator PASS recorded for `d741a62a9919550d0d417c2458fde4404734fefd`** (and
-  earlier for `ca44537fbc5fba66b5ce31271f18699e76ccae97`) on rover3,
-  2026-08-04 — services, journal, 8/8 param read-back, bidirectional MAVLink, invariant 6 verified
-  on the wire for 12/12 DISARM packets, control surface end-to-end, 236/236 on target. Full
-  evidence and its explicit limits are in `HANDOFF.md`. The `FRAME_CLASS` reboot question was
-  settled by measurement in that run: `MAV_TYPE` moved 11 SURFACE_BOAT → 10 GROUND_ROVER with no
-  power-cycle. **If any further commit lands on this branch, that PASS no longer attests it.**
-  Also outstanding for this branch: `app.js`'s three one-line call sites
-  (`buildTelemetryWiring(...)`, `startTelemetryLoop(...)`, the startup warnability
-  `console.error`) survive their mutations because `app.js` has no test file — see that entry.
 
 - **`main`'s MAVLink receive path never validates the frame CRC, and drops v2** —
   `pwm_mavproxy_servo.js:443-459`. `parseIncoming` resyncs on `0xFE`, reads `payloadLen`, and
