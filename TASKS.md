@@ -13,27 +13,55 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ## In progress
 
-- **[P0] Five branches are open, unmerged, and NONE is reviewed or validated** (2026-08-11). All
-  local, none pushed, none carrying a `Reviewed-by:` trailer, none with an Embedded Validator pass.
-  Merging any of them requires clearing the Second Opinion stage first — see the next entry.
-  - `fix/systemd-restart-limits` (`b2ef26e`) — mavproxy `RestartSec=2` + widened finite
-    start-limit; `test/systemd-units.test.js`; `test/on-target/service-boot.sh`.
-  - `chore/remove-px4-param-dump` (`345f300`) — deletes `mav.parm`/`mav.tlog`/`mav.tlog.raw` and
-    the comment inviting operators to load the first. **The repo-bloat entry under P3 must not be
-    narrowed until this merges** — the files are still on `main`.
-  - `fix/verify-gps-disable-params` (`66df00c`) — read back `AHRS_GPS_USE`/`GPS1_TYPE`, plus a test
-    that every pushed parameter is verified.
-  - `feature/fc-failsafe-params` (`376fec2`, `583f18c`) — decode `COMMAND_ACK`; push and verify
-    `FS_ACTION=2` and `FS_GCS_ENABLE=1`. **Touches invariants 6 and 7.**
-  - `fix/align-steering-rc-range` (`add9294`) — own `RC1_MIN/MAX` and `RC3_MIN/MAX`. Changes
-    steering feel; needs a WebUI drive.
-- **[P0] The Second Opinion stage is ESCALATED, not satisfied** — Codex reviewed the first,
-  over-scoped systemd change and returned 8 findings, all accepted (that change was reverted whole
-  and re-scoped). It then produced **no verdict at all** on any other work this session: one
-  foreground run timed out at 10 minutes, and a `--background` re-run terminated after dumping the
-  diff without reviewing. `.claude/skills/second-opinion-validator/SKILL.md` states a timeout is
-  **not** a fallback condition, so the Opus fallback was not used. This needs an operator decision
-  or a working Codex before anything merges.
+- **[P0] Nine branches are open, ALL reviewed, NONE cleared, NONE validated** (2026-08-11, second
+  session). Every one is local, unpushed, carries no `Reviewed-by:` trailer and has no Embedded
+  Validator pass. **rover3 has not been deployed to at all** — it is still on
+  `fix/webrtc-require-udp` @ `370d39da`, so nothing here has run on hardware.
+
+  Codex verdicts, one review per branch, each in its own detached `git worktree`:
+
+  | Branch | SHA | Verdict | HIGH |
+  | --- | --- | --- | --- |
+  | `chore/remove-px4-param-dump` | `345f300` | NEEDS-CORRECTION | 0 |
+  | `fix/verify-gps-disable-params` | `66df00c` | NEEDS-CORRECTION | 2 |
+  | `fix/align-steering-rc-range` | `add9294` | NEEDS-CORRECTION | 2 |
+  | `chore/record-audit-2026-08-11` | `d8110cb` | NEEDS-CORRECTION | 5 |
+  | `fix/systemd-restart-limits` | `b2ef26e` | **NO-SHIP** | 5 |
+  | `feature/fc-failsafe-params` | `376fec2`,`583f18c` | **NO-SHIP** | 6 |
+  | `chore/validator-battery-premise` | `34de5a4` | **NO-SHIP** | 5 |
+  | `fix/overlay-merges-not-replaces` | `ac80d59` | **NO-SHIP** (2nd round) | 1 |
+  | `fix/motion-gate-fails-closed` | `b4a485c` | NEEDS-CORRECTION | 2 |
+
+  **~57 findings, 23 HIGH; four NO-SHIP and five NEEDS-CORRECTION.** Per-branch remediation is in
+  the P0/P1 entries below. The three
+  branches from this session (`validator-battery-premise`, `overlay-merges-not-replaces`,
+  `motion-gate-fails-closed`) are new work, not part of the earlier five.
+
+  The Second Opinion stage is **no longer escalated** — that entry is deleted. Codex ran cleanly
+  on every branch (`codex-cli 0.146.0`, `gpt-5.6-sol`, exit 0 each time). The earlier timeouts
+  were a foreground-invocation problem: scope each review to ONE branch's diff, run it detached
+  with a generous ceiling, and it completes in 5-20 minutes.
+
+- **[P0] The dominant defect shape is now measured, not suspected: a correct rule with an
+  untouched consumer** — every substantive finding across all nine branches reduces to it, and
+  `CLAUDE.md` already names it. Recorded here because it is a *review-process* requirement, not
+  a single defect:
+  - The five audit branches each add a rule plus a test asserting two **static tables** agree,
+    while production pushes a different object (`this.paramOverlay`).
+  - `chore/validator-battery-premise` corrected a false premise in three directive files and left
+    the **code that acts on it** commanding motion.
+  - `fix/overlay-merges-not-replaces` protected the sanitizer and left **four** consumer
+    mutations alive; the rewrite closed the broad ones and a targeted one still survives.
+
+  **So: for every rule a branch adds, mutate its CALL SITE, not the rule.** A test that imports
+  a table and compares it to another table cannot fail for the reason that matters.
+
+- **[P0] Four commit bodies in this repo claimed mutations were dead when they were not** — now
+  five and six. `fix/systemd-restart-limits` says "Mutation-tested: 8/8 killed"; `RestartSec=20`,
+  `StartLimitIntervalSec=1` and `StartLimitBurst=8` all survive, and the first two were
+  reproduced by hand (3 pass / 0 fail each). `feature/fc-failsafe-params` says "7/7 killed" while
+  every one of its six ACK tests builds **v1** frames, so discarding msgId 77 when `isV2` is
+  green. Do not accept a mutation table as evidence; re-derive it.
 - **[P0] Close the unauthenticated attack surface** — the RCE, the missing Origin check, and the
   Fleet Manager XSS below. These are reachable today from any device that can open a socket to a
   rover, with no credential. Scheduled as Phase 1.
@@ -46,6 +74,67 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 ## Backlog
 
 ### P0 — safety and security
+
+- **[P0] `test/on-target/control-e2e.js` let a BROKEN SENSOR authorise motion — fixed on a branch,
+  not merged** — the highest-severity finding of 2026-08-11. The gate read
+  `const live = b && b.voltageV != null && b.voltageV > 3; if (!live) return;`. rover3's analog
+  voltage sense is dead (`voltageV 0.007` while `currentA 0.54`), so `live` was false, the guard
+  returned, and `npm run test:on-target` **armed the vehicle and commanded steering and a
+  drivetrain change with no `--allow-motion` flag** — on a rover with a pack installed, armed
+  continuously, whose FC refuses DISARM. **Four** of the five readings rover3 can produce opened
+  the gate: `0.007`, exactly `3.0`, exact `0`, and `null`. Only a plausible reading above 3 V
+  refused. An earlier revision of this entry said three and omitted `3.0`, which the strict
+  `> 3` comparison also lets through — the boundary case, and the one a reader would assume was
+  covered.
+
+  The function's own comment four lines above said *"Fails CLOSED — 'I could not tell' must never
+  read as 'it is safe'"*. The code did the reverse one line later; nothing enforced the comment.
+  This is the 2026-08-05 throttle-probe reasoning error reached through a broken reading instead
+  of a stale comment, and `CLAUDE.md`'s correction had already asked for exactly this fix ("make
+  the guard require a *positive* determination") six days earlier.
+
+  Fixed on `fix/motion-gate-fails-closed` (`b4a485c`): the flag is the only authorisation, the
+  battery is reported and never consulted, an implausible reading is labelled as proving nothing
+  in either direction, and the script is exported behind `if (require.main === module)` so a host
+  test can drive the gate without arming a rover as an import side effect.
+  `test/motion-gate.test.js` drives the real exported guard; five mutations killed including
+  restoring the original logic. **Entry stays open until it merges.**
+
+- **[P0] The parameter overlay REPLACED the built-in set instead of merging — fixed on a branch,
+  not merged** — `sanitizeParamOverlay` built `const overlay = {}` and populated it only from
+  `config.mavproxy_param_overlay`, using `DEFAULT_PARAM_OVERLAY` only when the key was absent,
+  null or not an object. So `mavproxy_param_overlay: {FRAME_CLASS: 1}` in untracked
+  `picar-cfg.local.json` produced an effective overlay of **one** parameter, dropping all six
+  `SERVOn_FUNCTION` entries, `MOT_SLEWRATE`, `RC3_DZ`, `RC3_TRIM`, `RC_OVERRIDE_TIME`,
+  `AHRS_GPS_USE` and `GPS1_TYPE`. Losing `SERVO1_FUNCTION=26`/`SERVO3_FUNCTION=70` means steering
+  drives throttle. Nothing gates arming on verification, so read-back reporting the loss is a log
+  line, not a refusal. Reported independently as HIGH on three separate branches.
+
+  Fixed on `fix/overlay-merges-not-replaces` (`ac80d59`): merge over the built-in set; an
+  `OVERRIDABLE_PARAMS` **allowlist**, empty by design; and over-16-character names refused,
+  because `buildParamSet` does `String(name).slice(0, 16)` and `RC_OVERRIDE_TIME` is exactly 16
+  characters — so `RC_OVERRIDE_TIMEX` passes any name check and lands on the wire as
+  `RC_OVERRIDE_TIME`, setting the stale-override expiry 15× longer. **Entry stays open until it
+  merges, and the branch has open findings — see the P1 entry.**
+
+- **[P0] `FS_GCS_TIMEOUT` is unowned, so the FC-failsafe delay is unbounded and unknown** —
+  found 2026-08-11 reviewing `feature/fc-failsafe-params`, and it refutes that branch's central
+  design claim. ArduRover 4.6.3 applies **`FS_GCS_TIMEOUT` and then `FS_TIMEOUT`** before
+  executing the failsafe action; `FS_GCS_TIMEOUT` defaults to 5 s and neither the overlay nor
+  `EXPECTED_CRITICAL_PARAMS` owns it. So the nominal delay is **~6.5 s, not the 1.5 s** that
+  branch reasons from, and a replacement board holding `FS_GCS_TIMEOUT=120` would verify all 13
+  parameters green and still take ~121.5 s to reach Hold after the Pi dies at full throttle.
+  Own both parameters, or state the delay as unknown — do not push a trigger whose latency the
+  overlay does not control.
+
+- **[P0] `FS_GCS_ENABLE=1` does not cover a WEDGED picar, which is the failure that actually
+  happened** — ArduPilot counts any heartbeat whose system ID equals `SYSID_MYGCS` (255 on
+  rover3), and `mavproxy.service` is a **separate systemd unit** that emits its own sysid-255
+  GCS heartbeat. So the trigger stays satisfied for as long as MAVProxy lives, and the recorded
+  hour-long total loss of steering and throttle — picar wedged, MAVProxy healthy — would not
+  fire it. Covering that case needs `FS_THR_ENABLE`, which keys on the override stream only
+  picar produces, and which cannot be enabled until the mode-channel/Hold-recovery entry below
+  is settled. **Do not merge `FS_GCS_ENABLE=1` describing it as closing the wedge case.**
 
 - **MAVProxy can wedge and silently swallow the entire control path** — observed live on rover3,
   2026-08-03, causing **total loss of steering and throttle** for over an hour while picar
@@ -276,34 +365,66 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   `install.sh` selects this driver on a board it cannot identify. Fix: drop the driver or
   reimplement it without per-edge process spawning.
 
-- **`arm()` sends the force-DISARM magic on an ARM command** — `pwm_mavproxy_servo.js:1209`
-  sends `MAV_CMD_COMPONENT_ARM_DISARM` with `param1 = 1, param2 = 21196`, commented "(force)".
-  21196 is the force-**disarm** magic; the force-**arm** magic is **2989**. Corroborated on
-  target 2026-08-11 from MAVProxy's own arm module on rover3,
-  `.../MAVProxy/modules/mavproxy_arm.py:143` (`arm force` → `p2 = 2989`) and `:188`
-  (`disarm force` → `p2 = 21196`). ArduPilot's arm branch compares `param2` against the
-  force-**arm** value, so 21196 on an arm leaves checks **enabled** — consistent with the
-  measured `ARMING_CHECK=1` on rover3. `disarm()` at `:1257` uses 21196 correctly.
+- **[P0] `arm()` force-arms, disabling the flight controller's own pre-arm checks** —
+  `pwm_mavproxy_servo.js:1209` sends `MAV_CMD_COMPONENT_ARM_DISARM` with
+  `param1 = 1, param2 = 21196`. **This is a force-arm.** Settled 2026-08-11 against the tagged
+  firmware source, after a wrong "correction" nearly retired it (see below):
 
-  **This entry previously claimed the opposite** — that the force magic "routes to
-  `AP_Arming::arm()` with checks disabled and skips both `pre_arm_checks` and `arm_checks`",
-  citing a stale `:555`. That claim is withdrawn: it overstated the hazard and pointed
-  remediation at the wrong thing. The same wrong claim still appears at `TASKS.md:697`,
-  `CLAUDE.md` invariant 7 ("tells ArduPilot to skip *its own* pre-arm checks") and the
-  invariant-7 row of `CLAUDE.md`'s "which hold on `main` today" table; all three need the same
-  correction, and `CLAUDE.md` is a separate change.
+  - `libraries/GCS_MAVLink/GCS.h:744-745` (Rover-4.6.3) —
+    `magic_force_arm_value = 2989.0f` and `magic_force_arm_disarm_value = 21196.0f`. The NAME
+    is the giveaway: 21196 is the arm-**and**-disarm force value, not a disarm-only one.
+  - `libraries/GCS_MAVLink/GCS_Common.cpp:5027` — on the ARM branch,
+    `do_arming_checks = !is_equal(param2, magic_force_arm_value) && !is_equal(param2,
+    magic_force_arm_disarm_value)`. So **either** 2989 **or** 21196 sets it false.
+  - `libraries/AP_Arming/AP_Arming.cpp:1798` —
+    `if ((!do_arming_checks && mandatory_checks(true)) || (pre_arm_checks(true) &&
+    arm_checks(method)))`. The forced path short-circuits: `pre_arm_checks()` and
+    `arm_checks()` are **never called**. Only `mandatory_checks()` survives — battery, INS,
+    GPS, compass, EKF, mode, motor, parameter and fence checks are all skipped.
+  - `AP_Arming.cpp:1816` — the "Arming Checks Disabled" STATUSTEXT fires only when
+    `do_arming_checks` is true, so **a forced arm warns nobody**.
+  - MAVLink's own `common.xml` documents param2 `21196` as "force arming/disarming (e.g. allow
+    arming to override preflight checks and disarming in flight)" — the standard force value
+    for BOTH directions. 2989 is an ArduPilot-specific arm-only addition.
 
-  **The half that stands, and is still P0:** `main` has no arm gate of its own (invariant 7) —
-  no `isSafetyReady()`, nothing gates on `EXPECTED_CRITICAL_PARAMS`. And `arm()` returns `true`
-  unconditionally (`:1212`) while `COMMAND_ACK` was undecodable, so a *refused* arm reported
-  success. Fix: use 2989 or drop the magic entirely, gate arming on verified params, and surface
-  the `COMMAND_ACK` result. Note the ack decode landed on unmerged `feature/fc-failsafe-params`
-  (`376fec2`), which is what makes the rest of this diagnosable.
+  The dispatch path from picar is unbroken: COMMAND_LONG →
+  `convert_COMMAND_LONG_to_COMMAND_INT` (copies param2 unchanged) → the handler; 21196 is
+  exactly representable in float32 so `is_equal` matches; Rover does not override the handler
+  and `AP_Arming_Rover::arm` passes `do_arming_checks` straight through.
 
-  Not yet confirmed against ArduPilot source — MAVProxy's convention is strong corroboration,
-  not the firmware itself. Settles definitively on target with no motion: make a pre-arm check
-  fail, send `COMMAND_LONG 400 param1=1 param2=21196`, and read the `COMMAND_ACK` —
-  `MAV_RESULT_FAILED` plus a `PreArm:` STATUSTEXT means checks ran.
+  **THE WITHDRAWAL WAS WRONG AND IS ITSELF WITHDRAWN.** An earlier revision of this entry
+  claimed 21196 was disarm-only, that an arm carrying it left checks **enabled**, and that
+  `CLAUDE.md` invariant 7 therefore needed correcting too. Its evidence was MAVProxy's CLI
+  conventions (`mavproxy_arm.py:143` `arm force` → 2989, `:188` `disarm force` → 21196) and a
+  measured `ARMING_CHECK=1`. Neither binds a forced command: MAVProxy's choices are that
+  tool's own CLI, fully consistent with either value forcing an arm, and `ARMING_CHECK` is read
+  only *inside* `pre_arm_checks()`/`arm_checks()` — the code a forced arm never enters. This is
+  the repo's recurring failure exactly: a plausible secondary source preferred over the
+  handler. **`CLAUDE.md` invariant 7 is CORRECT as written and must NOT be "corrected".**
+
+  **Consequence, stated plainly.** Any unauthenticated socket reaching `:8443` can trigger
+  `arm()`, and the packet picar emits tells the flight controller to arm with its own pre-arm
+  and arm checks switched off, silently, logged as forced. There is no gate on the Pi
+  (invariant 7 unimplemented) and this command disables the one on the hardware. With the FC's
+  own failsafe triggers disabled and DISARM demonstrably ignored, an anonymous network peer can
+  place a vehicle that has a live pack into a state where the next RC_CHANNELS_OVERRIDE drives
+  it, with nothing anywhere having checked anything.
+
+  **Fix, and note the ASYMMETRY:**
+  - **ARM: send `param2 = 0`.** That yields `do_arming_checks = true` and runs the full
+    `pre_arm_checks() && arm_checks()`. Do NOT substitute 2989 — it is also a force value.
+  - **DISARM: KEEP `21196`.** A forced disarm is the correct fail-safe semantic — "disarm even
+    in motion". On Rover-4.6.3 it makes no behavioural difference (`AP_Arming::disarm` ignores
+    the flag), but on Copter a non-forced disarm can be refused in flight, and this platform's
+    stated direction is a drone. Comment the asymmetry so it is not "tidied" away.
+  - Then gate arming on verified parameters and surface the `COMMAND_ACK` result. `arm()`
+    returns `true` unconditionally (`:1212`), so a refused arm reported success.
+
+  **The on-target test named in an earlier revision does not work as written:** it said to make
+  a pre-arm check fail, send `COMMAND_LONG 400 param1=1 param2=21196` and read the ack. rover3
+  is already ARMED and refuses DISARM, so the command returns an already-armed result without
+  entering the check branch. Not needed now — the source settles it — but if re-run for
+  confirmation the vehicle must be disarmed first.
 
 - **Gear change engages throttle and it cannot be turned off** — operator-reported, 2026-07-30.
   On the two rovers fitted with a high/low gearbox, selecting **high gear** engages throttle and
@@ -446,8 +567,171 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ### P1 — correctness and robustness
 
+- **[P1] Per-branch remediation from the 2026-08-11 Codex sweep** — grouped by branch so each can
+  be worked independently. Full verbatim reviews were not committed; re-run the stage per branch
+  to regenerate them.
+
+  **`fix/systemd-restart-limits` — NO-SHIP, and the operator chose to RE-SCOPE it** to infinite
+  retry with capped backoff rather than patch it:
+  1. `RestartSec=2` **aliases picar's own reconnect delay** — `pwm_mavproxy_servo.js:449` is
+     `setTimeout(() => this._connect(), 2000)`. If picar reaches port 5760 before MAVProxy binds
+     it, `ECONNREFUSED` pushes the next attempt to t≈4 s, so the held-throttle window grows from
+     ~1.8 s to ~3.8 s. Pick a value that does not alias 2000 ms.
+  2. Drop the **finite** start-limit. Once hit, systemd never retries, MAVProxy stays down, and
+     picar cannot tell that from a working link — the recorded wedge proves the operator sees
+     nothing. Infinite retry with capped backoff plus an operator-visible alert is the safer
+     trade on this platform.
+  3. Three mutations survive: `RestartSec=20`, `StartLimitIntervalSec=1`, `StartLimitBurst=8`.
+     The tests assert only a lower bound; add an upper bound and encode the relationship between
+     the rate-limit interval and the restart spacing.
+  4. `test/on-target/service-boot.sh` prints PASSED in the exact wedge state it claims to detect
+     — it checks systemd state, restart count, device existence and file drift, never tlog growth
+     or inbound heartbeat freshness. It also tolerates missing journal evidence silently, and
+     "first 12 journal lines" is really the first 12 of the last 200.
+  5. It has **no consumer**: `npm run test:on-target` is only `node test/on-target/control-e2e.js`.
+  6. The commit body's boot claim is a hypothesis — no captured `Result=start-limit-hit` and no
+     measured USB enumeration time exist.
+
+  **`feature/fc-failsafe-params` — NO-SHIP; the operator chose to SPLIT it.** Land the ACK decode
+  after fixing it; send the FS_* half back (see the two P0 entries above).
+  1. **ACK attribution (HIGH).** The handler reads only the 3-byte base payload, ignoring v2
+     `target_system`/`target_component` at offsets 8/9. MAVProxy (sysid 255, comp 230) also
+     issues commands, and the 2026-08-11 capture holds **712 cmd-410 ACKs against 1 cmd-400 ACK**
+     — so MAVProxy's repeating `GET_HOME_POSITION` failure arrives last and **overwrites picar's
+     DISARM result**. `/status` would attribute MAVProxy's refusal to picar, corrupting the exact
+     diagnosis this decode exists to enable. Needs pending-command correlation, not source IDs:
+     a v1 down-conversion drops the target fields entirely.
+  2. `lastCommandAck` is erased on socket close — the close handler replaces the whole telemetry
+     object — so a DISARM refusal followed by a MAVProxy restart 1 s later leaves it `null`,
+     destroying the evidence the field exists to retain.
+  3. All six new ACK tests build **v1** frames. Mutating `parseIncoming` to discard msgId 77 when
+     `isV2` leaves them green.
+  4. The commit body reverses the mode flags: `MAV_MODE_FLAG_CUSTOM_MODE_ENABLED` is 1 and
+     `MAV_MODE_FLAG_SAFETY_ARMED` is 128. `base_mode=1` is structurally right, for the opposite
+     reason to the one stated.
+  5. `CRC_EXTRA[77] = 143` is **correct**, and short payloads are zero-extended so the parser
+     cannot throw from the socket callback. Both were independently confirmed — keep them.
+
+  **`fix/verify-gps-disable-params` — 2 HIGH.**
+  1. Nothing exercises the `PARAM_VALUE` consumer for the two new names, so making the consumer
+     ignore `GPS1_TYPE` survives. Add a round-trip test through the real parser.
+  2. The new test asserts `DEFAULT_PARAM_OVERLAY`, not the effective overlay — largely closed by
+     `fix/overlay-merges-not-replaces`; rebase onto it and re-check.
+  3. `GPS1_TYPE` is documented `@RebootRequired`, so immediate read-back confirms the STORED and
+     not the ACTIVE value. Same trap as the settled `FRAME_CLASS` dispute, opposite answer.
+  4. The comment's claim that "ArduPilot renamed GPS_TYPE to GPS1_TYPE in 4.5" is wrong: 4.5.7
+     still documents `GPS_TYPE`, 4.6.3 documents `GPS1_TYPE`. The name used is right for this
+     fleet; the stated history is not.
+
+  **`fix/align-steering-rc-range` — 2 HIGH.**
+  1. Same effective-vs-tracked-config defect as above; rebase onto the overlay fix.
+  2. Deleting `EXPECTED_CRITICAL_PARAMS.RC1_MAX` survives — closed by the overlay⊆expected test
+     on `fix/verify-gps-disable-params`, so merge that first.
+  3. `RC1_TRIM` and `RC1_DZ` stay unowned, so steering centring is still not reproducible: a
+     board with `RC1_TRIM=1550` reads back 1000/2000 green while treating neutral as left lock.
+  4. The comment's RC2 rationale is **false** — `RCPassThru` ignores `SERVO2_MIN/MAX`, which this
+     repo measured, so 1000 µs is not clamped to 1100. It also intersects the gear/throttle P0 and
+     cannot be validated on gearless rover3. Remove the claim.
+  5. The "outer ~12.5%" arithmetic is wrong: 100 µs at each end of a 1000 µs span is **10%** of
+     travel per end (12.5% would be 100/800).
+  6. "SERVO1_MIN/MAX are the mechanical limit of the steering linkage" is unsupported — they are
+     ArduPilot factory defaults. The direction of the change is nevertheless sound and was
+     confirmed against ArduPilot's RC and SRV channel source: it lowers intermediate gain and
+     removes the endpoint plateau **without reaching new servo positions**. Keep the change, fix
+     the claim.
+
+  **`chore/remove-px4-param-dump` — 0 HIGH, safe to land after cosmetics.** Independently
+  confirmed: every changed JavaScript byte is inside `//` comments, no runtime path is affected,
+  the ignore patterns match, and **no open-task evidence is lost** (the deleted tracked tlog is a
+  2026-05-05 PX4 session; all DISARM/wedge evidence cites `/tmp` or `/var/log`). Remaining: point
+  the replacement comment at the measured 2026-08-11 baseline in `HANDOFF.md`; the commit body
+  overclaims "enforced by the tool" (`git add -f` still works) and a bloat benefit it does not
+  deliver (history is unchanged); and `HIGHRES_IMU`/`ALTITUDE` are MAVLink common messages, not
+  PX4-only — the PX4 identification rests on `MAV_TYPE=2` and the parameter namespace, which does
+  hold.
+
+- **[P1] Open findings on this session's own three branches** — none is cleared.
+
+  **`chore/validator-battery-premise` (`34de5a4`) — NO-SHIP, 5 HIGH.**
+  1. It fixed the rule and left the consumer — now addressed by `fix/motion-gate-fails-closed`.
+  2. `.claude/skills/embedded-validator/SKILL.md` still requires "Arm, move the controls" for the
+     WebUI check while the same file now says routine validation commands no motion. That
+     contradiction is unresolved and needs deciding, not rewording.
+  3. "Neutral-before-disarm still stops motion" **overreaches** — the wedge proves a successful
+     local write can be swallowed before reaching the FC. Qualify it.
+  4. `HANDOFF.md`'s `## Environment` on `main` still says the flight battery "is not connected"
+     (fixed only on the unmerged audit branch), and `CLAUDE.md:346` still says wire verification
+     happens "with no motor power". The premise is not fully closed.
+  5. A neutral `SERVO_OUTPUT_RAW` sample cannot prove channel mapping — equal neutral values are
+     observationally identical, so a swapped steering/throttle mapping passes.
+  6. The added field-offset warning is right only for `servo1_raw`–`servo8_raw`. In v2, `port` is
+     byte 20 and `servo9_raw`–`servo16_raw` are extensions AFTER it, so `port` is not the last
+     byte and `4+(N-1)*2` misdecodes output 9.
+  7. `test/telemetry-footer.test.js` blind spots: the harness omits `set -u` (and
+     `telemetry.sh:27` **is** `set -uo pipefail`, contrary to the commit body), so reverting a
+     `${bv:-}` guard passes while the real script aborts; it pins `FAILED=0` and excludes
+     `exit $FAILED`, so prefixing `FAILED=0;` clears a real failure with all five tests green;
+     the `jget` stub ignores its path argument, so pointing the current lookup at
+     `remainingPct` survives; and a `printf` placed BEFORE the extraction marker is invisible, so
+     "no reachable branch can print the premise" is false.
+
+  **`fix/overlay-merges-not-replaces` (`ac80d59`) — NO-SHIP on the second round.**
+  1. A **targeted** consumer mutation still survives: `if (name === 'SERVO3_FUNCTION') return;`
+     inside the overlay application loop, or corrupting only its transmitted value. The
+     transmission test uses a 2-key fixture and checks names, not values. Assert the full built-in
+     set and decode the values.
+  2. `overlayChainMs()` takes numeric counts and is passed an **object**, which coerces to 0 and
+     yields an accidental 500 ms delay; the `finally` calls a nonexistent `d.stopTimers()` instead
+     of `clearOverlayTimers()`; and an assertion throw inside the `setTimeout` never rejects the
+     promise. So a mutation can **HANG rather than fail** — the trap `CLAUDE.md` names, in a test
+     written to avoid it. Fix before trusting any count from this file.
+  3. The safety comment says the old behaviour dropped "both FS_* entries" and read-back reported
+     "12 of 13 missing". Neither is true at this SHA: no `FS_*` entry is in the 13 defaults (they
+     live on the unmerged branch), only 11 are verified, and with `FRAME_CLASS` retained the most
+     read-back can report is 10. Correct the comment.
+  4. "A real per-rover difference is a reviewed change to a tracked profile" describes a mechanism
+     that **does not exist** — `app.js` erases tracked/local provenance and there is one global
+     `DEFAULT_PARAM_OVERLAY`. Either build provenance-aware profiles or fail startup on an
+     incompatible overlay; do not resolve it by allowlisting critical names.
+  5. The numeric-string test cannot test its named rule: with an empty allowlist the refusal
+     happens for the allowlist reason, so accepting numeric strings still passes.
+
+  **`fix/motion-gate-fails-closed` (`b4a485c`) — NEEDS-CORRECTION, 2 HIGH.** The gate itself is
+  sound on every settled path, but the fix reproduces the untouched-consumer shape it was written
+  to close:
+  1. **The caller discards the decision (HIGH).** `:158` is `await assertSafeToCommand(...)` with
+     the returned boolean thrown away, and every host test injects a NON-FATAL `exit`, so the
+     production fatal path is never exercised. Mutate the default to
+     `exit = deps.exit || ((c) => { process.exitCode = c; })` — a plausible refactor — and all six
+     tests pass while an unflagged run sends ARM, steering and drivetrain commands and then exits
+     zero. Deleting `:158` outright also survives every host test. Fix: branch on the result at
+     the call site, or make the refusal seam **throw** so denial cannot continue.
+  2. **Nothing proves direct execution still runs (HIGH).** The import test only checks the
+     negative. Mutate `if (require.main === module)` to `if (false)` and all six tests pass while
+     `npm run test:on-target` becomes a silent, successful no-op — validation that runs nothing
+     and reports success, the defect `3e9103e` already fixed once. Needs a child-process test of
+     the positive path.
+  3. The `/status` request is unbounded (`:117`): a response that never ends leaves the guard
+     hanging, and a hang is not a fail-closed result — even `--allow-motion` cannot proceed. Add a
+     timeout and record the reading as unavailable.
+  4. `exit 3` makes "SKIPPED BY DESIGN" an npm failure, and the only packaged on-target E2E
+     command now performs no useful checks by default. The likely workaround is someone adding
+     `--allow-motion` to `package.json`, normalising motion during routine validation. Split a
+     read-only default target, or move the gate immediately before the motion section and report
+     the safe checks as run.
+  5. The harness ignores method and path, so mutating `'/status'` to `'/manifest.json'` survives;
+     production also ignores HTTP status, so a 503 carrying stale JSON reads as a current battery
+     record. Assert `GET`, `/status`, and 200.
+  6. Deleting `&& b.voltageV < 30` survives, so a mis-scaled 40 V reading reads as plausible; and
+     `"voltageV":"7.905"` as a string is accepted through coercion. Use finite numeric checks and
+     assert both bounds plus current/percentage/source.
+  7. The commit body's "`the original voltage-decides logic restored -> 5 failures`" has **no
+     auditable derivation** — the mutant patch was an approximation that hard-coded the reading
+     rather than a faithful restoration, which yields four. Record the exact patch or restate the
+     count.
+
 - **[P1] No `SIGTERM` handler — the safety of `systemctl restart` rests on one unit-file line** —
-  `app.js:418-424` handles only `SIGINT`, and `crash-failsafe.js` only `uncaughtException` /
+  `app.js:400-406` handles only `SIGINT`, and `crash-failsafe.js` only `uncaughtException` /
   `unhandledRejection`. Node's default disposition for `SIGTERM` is immediate termination with no
   handler run, so `kill`, `pkill -f app.js`, a deploy script's `killall node`, or any rover whose
   installed unit predates `KillSignal=SIGINT` (`systemd/picar.service:18`) kills picar with the
@@ -457,22 +741,42 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 - **[P1] The input watchdog is one module-scope timer shared by every socket** — `app.js:143`
   declares `let lastAction = null;` at module scope, and every socket's `fromclient` handler
-  (`:387-393`) closes over it. With two clients connected — which needs no attacker, a stale second
-  tab suffices, since the control plane is unauthenticated — client B's traffic keeps calling
-  `clearTimeout(lastAction)` and the watchdog protecting client A's dead link never fires. The "no
-  input" condition is evaluated across the union of all sockets rather than per session. Violates
-  invariants 2 and 5. Make it per-socket, or gate on a monotonic arrival check per session.
+  (`:340-376`, watchdog rearm at `:369-375`) closes over it. With two clients connected — which
+  needs no attacker, a stale second tab suffices, since the control plane is unauthenticated —
+  client B's traffic keeps calling `clearTimeout(lastAction)` and the watchdog protecting client
+  A's dead link never fires. The "no input" condition is evaluated across the union of all
+  sockets rather than per session. Violates invariants 2 and 5.
+
+  **"Make it per-socket" is NOT a valid fix on its own, and an earlier revision of this entry
+  recommended it.** There is no single owner yet (invariant 2 is unimplemented), and every
+  accepted command writes the same module-scope motion state — so there is no per-socket thing
+  to protect. Per-socket timers would actively make it worse: socket A sends one command and
+  goes quiet, B keeps driving legitimately, A's timer expires and neutralises/disarms **B's**
+  live stream, then B's next packet re-applies motion. That is stop/command oscillation on a
+  vehicle whose FC refuses DISARM. **This is blocked on the single-owner lease**; until that
+  exists the honest interim is a monotonic per-session arrival check that cannot cancel another
+  session's watchdog.
 
 - **[P1] `test/on-target/control-e2e.js` cannot fail on the checks that matter** —
   `:125` defines `const ok = (m) => log("  PASS " + m);` — an unconditional print that never
   touches `failed`. The input-watchdog block (`:219-226`) sends one `fromclient`, sleeps 3 s,
   drains the poll and prints PASS; the disarm step (`:212-216`) and the disconnect step verify
-  nothing. **Delete `app.js:387-393` — the whole watchdog — and this script still prints
+  nothing. **Delete `app.js:369-375` — the whole watchdog — and this script still prints
   `E2E PASSED`.** The assertion is nearly free: `failSafeStop` resets `old_throttle`/`old_steering`
-  (`app.js:400-402`) and `/status` serves them, so a `GET /status` after the silence proving
-  `throttle === 0` would make this the one check that catches the highest-severity path on the
-  platform. This is the "test unable to fail" pattern `CLAUDE.md` documents, in the on-target
-  suite rather than the host suite.
+  (`app.js:381-384`) and `/status` serves them.
+
+  **But assert STEERING, not throttle.** An earlier revision of this entry said a `GET /status`
+  proving `throttle === 0` would catch it. It would not: the script sends
+  `{throttle: 0, steering: 0.25}` at `:222`, so throttle is **already** 0 before the watchdog
+  ever fires and the assertion holds whether or not the watchdog exists. It is the same
+  can't-fail defect one level up — a proposed fix for an unfalsifiable check that was itself
+  unfalsifiable. Assert that **steering returns to 0** after the silence; that value is
+  non-zero when the timer starts and only `failSafeStop` resets it.
+
+  This is the "test unable to fail" pattern `CLAUDE.md` documents, in the on-target suite rather
+  than the host suite. Note the script now refuses to run at all without `--allow-motion`
+  (`fix/motion-gate-fails-closed`), so this check is unreachable on a routine run either way —
+  fixing the assertion and giving the read-only checks a path that runs are one job.
 
 - **[P1] The autopilot's armed bit is decoded and then discarded** — `pwm_mavproxy_servo.js:1109`
   sets `this.telemetry.heartbeat = { at, armed: (payload[6] & 0x80) !== 0 }`, and no production
@@ -581,6 +885,33 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   Embedded Validator's checklist is still not satisfiable purely from committed scripts.
   Author via the Optimizer, not the validator.
 
+- **[P1] `npm run test:on-target` runs ONE script, and that script cannot fail on what matters** —
+  measured 2026-08-11. On `main` the script is literally
+  `"test:on-target": "node test/on-target/control-e2e.js"`, so `telemetry.sh`, `video-drop.sh` and
+  `service-boot.sh` are never invoked by it. A `run-all.sh` that runs everything exists **only on
+  the parked `fix/webrtc-require-udp` branch** (`3e9103e`, `2039f18`, `8137403` — which fixed a
+  runner that reported PASSED while running nothing, and one that treated a safety refusal as a
+  failure). So an Embedded Validator quoting "on-target suite passed" on `main` is quoting one
+  script, whose `ok()` helper is an unconditional print (see the can't-fail entry above).
+  Combined effect: **the committed on-target suite is close to vacuous on `main`.** Re-land
+  `run-all.sh` separately from the video work it is stranded behind, and treat any historical
+  "26/26 on-target checks" claim as describing a branch, not `main`.
+
+- **[P1] `CLAUDE.md` carries one claim this repo has since disproved — and one it does NOT** —
+  the file is the directive, so a stale claim in it propagates further than one in a dated entry.
+  Equally, "correcting" a claim that was right is worse than leaving it alone.
+  1. **Invariant 7's force-arm claim is CORRECT. Do not touch it.** An earlier revision of this
+     entry listed it as needing withdrawal, on the strength of MAVProxy's CLI conventions. The
+     Rover-4.6.3 source says otherwise: `GCS_Common.cpp:5027` disables arming checks for
+     **either** 2989 or 21196, and `AP_Arming.cpp:1798` skips `pre_arm_checks()` and
+     `arm_checks()` entirely on that path. So `arm()`'s `21196` *does* tell ArduPilot to skip its
+     own pre-arm checks, exactly as invariant 7 says. See the force-arm P0 above for the full
+     citation chain. **This item exists to stop the next reader "fixing" a correct directive.**
+  2. `CLAUDE.md:346` says MAVLink wire verification "proves commands reach the FC and it reacts,
+     with no motor power". A pack is installed; that clause is the same premise the Validation
+     section of the same file reversed on 2026-08-05. **This one is real** and is fixed on
+     `chore/validator-battery-premise`.
+
 - **`install.sh` is destructive on re-run and blocks clean validation** —
   1. `install.sh:244` rewrites the **tracked** `picar-cfg.json` in place from the prompt answers,
      so any rover that has run the installer has a permanently dirty tree. This defeats
@@ -593,18 +924,6 @@ Open work only. Completed tasks are **deleted** from this file — their record 
      dead code that dies with `command not found`.
   4. `uninstall.sh` never removes the polkit rule installed at `install.sh:331`.
 
-- **`main`'s MAVLink receive path never validates the frame CRC, and drops v2** —
-  `pwm_mavproxy_servo.js:443-459`. `parseIncoming` resyncs on `0xFE`, reads `payloadLen`, and
-  hands the payload to `handleMessage` **without checking the 2-byte checksum it carefully
-  computes on the transmit side**. Any byte pattern that happens to look like a v1 header is
-  accepted as a message, so a mid-payload `0xFE` can synthesise a bogus HEARTBEAT or PARAM_VALUE.
-  Separately `:446` discards every non-`0xFE` byte, so v2 frames are dropped — and
-  `handleMessage:462` treats *any* HEARTBEAT as the autopilot's, with no `autopilot != 8` check and
-  no `sysId` filter, so MAVProxy's own GCS heartbeat satisfies it. Together, `main` reports a
-  healthy flight controller having confirmed nothing. Harmless only because nothing on `main` gates
-  on it. The v2 parser and CRC validation both arrive with the telemetry branch above; the
-  heartbeat filter must land with them, never before.
-
 - **Critical-param verification never retries** — `pwm_mavproxy_servo.js:405-409` fires exactly one
   `PARAM_REQUEST_READ` per critical param on a one-shot `setTimeout` chain. A single dropped
   `PARAM_VALUE` over the serial link means that param is never confirmed. Consequence correction:
@@ -613,11 +932,13 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   becomes a real availability defect the moment arming is gated on it. Fix: bounded retry with
   backoff, and surface the retry state.
 
-- **Param-overlay timers survive disconnect** — `applyParamOverlay` schedules 9 `PARAM_SET` timers
-  (`pwm_mavproxy_servo.js:394-399`) and 7 read-back timers (`:405-409`). The `close` handler
-  (`:164-170`) clears `interval` and `heartbeatInterval` — **not** these, and not `armTimeout`
-  either. Reconnect churn stacks overlapping overlay passes. Fix: track and clear all handles on
-  close.
+- **`armTimeout` survives disconnect** — narrowed 2026-08-11 after checking the code rather than
+  the entry. This used to say the overlay's `PARAM_SET` and read-back timers also survived, and
+  that is no longer true: the `close` handler calls `clearOverlayTimers()`
+  (`pwm_mavproxy_servo.js:733`, `for (const t of this.overlayTimers) clearTimeout(t)`) and clears
+  `overlayReassertTimer`, so reconnect churn does **not** stack overlay passes. `armTimeout` is
+  the one handle still not cleared there — it is cleared only at `:1205` and `:1252`. Fix: clear
+  it on close with the rest.
 
 - **Command rejections and fail-safe stops are never reported to the client** —
   `app.js:277-287` (`failSafeStop`) logs and returns a result but emits nothing, so
@@ -630,7 +951,18 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   `keysDown` and drive the vehicle, so adjusting the video FPS slider with the arrow keys steers at
   full lock while armed. Fix: apply the same guard to every control key.
 
-- **No MAVLink framing tests** — nothing validates the hand-rolled CRC and wire order in
+- **No MAVLink framing tests for the TRANSMIT builders** — narrowed 2026-08-11.
+  `test/mavlink-vectors.test.js` now exists and is substantial (19 tests: reference frames split
+  at arbitrary chunk boundaries, back-to-back streams, leading garbage, a bogus magic claiming a
+  huge payload, unknown msgids, v2 incompatibility flags, foreign sysId/compId rejection, a
+  CRC-valid but short v1 payload). **All 19 exercise `parseIncoming` — the RECEIVE path only.**
+  Not one covers `buildRCOverride`, `buildCommandLong`, `buildParamSet`,
+  `buildParamRequestRead` or `buildHeartbeat`, so the outbound wire order and every transmit
+  `CRC_EXTRA` are still unvalidated against known-good vectors. That is the half that matters
+  most for the control path: a wrong `CRC_EXTRA` on `RC_CHANNELS_OVERRIDE` means the autopilot
+  silently discards every command. Original entry follows.
+
+  Nothing validates the hand-rolled CRC and wire order in
   `pwm_mavproxy_servo.js` (`buildRCOverride`, `buildCommandLong`, `buildParamSet`,
   `buildParamRequestRead`, `buildHeartbeat`, `parseIncoming`) against known-good vectors. The
   framing and every `CRC_EXTRA` were hand-verified correct on 2026-08-03 for messages
@@ -848,6 +1180,35 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   currently left on `test/p0-verify`, a throwaway branch. Re-run: the four secret paths must
   404, the four UI paths must 200, a `Range` request must return 200 and leave picar's PID
   unchanged, and `RestartUSec` must read 2s.
+
+- **[P0] The ArduRover parameter overlay is pushed to ANY autopilot, without identifying it
+  first** — measured on rover1, 2026-08-11, and it is not theoretical. rover1's Pixhawk 6C was
+  recently converted and runs **PX4**, reporting `MAV_TYPE_QUADROTOR` with 1101 parameters in the
+  PX4 namespace and zero ArduPilot names. Deploying `main` pushed all 13 ArduPilot names at it.
+  Nine were rejected outright — but `RC3_DZ` and `RC3_TRIM` exist in BOTH namespaces and were
+  actually written: **`RC3_DZ` went 10 → 30 on a PX4 flight controller**, confirmed by
+  `PARAM_SET RC3_DZ=30` → `verified RC3_DZ=30` in the journal.
+
+  So picar silently reconfigures a flight controller it has not identified. The driver already
+  decodes `HEARTBEAT.autopilot` and `HEARTBEAT.type`; nothing consults them before
+  `applyParamOverlay()`. Fix: gate the overlay on `MAV_AUTOPILOT_ARDUPILOTMEGA`, refuse to push
+  anything otherwise, and say so loudly on `/status` — a rover whose firmware the overlay does
+  not model should report that, not appear to be a rover with 9 missing parameters. Note the
+  deleted tracked `mav.tlog` uniquely records 18 ArduPilot parameter writes sent to a PX4 board;
+  preserve it outside the repo before any authorized history rewrite.
+
+  Raised as a blocking finding against `fix/overlay-merges-not-replaces`; scoped to its own
+  branch on operator instruction because it is new safety logic rather than a correction.
+
+- **[P1] `test/on-target/control-e2e.js` should export a `run()` driven by an injected request
+  transcript** — deferred from `fix/motion-gate-fails-closed` on operator instruction, and
+  tracked here because that branch will merge and be deleted. The durable fix for three separate
+  problems: `ok()` is an unconditional print, so `arm`, `fromclient`, `disarm` and `setLight` all
+  report PASS after an HTTP 200 without confirming the named server handler ran — rename the
+  production `arm` handler to `armx` and the script still prints `PASS arm sent`; the host test
+  depends on the tracked `certs/key.pem`/`cert.pem`, which an open P0 says must be untracked; and
+  the child-process machinery has already had to be patched once for turning a hang into a pass.
+  Injecting the transport removes all three at once and moves every assertion onto the wire.
 
 - **[P2] `app.js` still has no test file, and this is now the fifth branch it has cost** —
   the wiring for the crash fail-safe, the Range strip, the static allowlist, the telemetry

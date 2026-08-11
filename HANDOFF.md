@@ -36,9 +36,23 @@ software stack. A custom flight controller is **not** in scope, and the vehicle 
 > It is *not* local and *not* scheduled. Recover any part of it with
 > `git show origin/archive/control-failsafe-2026-07-30:<file>`.
 >
-> Three fixes buried in that archive are prerequisites for current priority work — the
-> MAVLink v2 parser and heartbeat filter block all telemetry work, and `FRAME_CLASS=1`
-> corrects a live misconfiguration. Cherry-pick them rather than rewriting them.
+> **DO NOT cherry-pick the archive's MAVLink work — that instruction is withdrawn.** An earlier
+> revision of this paragraph said the archive's v2 parser and heartbeat filter were prerequisites
+> for current work and should be cherry-picked rather than rewritten. Both have since landed on
+> `main` in better form, verified by reading the code on 2026-08-11: `parseIncoming` accepts v1
+> and v2, validates `CRC_EXTRA`, rejects unknown msgids, and filters on `sysId`/`compId` at two
+> separate points. **Applying the archive's version now would overwrite the newer hardened parser
+> and regress live telemetry and heartbeat attribution.** `FRAME_CLASS=1` also landed. There is
+> nothing in that archive currently needed; treat it as history unless a specific gap is
+> identified against today's code.
+>
+> **Second-most-important fact, 2026-08-11: do not run `npm run test:on-target` on rover3 until
+> `fix/motion-gate-fails-closed` merges.** Its motion gate reads the vehicle's broken voltage
+> sense (0.007 V) as "no battery" and therefore arms the rover and commands steering and a
+> drivetrain change **without** the `--allow-motion` flag. Details in the change-log entry below.
+>
+> **Nine branches are open, all reviewed, none cleared, none validated, none pushed.** rover3 has
+> never been deployed to from any of them. See `TASKS.md` for the verdicts and the remediation.
 
 What works today **on `main`**:
 
@@ -92,6 +106,115 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 Newest first.
 
+> **EVERY ACTUATION DISCLAIMER BELOW DATED BEFORE 2026-08-05 IS VOID.** Entries here say things
+> like "no mechanical actuation was observed (no flight battery)", "motors and servos cannot
+> move", and "no actuation is possible with the flight battery disconnected" — at roughly
+> `:443`, `:478`, `:547`, `:845`, `:1129` and `:1207`. **A pack was installed the whole time**;
+> battery telemetry read 7.9 V at 0.41 A from the first validation onward. The command-path
+> evidence in those entries stands on its own and is not rewritten — falsifying a dated record is
+> worse than annotating it — but the safety property each one asserts was never true. `CLAUDE.md`
+> ruled on 2026-08-05 that this premise must never be written as a standing fact.
+>
+> A cross-family red team found these still reading as unqualified fact on 2026-08-11, in a
+> commit that extensively edited this file while condemning exactly that failure three sections
+> earlier. Hence this banner rather than another silent pass.
+
+### 2026-08-11 (second session) — Every open branch reviewed by Codex; two P0s found, none merged
+
+Nine branches went through the Second Opinion stage. **Not one cleared it.** ~57 findings, 23
+HIGH: four NO-SHIP and five NEEDS-CORRECTION, spread across both the five branches the previous
+session left open and the three this session wrote. The verdict table and all remediation are in
+`TASKS.md`; this entry records what happened, what was measured, and what it cost.
+
+**The escalated stage was not broken — the invocation was.** The previous session recorded the
+Second Opinion stage as escalated because Codex "produced no verdict at all": one foreground run
+timed out at 10 minutes, one `--background` run died after dumping the diff. Codex works.
+`codex-cli 0.146.0`, `gpt-5.6-sol`, exit 0 on all nine runs. What makes it work: scope each review
+to **one branch's diff**, run `codex exec --cd <worktree> --sandbox read-only` detached with a
+~40-minute ceiling, and give it the hardware context and the branch's specific hazards in the
+prompt. Reviews took 5-20 minutes each and ran nine-wide in parallel. A timeout was an
+invocation problem, and `SKILL.md` is right that it is not a fallback condition.
+
+**Every review ran in its own detached `git worktree`**, closing the tracked P3 the hard way: the
+2026-08-06 session ran mutations in the same tree two reviewers were reading and had to discard
+the results. `git worktree add --detach <path> <branch>` per branch, `node_modules` symlinked so
+the reviewer can run the suite read-only. Authoring continued in the main checkout throughout with
+no interference.
+
+**Two P0s, both found by reviewing a DIFFERENT branch than the one that had the defect.**
+
+The first is the worst thing found this session. `test/on-target/control-e2e.js` gated motion on
+`voltageV > 3`, and rover3's analog voltage sense is dead — `0.007 V` while current reads `0.54 A`.
+`0.007` is not `> 3`, so the guard concluded "no pack" and **`npm run test:on-target` armed the
+vehicle and commanded steering and a drivetrain change with no `--allow-motion` flag**, on a rover
+with a pack installed, armed continuously, whose FC refuses DISARM. The function's own comment four
+lines above read *"Fails CLOSED — 'I could not tell' must never read as 'it is safe'"*; the code did
+the reverse one line later. **Four** of the five readings rover3 can produce opened it: `0.007`,
+exactly `3.0`, exact `0`, and `null` — the `3.0` boundary case included, because the rule was a
+strict `> 3`. `CLAUDE.md` had asked for this exact fix on 2026-08-05 ("make the guard require a
+*positive* determination"); it sat open six days.
+
+The second: a custom `mavproxy_param_overlay` **replaced** the built-in parameter set instead of
+merging. Three separate branch reviews reported it before anyone looked at the sanitizer itself,
+which is the interesting part — each branch added a parameter and a test asserting two static
+tables agreed, and none could see that production pushes a different object. The defect, its
+consequence and its remediation are in `TASKS.md`; not restated here.
+
+**Three branches written this session**, all committed, none cleared:
+`fix/motion-gate-fails-closed` (`b4a485c`), `fix/overlay-merges-not-replaces` (`ac80d59`),
+`chore/validator-battery-premise` (`34de5a4`).
+
+**Facts established by reading the code rather than the tracking documents.** Several `TASKS.md`
+entries described defects that had already been fixed, and one review's stale-entry claim was
+itself too broad:
+
+| Claim on file | Measured |
+| --- | --- |
+| "`main` never validates the receive CRC, and drops v2" | **False.** `parseIncoming` accepts `0xFE` and `0xFD` (`:832`), validates `CRC_EXTRA`, and rejects unknown msgids. Entry deleted. |
+| "any HEARTBEAT is treated as the autopilot's, no sysId filter" | **False.** Filtered at `:949` and again at `:1108`. Deleted with the above. |
+| "Param-overlay timers survive disconnect" | **Mostly false.** `close` calls `clearOverlayTimers()` (`:733`) and clears `overlayReassertTimer`. Narrowed to `armTimeout`, which genuinely is not cleared there. |
+| "No MAVLink framing tests" | **Half true.** `test/mavlink-vectors.test.js` has 19 tests — but **all 19 exercise `parseIncoming`**. Not one covers `buildRCOverride`, `buildCommandLong`, `buildParamSet`, `buildParamRequestRead` or `buildHeartbeat`. Narrowed to the transmit builders. |
+| `RC_OVERRIDE_TIME` is a safe 16-char name | It is **exactly** 16 characters, and `buildParamSet` does `String(name).slice(0, 16)` — so `RC_OVERRIDE_TIMEX` passes any name-based check and lands on the wire as `RC_OVERRIDE_TIME`. |
+| `FS_TIMEOUT=1.5` is the failsafe delay | Rover 4.6.3 applies **`FS_GCS_TIMEOUT` then `FS_TIMEOUT`**; `FS_GCS_TIMEOUT` defaults to 5 s and nothing owns it, so the delay is ~6.5 s and unbounded on a replacement board. |
+| `telemetry.sh` has no `set -u` | It does — `:27`, `set -uo pipefail`. Stated wrongly mid-session on a `head -12` grep. |
+
+**Four process failures, mine, recorded because the pattern is the point.**
+
+1. **I drafted five mutation counts before running the harness.** Every one was wrong, and a sixth
+   mutation turned out syntax-broken, so it proved nothing while looking like a kill. `CLAUDE.md`
+   records two prior commit messages doing this and the last session made three; this would have
+   been four. Caught only because the harness was run afterwards. **Write the table from output.**
+2. **I committed the dominant defect shape twice, in commits written to avoid it** — once fixing
+   a rule in documentation while its code consumer went on acting on the old one, once protecting
+   a helper while its caller stayed unguarded. Both caught by review, not by me. The specific
+   defects and their fixes are tracked in `TASKS.md`; what belongs here is the pattern: when I fix
+   X, X is in frame and its callers are not, and the test I write is authored from inside that
+   same frame.
+3. **I asserted `telemetry.sh` had no `set -u`** on the strength of grepping its first 12 lines,
+   and told the operator the `${bv:-}` guards were therefore decorative. They are load-bearing.
+4. **A test I wrote to avoid the hang-as-pass trap can hang.** `test/config-bounds.test.js`'s
+   transmission test passes an object to `overlayChainMs()`, which expects counts and coerces to 0;
+   an assertion throw inside its `setTimeout` never rejects the promise; and its cleanup calls a
+   method that does not exist. Under a mutation it can report HANG instead of a failure.
+5. **I miscounted the defect in the record itself, and the miss was the boundary case.** The
+   motion-gate entry said three of five readings opened the old gate. It was **four**: the rule
+   was a strict `voltageV > 3`, so exactly `3.0` also passed through, and that is precisely the
+   value a reader would assume was handled. Stated three times — to the operator, in the commit
+   body, and in both tracking documents — before the review of that branch caught it. Corrected
+   above. The lesson is narrow and repeatable: **enumerate boundary values by running the old
+   predicate over them, not by reasoning about it.** Four lines of `node -e` settled it.
+6. **A mutation count went in with no auditable derivation.** The motion-gate commit records
+   "the original voltage-decides logic restored -> 5 failures". The patch that produced it
+   hard-coded the reading rather than faithfully restoring the old rule, and a faithful
+   restoration yields four. The number was real output from a real run — of the wrong mutant.
+   Record the patch alongside the count, or the count means nothing.
+
+**rover3 was not touched.** No deploy, no checkout change, no service restart, no MAVLink written.
+It remains on `fix/webrtc-require-udp` @ `370d39da` with the untracked `field-log.sh`, exactly as
+the previous session left it. **Nothing in this entry carries an Embedded Validator pass, and
+nothing may merge on the strength of it.** Host suite on the working branches: 302 on `main`, 308
+with the motion-gate tests, 312 with the overlay tests.
+
 ### 2026-08-11 — Control-path and Pixhawk-config audit; five branches open, NONE reviewed or validated
 
 Two audits (server/client control path, then flight-controller configuration), both fanned out
@@ -141,7 +264,24 @@ the armed state, and the broken battery voltage sense. Open work from it is in `
    `base_mode 193`, ArduRover 4.6.3) than the entry describes (3 m 40 s, 222 heartbeats,
    `base_mode 129`, SHA `268561f`). Different session, so it corroborates nothing about that one.
    The new measurement is recorded as its own dated observation instead. **The refute pass is the
-   only reason a wrong "correction" did not land in a file everyone trusts — keep doing it.**
+   only reason those three wrong "corrections" did not land in a file everyone trusts — keep
+   doing it.**
+
+   **But a FIFTH correction did land, and it was wrong.** The refute pass cleared the force-arm
+   correction — that `21196` is disarm-only, so an arm carrying it leaves ArduPilot's checks
+   enabled — and it was written into `TASKS.md`, retiring a real P0 and queueing a matching
+   "fix" to `CLAUDE.md` invariant 7. A cross-family red team read the Rover-4.6.3 source on
+   2026-08-11 and overturned it: `GCS_Common.cpp:5027` disables arming checks for **either**
+   2989 or 21196, and `AP_Arming.cpp:1798` then skips `pre_arm_checks()` and `arm_checks()`
+   outright. The hazard is real and is restored.
+
+   Why the refute pass missed it is the useful part: every other correction was checked against
+   *this repository*, which the pass could read. This one turned on the behaviour of **external
+   firmware**, and the pass accepted MAVProxy's CLI conventions as a proxy for it because they
+   were on-disk, on the target, and looked authoritative. An adversarial pass over your own
+   claims cannot settle a question whose answer lives outside your tree. **When a claim depends
+   on third-party behaviour, go to that project's source at the tag you are running, or record
+   the claim as unverified — do not promote a nearby artefact to evidence.**
 
 ### 2026-08-05 — Two P0s on the unauthenticated control port: crash-without-fail-safe, and served private keys
 
@@ -1063,7 +1203,9 @@ Shelved the control-safety branch and recorded four new operator priorities.
   **`origin/archive/control-failsafe-2026-07-30`** on operator instruction, verified the
   content is retrievable from the remote ref, then deleted the local branch. It had never
   been pushed, so this was the only way to shelve it without destroying it. Three fixes
-  inside it are prerequisites for current work and are flagged for cherry-pick in `TASKS.md`.
+  inside it were flagged as cherry-pick prerequisites. **That is withdrawn — see `## Current
+  state`. All three landed on `main` in better form, and applying the archive's versions now
+  would OVERWRITE the newer hardened parser.**
 - Recorded the four priorities set by the operator: the gear/throttle safety defect, latent
   frame dropping for video + C2, radio and power status in the UI and Fleet Manager, and
   Xbox/PlayStation controller support.
@@ -1300,11 +1442,24 @@ vehicle out of MANUAL, and `RCMAP_*` is at defaults so picar's channel map is co
 across all 48 heartbeats in the live tail, `custom_mode=0` (MANUAL). It has been armed
 continuously, and picar's `neutralizeAndDisarm()` on connect has not changed that.
 
-**Verified-independently note on `mavproxy_arm.py`.** MAVProxy's own arm module on rover3
+**`mavproxy_arm.py` is NOT evidence of what ArduPilot does — a worked example of the mistake this
+file keeps recording.** MAVProxy's arm module on rover3
 (`/opt/venvs/mavproxy/lib/python3.13/site-packages/MAVProxy/modules/mavproxy_arm.py`) uses
-`p2 = 2989` for `arm force` (:143) and `p2 = 21196` for `disarm force` (:188). That is on-disk
-evidence, on the target, that **2989 is the force-ARM magic and 21196 is the force-DISARM magic** —
-which bears directly on a `TASKS.md` P0 and is why that entry has been corrected.
+`p2 = 2989` for `arm force` (:143) and `p2 = 21196` for `disarm force` (:188). On 2026-08-11 that
+was read as proof that "2989 is the force-ARM magic and 21196 is the force-DISARM magic", and a
+real P0 was withdrawn on it.
+
+**It proved no such thing, and the withdrawal was wrong.** Rover-4.6.3's own handler
+(`GCS_Common.cpp:5027`) disables arming checks when `param2` equals **either** value, and
+`AP_Arming.cpp:1798` then skips `pre_arm_checks()` and `arm_checks()` outright. MAVProxy's choices
+are one tool's CLI conventions, entirely consistent with both values forcing an arm. The measured
+`ARMING_CHECK=1` proved nothing either: that parameter is read only *inside* the checks a forced
+arm never reaches.
+
+The lesson is the one this repo has now recorded several times in different clothes: a plausible
+secondary source was preferred over the primary one, and it retired a live hazard. The P0 is
+restored in `TASKS.md` with the source citations, and `CLAUDE.md` invariant 7 — which had been
+queued for "correction" — turns out to have been right all along.
 
 Rollback point, if ever needed: branch `fleet-manager` @
 `cdf4ae16dc9e105acf4cd711b33c416f52ae7739`, with the pre-change working-tree diff and the
@@ -1397,3 +1552,27 @@ startup), `*.tlog`, or any new key material.
 branches. Several stale remote branches exist (`dev`, `dev-h264`, `pix_dev`,
 `fleet-manager`, `claude/nice-bell-AupRX`) — leave them alone; cleanup is explicitly not
 authorized.
+
+**Running the Second Opinion stage so it actually completes** — known-good as of 2026-08-11,
+recorded because getting this wrong cost a previous session a false "the stage is escalated"
+and nearly cost it the weaker fallback reviewer.
+
+```
+git worktree add --detach <path>/<branch> <branch>      # never review in the authoring tree
+ln -sfn /home/bimansantoso/picar/node_modules <path>/<branch>/node_modules
+timeout 2400 codex exec --cd <path>/<branch> --sandbox read-only "$(cat preamble.md focus.md)"
+```
+
+- **One branch per review.** The runs that timed out were multi-branch. Scoped to a single
+  `git diff main..HEAD`, nine reviews completed in 5-20 minutes each, run in parallel.
+- **Detached background invocation with a ~40 min ceiling.** A foreground 10-minute timeout is an
+  invocation problem, not a fallback condition — `SKILL.md` is right to refuse it as one.
+- **`--sandbox read-only`** keeps the stage review-only as `SKILL.md` requires. The consequence is
+  that Codex reasons about mutations rather than running them; it has been accurate doing so, but
+  re-derive any mutation claim yourself before trusting it.
+- **A worktree per review is mandatory, not hygiene.** The 2026-08-06 session ran mutations in the
+  tree two reviewers were reading; one saw HEAD move and correctly discarded its own results.
+- **Give the reviewer the hardware context in the prompt.** It cannot know the pack is installed,
+  that DISARM is refused, that the voltage sense is broken, or that `SYSID_MYGCS=255`, and every
+  one of those changed a verdict. Also tell it the repo's known can't-fail test shapes and ask it
+  to name a concrete mutation per test — that is where the highest-value findings came from.
