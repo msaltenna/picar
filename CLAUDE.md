@@ -343,7 +343,11 @@ rover3 by the Embedded Validator, which must gather **all** of:
    `journalctl` (autopilot heartbeat seen, critical params verified, stream config written).
 2. **MAVLink wire verification** — observe real traffic and the Pixhawk's response
    (RC_CHANNELS_OVERRIDE out; HEARTBEAT / PARAM_VALUE / COMMAND_ACK / SERVO_OUTPUT_RAW back).
-   This proves commands reach the FC and it reacts, with no motor power.
+   This proves commands reach the FC and it reacts, **without commanding motion** — it does not
+   prove the output MAPPING, because every motion channel reads 1500 µs at neutral and a swapped
+   steering/throttle assignment looks identical to a correct one. The clause "with no motor
+   power" stood here until 2026-08-11 and is removed: a pack is installed, and this section's own
+   rule is to state what you measured rather than assert what the vehicle cannot do.
 3. **WebUI end-to-end** — drive the served UI: arm, move the controls, and trip each
    fail-safe path, confirming server-side state and telemetry respond.
 4. **Scripted regression suite on-target** — the checks are committed scripts under
@@ -386,10 +390,19 @@ there.
 
 **Compounding factor, and the reason this matters more than a documentation slip:** this
 flight controller ignores DISARM (P0 in `TASKS.md`, demonstrated on rover3 — 222
-consecutive ARMED heartbeats with no `COMMAND_ACK`). Neutral-before-disarm still stops
-motion, so the fail-safe's *stopping* function works. But the vehicle does not actually
-disarm, and it will act on the next command it receives. Under the old false premise that
-was a paperwork problem. With a pack installed it is not.
+consecutive ARMED heartbeats with no `COMMAND_ACK`). The vehicle does not actually disarm, and
+it will act on the next command it receives. Under the old false premise that was a paperwork
+problem. With a pack installed it is not.
+
+An earlier revision of this paragraph added "Neutral-before-disarm still stops motion, so the
+fail-safe's *stopping* function works." **That is withdrawn — it is one claim too far.** Neutral
+stops motion only if the neutral *packet reaches the flight controller*, and the recorded
+MAVProxy wedge proves it need not: `sendPacket()` returned true, the 20 Hz loop logged normal
+values, no fail-safe fired, and 113 KB sat unread on the socket while the FC held its last output
+for over an hour. Invariant 6 gets the ORDER right on the wire; whether the packet arrives is the
+separate, still-open "a successful `write()` is not proof of delivery" P0. Do not describe a
+fail-safe as having stopped the vehicle unless the flight controller's own output was observed
+to change.
 
 ---
 
