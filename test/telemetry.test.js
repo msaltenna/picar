@@ -989,3 +989,35 @@ test('a half-configured pack range is reported, not silently ignored', () => {
     `both half-configured drivers must complain (got ${captured.length} messages: ` +
     `${JSON.stringify(captured)})`);
 });
+
+test('getTelemetry declares the driver IS a flight controller', () => {
+  // The motion gate in test/on-target/control-e2e.js refuses unless `fcSupported === true`.
+  // The field was never emitted here, so on a real rover it was undefined and the gate
+  // refused every time — `--allow-motion` could not authorise motion on hardware, and the
+  // mandatory on-target pass was unobtainable. The host tests hid it by constructing
+  // telemetry with the field set. Found by an adversarial review, not by the suite.
+  const d = driver();
+  assert.equal(d.getTelemetry().fcSupported, true);
+});
+
+test('telemetry-loop forwards fcSupported instead of manufacturing it', () => {
+  // The other half of the same contract. If the wrapper defaulted the field, a future
+  // driver with getTelemetry but no MAVLink would be reported as a flight controller.
+  const { buildTelemetryWiring } = require('../telemetry-loop.js');
+  const withFc = buildTelemetryWiring({
+    pwm: { getTelemetry: () => ({ fcSupported: true, linkUp: true }) },
+    io: { emit() {} }, fs: { promises: {} },
+  });
+  assert.equal(withFc.getFcTelemetry().fcSupported, true);
+
+  const gpio = buildTelemetryWiring({ pwm: {}, io: { emit() {} }, fs: { promises: {} } });
+  assert.equal(gpio.getFcTelemetry().fcSupported, false,
+    'a driver with no telemetry at all must report false, not absent');
+
+  const odd = buildTelemetryWiring({
+    pwm: { getTelemetry: () => ({ linkUp: true }) },
+    io: { emit() {} }, fs: { promises: {} },
+  });
+  assert.equal(odd.getFcTelemetry().fcSupported, undefined,
+    'and an unknown driver must stay undefined so the motion gate refuses it');
+});

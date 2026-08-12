@@ -1257,6 +1257,15 @@ class PWMMavproxy {
       battery: fresh(this.telemetry.battery) ? { ...this.telemetry.battery } : null,
       power:   fresh(this.telemetry.power)   ? { ...this.telemetry.power }   : null,
       radio:   fresh(this.telemetry.radio)   ? { ...this.telemetry.radio }   : null,
+      // This driver IS the flight-controller driver. telemetry-loop emits
+      // `{ fcSupported: false }` for the four GPIO drivers, which have no getTelemetry at
+      // all, and forwards this object unchanged otherwise — so without this the field was
+      // simply ABSENT on every rover. Anything reading `fcSupported === true` therefore saw
+      // undefined and refused: control-e2e's motion gate could never authorise motion on
+      // real hardware, and only passed in host tests because they synthesised the field.
+      // Emitted rather than defaulted at the reader, because `undefined` must keep meaning
+      // "unknown driver, refuse" there.
+      fcSupported: true,
       linkUp:  !!(this.client && !this.client.destroyed),
       // Coerced: `fresh()` short-circuits to null on a missing entry, and a
       // consumer checking this field deserves a boolean, not null-vs-false.
