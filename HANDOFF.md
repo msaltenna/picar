@@ -104,6 +104,71 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-12 (later) — pushed to origin, and the refusal path validated on rover1 @ `d7018b3`
+
+**`origin/main` is no longer untouched.** `948cdcc..d7018b3`, fast-forward, no rewrite and no
+force. This is the first push of any of this work, made on explicit operator instruction. Both
+rovers now run `main` @ `d7018b3`.
+
+**THE GAP IN THE PREVIOUS ENTRY IS NOW CLOSED.** That entry recorded that every refusal path was
+host-tested only, because rover3 is a healthy ArduRover and the one vehicle that would exercise
+them was unreachable. rover1 came back, and it did.
+
+**rover1 BEFORE the deploy**, captured from `/status` on `948cdcc` — this is the corruption
+described in the firmware P0, live:
+
+    firmware:  null                       (the old code never identified anything)
+    verified:  ["RC3_DZ", "RC3_TRIM"]     (two PX4 parameters, reported VERIFIED)
+    missing:   9                          (the ArduPilot-only names PX4 rejected)
+    battery:   7.442 V, 0 A               (a pack is connected)
+
+**rover1 AFTER**, on `d7018b3`:
+
+    firmware:  {autopilot: 12, type: 2,
+                mismatch: "MAV_AUTOPILOT=12 (expected 3 ARDUPILOTMEGA); MAV_TYPE=2
+                           (expected 10 GROUND_ROVER or 11 SURFACE_BOAT, ...)",
+                overlaySuppressed: true, identityTimedOut: false}
+    verified:  []
+
+**And the journal shows the tiering doing exactly what it was built to do:**
+
+    Applying the pre-identity param overlay (1 of 13) — the rest waits for the autopilot…
+    PARAM_SET RC_OVERRIDE_TIME=0.2
+    WARNING this autopilot is NOT an ArduRover: MAV_AUTOPILOT=12 …; MAV_TYPE=2 … SUPPRESSED
+    Received first Pixhawk heartbeat (sys=1 MAVLink 2)
+
+**ONE parameter reached the PX4 board instead of thirteen**, and it was `RC_OVERRIDE_TIME`, which
+is ArduPilot-only and which PX4 rejects. No `SERVOn_FUNCTION`, no `FRAME_CLASS`, no `RC3_DZ`, no
+`RC3_TRIM`. The equivalent deploy on 2026-08-11 wrote `RC3_DZ` 10 → 30 to this board and reported
+it verified. Both the suppression and the read-back quarantine are now hardware-validated, on the
+vehicle whose misconfiguration motivated them.
+
+**On-target scripts on rover1 correctly FAIL, and that is the pass condition here.**
+`npm run test:on-target` exits 1 with `params.missing` listing all 11 critical names, and every
+motion group SKIPPED. `telemetry.sh` exits 1 for the same reason, footer reporting
+`BATTERY MEASURED AT 7.398 V drawing 0 A. A PACK IS CONNECTED`. A PX4 quadrotor running a rover
+teleop stack SHOULD fail a rover's parameter verification; the scripts are telling the truth
+about the vehicle rather than about the code. Host suite on target: **385 pass, 0 fail**.
+Services active, `NRestarts=0`.
+
+**Still the read-only tier.** No motion was commanded on either rover. rover1 has a pack at
+7.4 V, so the same rule applies to it.
+
+**TWO THINGS ABOUT rover1's HOST that the next session needs.**
+
+1. **Deploy to rover1 as `salt`, not `saltenna`.** `/opt/picar` is owned by `salt:salt` and
+   `saltenna` is not in that group, so `git fetch` fails on `.git/FETCH_HEAD`. `saltenna` is in
+   `sudo` but has **no passwordless sudo** on rover1, unlike rover3 — so `sudo systemctl` prompts
+   and fails under a non-interactive SSH. `salt` owns the repo and does have passwordless sudo.
+   This is a real difference between the two rovers and it is not written down anywhere else.
+2. **`node_modules` was owned by `root:root`**, from some earlier `sudo npm ci`, so
+   `npm ci --omit=dev` failed with EACCES and the deploy silently ran on stale modules. Changed
+   to `salt:salt` and reinstalled cleanly. Worth checking on any rover before trusting a deploy.
+
+**rover1's PX4 board still holds the parameters picar wrote to it.** This change stops further
+writes; it restores nothing. `RC3_DZ` was read back as 30 from the flight controller before this
+deploy. The recovery task is the [P0] in `TASKS.md` and it is NOT closed by this entry.
+
 ### 2026-08-12 — six branches merged to local main, validated on rover3 @ `658f5d90`
 
 **What landed**, in merge order, all to **local `main` only — `origin` is untouched and nothing

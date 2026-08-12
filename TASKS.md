@@ -90,8 +90,13 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   writes; nothing restores what was already changed, and closing the firmware-gating P0 on the
   guard alone would leave rover1 operating from a corrupted baseline. Capture rover1's current
   parameters, restore `RC3_DZ=10` and `RC3_TRIM` to its authoritative prior value, read both
-  back, and record the rover's exact checkout and controller state. **rover1 was unreachable
-  (no SSH, no ICMP) from 2026-08-12; it resolves to 192.168.31.168.**
+  back, and record the rover's exact checkout and controller state.
+
+  **Confirmed still present 2026-08-12 (later).** rover1 came back online and `/status` on
+  `948cdcc` reported `verified: ["RC3_DZ", "RC3_TRIM"]` — i.e. the flight controller read those
+  values back. The deploy of `d7018b3` suppresses the overlay and empties the verified list, so
+  the corruption is no longer VISIBLE through picar, which makes this task easier to forget and
+  no less real. Deploy access is via the **`salt`** account, not `saltenna` — see `HANDOFF.md`.
 
 - **[P1] `params.verified` has no freshness, so stale verification can authorise motion** —
   `pwm_mavproxy_servo.js` retains `verifiedCriticalParams` until the TCP link closes and stops
