@@ -288,13 +288,38 @@ function hardwareReadyForMotion(telemetryFrame, expectedNames) {
 
 module.exports = { assertSafeToCommand, motionFlagGiven, withDeadline, hardwareReadyForMotion };
 
+let emergencyStop = null;
+
 if (require.main === module) (async () => {
   let failed = 0;
   let skipped = 0;
   // The decision is BRANCHED ON, not discarded. Deleting this assignment, or ignoring it, makes
   // the motion sections unreachable rather than unguarded — the failure direction that is safe.
   const motionAuthorised = await assertSafeToCommand(motionFlagGiven(process.argv));
+  // Whether this run has put the vehicle in an armed state. The fail-safe stop below is
+  // conditioned on THIS, not on link health — see the note there.
+  let armedThisRun = false;
   const ok  = (m) => log(`  PASS ${m}`);
+  // Send the server's neutral-then-DISARM primitive and CONFIRM the controls read neutral
+  // afterwards. Returns the observed reading, or null if it could not be confirmed — a
+  // successful POST is not evidence, which is this repo's standing "a successful write() is
+  // not proof of delivery" point.
+  const failSafeStop = async () => {
+    try {
+      await req('POST', P, '42' + JSON.stringify(['disarm']));
+      await sleep(600);
+      const st = JSON.parse((await withDeadline(
+        req('GET', '/status', null, { timeoutMs: 5000 }), 5000, 'GET /status')).body);
+      return (st.steering === 0 && st.throttle === 0)
+        ? `steering ${st.steering}, throttle ${st.throttle}` : null;
+    } catch (e) {
+      log(`  the final stop could not be confirmed: ${e.message}`);
+      return null;
+    }
+  };
+  // Exposed so the top-level catch can still stop the vehicle when a check THROWS after
+  // arming. Without it an unexpected exception left a rover armed and commanded.
+  emergencyStop = async () => { if (armedThisRun) await failSafeStop(); };
   const bad = (m) => { log(`  FAIL ${m}`); failed = 1; };
   const skip = (m) => { log(`  SKIP ${m}`); skipped++; };
 
@@ -402,6 +427,7 @@ if (require.main === module) (async () => {
   if (!await stillReady('THE FIRST ARM')) {
     skip('arm / 12 fromclient commands (hardware no longer ready)');
   } else {
+  armedThisRun = true;
   await req('POST', P, '42' + JSON.stringify(['arm']));
   await sleep(400);
   absorb((await req('GET', P)).body);
@@ -445,10 +471,23 @@ if (require.main === module) (async () => {
   }   // end drivetrain section readiness re-check
 
   // ── Operator stop ─────────────────────────────────────────────────────────
+  //
+  // ALWAYS attempted once this run has armed, INCLUDING after a link-health failure. An
+  // earlier version skipped it when linkLost was set, reasoning that a degraded link should
+  // not receive more commands. That was backwards and a reviewer caught it: `disarm` is the
+  // server's neutral-then-DISARM primitive — the cleanup, not further actuation — and
+  // skipping it left this script's last 0.5 steering command standing until an input
+  // watchdog that main's own tests cannot prove fires. A one-way RECEIVE failure makes
+  // heartbeat readiness fail while outbound packets still get through, so the stop had a
+  // good chance of working in exactly the case it was being withheld.
+  //
+  // linkLost still gates FURTHER actuation (the second arm, setLight). It does not gate
+  // stopping.
   log('\n== Operator stop (disarm) ==');
-  if (linkLost) {
-    skip('disarm (the link was lost earlier this run)');
+  if (!armedThisRun) {
+    skip('disarm (this run never armed, so there is nothing to stop)');
   } else {
+  if (linkLost) log('  the link was lost earlier this run — sending the stop ANYWAY');
   await req('POST', P, '42' + JSON.stringify(['disarm']));
   await sleep(600);
   absorb((await req('GET', P)).body);
@@ -464,17 +503,50 @@ if (require.main === module) (async () => {
   if (!await stillReady('THE SECOND ARM')) {
     skip('input watchdog expiry (hardware no longer ready)');
   } else {
+  armedThisRun = true;
   await req('POST', P, '42' + JSON.stringify(['arm']));
   await sleep(300);
   await req('POST', P, '42' + JSON.stringify(['fromclient', { throttle: 0, steering: 0.25 }]));
   log('  ---- going silent; input_timeout_ms is 1000, waiting 3 s');
   await sleep(3000);
   absorb((await req('GET', P)).body);
-  // NOTE: this only proves the window elapsed. It does NOT prove the watchdog fired — `ok()` is
-  // an unconditional print. Asserting that STEERING returns to 0 via GET /status is the fix,
-  // and it is tracked separately in TASKS.md rather than bundled into this branch.
-  ok('watchdog window elapsed');
+  // OBSERVE THE EFFECT, do not just let the window elapse. This called ok() unconditionally,
+  // so a deleted watchdog printed PASS — and once exit 0 became assertable evidence that
+  // turned a missing fail-safe into a validation pass. main's own suite cannot prove the
+  // watchdog fires (CLAUDE.md records it as deletable without failing a test), which makes
+  // this the only place it is checked at all.
+  let after;
+  try {
+    after = JSON.parse((await withDeadline(
+      req('GET', '/status', null, { timeoutMs: 5000 }), 5000, 'GET /status')).body);
+  } catch (e) {
+    bad(`watchdog: could not read /status back (${e.message})`);
+    after = null;
+  }
+  if (after) {
+    // 0.25 was commanded above and then the client went silent for 3x input_timeout_ms.
+    const st = after.steering, th = after.throttle;
+    if (st === 0 && th === 0) ok(`watchdog returned the controls to neutral (steering ${st}, throttle ${th})`);
+    else bad(`watchdog did NOT neutralise: steering ${JSON.stringify(st)}, throttle ${JSON.stringify(th)} ` +
+             `after 3 s of silence with input_timeout_ms=1000`);
+  }
   }   // end second-arm readiness re-check
+
+  // ── Leave the vehicle stopped, whatever happened above ────────────────────
+  //
+  // The watchdog section RE-ARMS and then deliberately goes silent. If the watchdog does
+  // not fire — the case that section exists to detect, and which main's host suite cannot
+  // detect at all — the run would otherwise END with a rover armed and holding 0.25
+  // steering, having just printed the FAIL that says so. Mutation found this: setting
+  // armedThisRun at the second arm was dead code, because nothing read it afterwards.
+  //
+  // Unconditional on armedThisRun, not on link health or on whether anything passed.
+  if (armedThisRun) {
+    log('\n== Final stop ==');
+    const stopped = await failSafeStop();
+    stopped ? ok(`the run ends with the vehicle stopped (${stopped})`)
+            : bad('the run could NOT confirm the vehicle was left stopped');
+  }
   } // end motion sections
 
   // ── Light control (main already carries this feature) ─────────────────────
@@ -549,4 +621,10 @@ if (require.main === module) (async () => {
     log('\nE2E PASSED');
     process.exit(0);
   }
-})().catch((e) => { console.error('E2E ERROR', e); process.exit(2); });
+})().catch(async (e) => {
+  console.error('E2E ERROR', e);
+  // Stop first, report second. A throw after arming used to exit 2 with the vehicle still
+  // armed and holding whatever the last command was.
+  if (emergencyStop) { try { await emergencyStop(); } catch (e2) { console.error('  and the emergency stop failed:', e2.message); } }
+  process.exit(2);
+});

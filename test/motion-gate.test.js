@@ -237,7 +237,8 @@ test('unverified critical parameters refuse motion even WITH the flag', () => {
 // untestable — a permanently degraded stub makes every section refuse on its own, so removing
 // the latch changes nothing. Measured: that mutation survived until this existed.
 function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = Infinity,
-                     degradeTo = {}, stallStatusAfter = Infinity } = {}) {
+                     degradeTo = {}, stallStatusAfter = Infinity,
+                     statusSteering = 0, statusThrottle = 0 } = {}) {
   const https = require('node:https');
   const bodies = [];
   const pendingAcks = [];
@@ -260,7 +261,8 @@ function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = In
           const degraded = statusReads > degradeStatusAfter && statusReads <= degradeUntil;
           const t = telemetry ? (degraded ? { ...telemetry, ...degradeTo } : telemetry) : null;
           rs.writeHead(200, { 'Content-Type': 'application/json' });
-          return rs.end(JSON.stringify({ status: 'OK', throttle: 0, steering: 0, telemetry: t }));
+          return rs.end(JSON.stringify({ status: 'OK', throttle: statusThrottle,
+                                         steering: statusSteering, telemetry: t }));
         }
         if (rq.method === 'GET' && !/[?&]sid=/.test(rq.url)) {
           rs.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -565,4 +567,98 @@ test('a /status that accepts the request and never answers cannot hang the re-ch
   const sent = eventsSent(r.bodies);
   assert.ok(!sent.includes('arm'), `arm was sent despite a dead re-check; decoded: ${JSON.stringify(sent)}`);
   assert.equal(r.code, 1, 'a re-check that could not complete is a FAILURE, not a skip');
+});
+
+test('a link lost mid-run still sends the fail-safe stop', async () => {
+  // The review finding this closes: linkLost skipped `disarm`, so a run that had already
+  // ARMED and commanded steering 0.5 left that command standing and returned. `disarm` is
+  // the server's neutral-then-DISARM primitive — the cleanup, not further actuation — and a
+  // one-way RECEIVE failure fails the heartbeat check while outbound packets still work, so
+  // the stop was being withheld in the case it was most likely to work and most needed.
+  //
+  // Degrade from status read 3: read 1 is the battery gate, read 2 authorises the FIRST ARM,
+  // and read 3 is the drivetrain re-check — so this run arms, steers, and then loses the link.
+  const r = await runScript(['--allow-motion'], {
+    telemetry: OK_TELEMETRY,
+    degradeStatusAfter: 2,
+    degradeTo: { autopilotHeartbeat: false },
+  });
+
+  const sent = eventsSent(r.bodies);
+  assert.ok(sent.includes('arm'), `precondition: this run must have armed; decoded: ${JSON.stringify(sent)}`);
+  assert.match(r.stdout, /REFUSING THE DRIVETRAIN SECTION/, 'precondition: the link was lost mid-run');
+  assert.ok(sent.includes('disarm'),
+    `the fail-safe stop must be sent even after a link-health failure; decoded: ${JSON.stringify(sent)}`);
+  assert.match(r.stdout, /sending the stop ANYWAY/);
+  // And it must still gate FURTHER actuation.
+  assert.match(r.stdout, /setLight == SKIPPED/);
+});
+
+test('an AUTHORISED run whose first-arm check refuses sends no pointless stop', async () => {
+  // The negative control for the test above, and it has to enter the motion block to be
+  // one: with no --allow-motion the whole block is skipped earlier, so that path never
+  // reaches the stop and proves nothing about the guard. Wedging from status read 2 — the
+  // FIRST ARM re-check — is the case where the run is authorised, enters the block, and
+  // never arms. Without the guard this would DISARM a rover it never touched.
+  const r = await runScript(['--allow-motion'], {
+    telemetry: OK_TELEMETRY,
+    degradeStatusAfter: 1,
+    degradeTo: { autopilotHeartbeat: false },
+  });
+
+  const sent = eventsSent(r.bodies);
+  assert.match(r.stdout, /REFUSING THE FIRST ARM/, 'precondition: it entered the block and refused');
+  assert.ok(!sent.includes('arm'), `precondition: nothing armed; decoded: ${JSON.stringify(sent)}`);
+  assert.ok(!sent.includes('disarm'),
+    `a run that never armed must not send disarm; decoded: ${JSON.stringify(sent)}`);
+  assert.match(r.stdout, /this run never armed/);
+});
+
+test('the watchdog check FAILS when the controls do not return to neutral', async () => {
+  // This check used to call ok() unconditionally after sleeping — it proved the window
+  // elapsed, not that anything happened. Once exit 0 became assertable evidence, that turned
+  // a deleted watchdog into a validation PASS. CLAUDE.md records that main's input watchdog
+  // can be deleted outright without failing a host test, so this is the only check on it.
+  const r = await runScript(['--allow-motion'],
+    { telemetry: OK_TELEMETRY, statusSteering: 0.25 });
+
+  assert.match(r.stdout, /watchdog did NOT neutralise/,
+    `a rover still holding steering after the silence must FAIL; got:\n${r.stdout}`);
+  assert.match(r.stdout, /steering 0\.25/);
+  assert.equal(r.code, 1, 'and the run must fail, not pass');
+  assert.doesNotMatch(r.stdout, /E2E PASSED/);
+});
+
+test('the watchdog check PASSES only on an observed return to neutral', async () => {
+  const r = await runScript(['--allow-motion'], { telemetry: OK_TELEMETRY });
+  assert.match(r.stdout, /watchdog returned the controls to neutral/);
+  assert.equal(r.code, 0);
+});
+
+test('the run ends with a stop after the watchdog section re-arms', async () => {
+  // The watchdog section re-arms and then goes silent by design, so without a final stop a
+  // healthy run ends with the vehicle armed. Mutation found this: setting armedThisRun at
+  // the SECOND arm was dead code, because nothing read it afterwards — the whole file stayed
+  // green with it removed.
+  const r = await runScript(['--allow-motion'], { telemetry: OK_TELEMETRY });
+  const sent = eventsSent(r.bodies);
+  const disarms = sent.filter((n) => n === 'disarm').length;
+  assert.equal(disarms, 2,
+    `one stop for the operator-stop check and one to leave the vehicle stopped; decoded: ${JSON.stringify(sent)}`);
+  assert.match(r.stdout, /Final stop/);
+  assert.match(r.stdout, /the run ends with the vehicle stopped/);
+  // The final stop must come AFTER the second arm, or it stops nothing.
+  const order = sent.slice(sent.lastIndexOf('arm'));
+  assert.ok(order.includes('disarm'),
+    `the last arm must be followed by a stop; tail: ${JSON.stringify(order)}`);
+});
+
+test('the final stop FAILS the run when neutral cannot be confirmed', async () => {
+  // A successful POST is not evidence — this repo's standing "a successful write() is not
+  // proof of delivery" point. If /status still shows the controls off neutral after the
+  // stop, the run must say so rather than print a reassuring line.
+  const r = await runScript(['--allow-motion'],
+    { telemetry: OK_TELEMETRY, statusSteering: 0.25 });
+  assert.match(r.stdout, /could NOT confirm the vehicle was left stopped/);
+  assert.equal(r.code, 1);
 });
