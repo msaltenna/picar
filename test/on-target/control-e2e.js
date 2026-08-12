@@ -310,8 +310,18 @@ if (require.main === module) (async () => {
       await sleep(600);
       const st = JSON.parse((await withDeadline(
         req('GET', '/status', null, { timeoutMs: 5000 }), 5000, 'GET /status')).body);
+      // WHAT THIS DOES AND DOES NOT SHOW. `app.js` zeroes its local steering/throttle BEFORE
+      // attempting neutralizeAndDisarm(), so these fields are the server's DESIRED state, not
+      // the vehicle's. They read neutral even if the MAVProxy write failed, the link wedged, or
+      // the flight controller kept its last output — which is exactly the recorded wedge, on a
+      // controller that also ignores DISARM. So this confirms the server accepted the stop and
+      // is no longer commanding motion; it is NOT confirmation that the vehicle stopped.
+      // Proving that needs the handler to return neutralSent/disarmSent and fresh MAVLink
+      // evidence, which is production work tracked in TASKS.md.
       return (st.steering === 0 && st.throttle === 0)
-        ? `steering ${st.steering}, throttle ${st.throttle}` : null;
+        ? `server no longer commands motion: steering ${st.steering}, throttle ${st.throttle} ` +
+          `— NOT proof the neutral packet reached the flight controller`
+        : null;
     } catch (e) {
       log(`  the final stop could not be confirmed: ${e.message}`);
       return null;
@@ -507,6 +517,19 @@ if (require.main === module) (async () => {
   await req('POST', P, '42' + JSON.stringify(['arm']));
   await sleep(300);
   await req('POST', P, '42' + JSON.stringify(['fromclient', { throttle: 0, steering: 0.25 }]));
+  // OBSERVE THE PRECONDITION before going silent. Without this the check is satisfiable by a
+  // build with NO fromclient handler and NO watchdog: the POST succeeds, /status never leaves
+  // 0, and the run then reports that the watchdog returned the controls to neutral. A
+  // transition to zero is only evidence if something was non-zero first.
+  let armedSteering = null;
+  try {
+    armedSteering = JSON.parse((await withDeadline(
+      req('GET', '/status', null, { timeoutMs: 5000 }), 5000, 'GET /status')).body).steering;
+  } catch (e) { bad(`watchdog: could not read the commanded state back (${e.message})`); }
+  if (armedSteering === 0.25) ok('the steering command was accepted (steering 0.25)');
+  else bad(`watchdog precondition FAILED: steering reads ${JSON.stringify(armedSteering)}, ` +
+           `not the 0.25 just commanded — there is nothing for the watchdog to undo, so its ` +
+           `result below would prove nothing`);
   log('  ---- going silent; input_timeout_ms is 1000, waiting 3 s');
   await sleep(3000);
   absorb((await req('GET', P)).body);
@@ -544,8 +567,8 @@ if (require.main === module) (async () => {
   if (armedThisRun) {
     log('\n== Final stop ==');
     const stopped = await failSafeStop();
-    stopped ? ok(`the run ends with the vehicle stopped (${stopped})`)
-            : bad('the run could NOT confirm the vehicle was left stopped');
+    stopped ? ok(`the stop was accepted — ${stopped}`)
+            : bad('the run could NOT confirm the server stopped commanding motion');
   }
   } // end motion sections
 

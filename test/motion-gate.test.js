@@ -238,10 +238,24 @@ test('unverified critical parameters refuse motion even WITH the flag', () => {
 // the latch changes nothing. Measured: that mutation survived until this existed.
 function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = Infinity,
                      degradeTo = {}, stallStatusAfter = Infinity,
-                     statusSteering = 0, statusThrottle = 0 } = {}) {
+                     watchdogFires = true, stopWorks = true, fromclientWorks = true } = {}) {
   const https = require('node:https');
   const bodies = [];
   const pendingAcks = [];
+  // MODEL THE SERVER'S COMMANDED STATE, rather than returning a constant. /status reports what
+  // app.js currently commands: a `fromclient` sets it, the input watchdog returns it to neutral
+  // after input_timeout_ms of silence, and `disarm` zeroes it. Returning a constant made the
+  // script's checks unfalsifiable in both directions — a run could "observe" a watchdog that
+  // was never armed. `watchdogFires` and `stopWorks` are the two negative controls.
+  let cmdSteering = 0, cmdThrottle = 0;
+  let lastCmdAt = 0;
+  const INPUT_TIMEOUT_MS = 1000;
+  const commanded = () => {
+    if (watchdogFires && lastCmdAt && (Date.now() - lastCmdAt) > INPUT_TIMEOUT_MS) {
+      return { steering: 0, throttle: 0 };
+    }
+    return { steering: cmdSteering, throttle: cmdThrottle };
+  };
   let statusReads = 0;
   const server = https.createServer(
     { key: fs.readFileSync(KEY_PATH), cert: fs.readFileSync(CRT_PATH) },
@@ -261,8 +275,9 @@ function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = In
           const degraded = statusReads > degradeStatusAfter && statusReads <= degradeUntil;
           const t = telemetry ? (degraded ? { ...telemetry, ...degradeTo } : telemetry) : null;
           rs.writeHead(200, { 'Content-Type': 'application/json' });
-          return rs.end(JSON.stringify({ status: 'OK', throttle: statusThrottle,
-                                         steering: statusSteering, telemetry: t }));
+          const c = commanded();
+          return rs.end(JSON.stringify({ status: 'OK', throttle: c.throttle,
+                                         steering: c.steering, telemetry: t }));
         }
         if (rq.method === 'GET' && !/[?&]sid=/.test(rq.url)) {
           rs.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -273,6 +288,15 @@ function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = In
         // exits 1 because setDrivetrain times out, which made the clean-PASS path unreachable by
         // the entire suite — a red team showed process.exit(0) could be changed to exit(1) with
         // nothing failing. `42<ackId>[...]` is answered with `43<ackId>[...]`.
+        if (rq.method === 'POST' && /^42/.test(raw) && raw.indexOf('[') > 0) {
+          const [name, payload] = JSON.parse(raw.slice(raw.indexOf('[')));
+          if (name === 'fromclient' && payload && fromclientWorks) {
+            cmdSteering = payload.steering ?? 0;
+            cmdThrottle = payload.throttle ?? 0;
+            lastCmdAt = Date.now();
+          }
+          if (name === 'disarm' && stopWorks) { cmdSteering = 0; cmdThrottle = 0; lastCmdAt = 0; }
+        }
         if (rq.method === 'POST' && /^42\d/.test(raw)) {
           const id = raw.slice(2, raw.indexOf('['));
           const [name, payload] = JSON.parse(raw.slice(raw.indexOf('[')));
@@ -620,7 +644,7 @@ test('the watchdog check FAILS when the controls do not return to neutral', asyn
   // a deleted watchdog into a validation PASS. CLAUDE.md records that main's input watchdog
   // can be deleted outright without failing a host test, so this is the only check on it.
   const r = await runScript(['--allow-motion'],
-    { telemetry: OK_TELEMETRY, statusSteering: 0.25 });
+    { telemetry: OK_TELEMETRY, watchdogFires: false });
 
   assert.match(r.stdout, /watchdog did NOT neutralise/,
     `a rover still holding steering after the silence must FAIL; got:\n${r.stdout}`);
@@ -646,7 +670,13 @@ test('the run ends with a stop after the watchdog section re-arms', async () => 
   assert.equal(disarms, 2,
     `one stop for the operator-stop check and one to leave the vehicle stopped; decoded: ${JSON.stringify(sent)}`);
   assert.match(r.stdout, /Final stop/);
-  assert.match(r.stdout, /the run ends with the vehicle stopped/);
+  assert.match(r.stdout, /the stop was accepted/);
+  // And it must NOT claim more than it can show. app.js zeroes its local steering BEFORE
+  // attempting the write, so /status reading neutral is the server's desired state, not the
+  // vehicle's — a reviewer's finding, and the claim was overstated until 2026-08-12.
+  assert.match(r.stdout, /NOT proof the neutral packet reached the flight controller/);
+  assert.doesNotMatch(r.stdout, /the vehicle was left stopped|vehicle stopped \(/,
+    'the run must not assert a vehicle state it cannot observe');
   // The final stop must come AFTER the second arm, or it stops nothing.
   const order = sent.slice(sent.lastIndexOf('arm'));
   assert.ok(order.includes('disarm'),
@@ -658,7 +688,23 @@ test('the final stop FAILS the run when neutral cannot be confirmed', async () =
   // proof of delivery" point. If /status still shows the controls off neutral after the
   // stop, the run must say so rather than print a reassuring line.
   const r = await runScript(['--allow-motion'],
-    { telemetry: OK_TELEMETRY, statusSteering: 0.25 });
-  assert.match(r.stdout, /could NOT confirm the vehicle was left stopped/);
+    { telemetry: OK_TELEMETRY, watchdogFires: false, stopWorks: false });
+  assert.match(r.stdout, /could NOT confirm the server stopped commanding motion/);
   assert.equal(r.code, 1);
+});
+
+test('a build that IGNORES fromclient cannot pass the watchdog check', async () => {
+  // Codex's scenario, and the one the precondition exists for: the POST succeeds, the handler
+  // does nothing, /status never leaves 0 — and the old check then reported that the watchdog
+  // had returned the controls to neutral. A transition to zero is only evidence if something
+  // was non-zero first, so with the handler gone this run must FAIL rather than pass a build
+  // that has neither a motion handler nor a safety timer.
+  const r = await runScript(['--allow-motion'],
+    { telemetry: OK_TELEMETRY, fromclientWorks: false });
+
+  assert.match(r.stdout, /watchdog precondition FAILED/,
+    `an ignored steering command must fail the precondition; got:\n${r.stdout}`);
+  assert.match(r.stdout, /steering reads 0, not the 0\.25 just commanded/);
+  assert.equal(r.code, 1, 'and the run must fail');
+  assert.doesNotMatch(r.stdout, /E2E PASSED/);
 });
