@@ -84,45 +84,49 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ## Backlog
 
-- **[P0] rover1's PX4 flight controller still holds parameters picar wrote to it** — measured
-  2026-08-11: `RC3_DZ` went **10 → 30** and `RC3_TRIM` was written, on a board running PX4 with
-  1101 parameters in the PX4 namespace. `fix/identify-autopilot-before-overlay` stops FUTURE
-  writes; nothing restores what was already changed, and closing the firmware-gating P0 on the
-  guard alone would leave rover1 operating from a corrupted baseline. Capture rover1's current
-  parameters, restore `RC3_DZ=10` and `RC3_TRIM` to its authoritative prior value, read both
-  back, and record the rover's exact checkout and controller state.
+- **[P0] The tracked `mavproxy.service` hardcodes `/dev/ttyACM0`, which does not survive a flight
+  controller reboot** — observed on rover1, 2026-08-12. Rebooting the FC (any parameter change
+  requiring it, or a reflash) does not release the old handle, so the board re-enumerates as
+  `ttyACM1`/`ttyACM2`. MAVProxy then failed 5 times in 2 s, hit `Start request repeated too
+  quickly`, and stayed DOWN — taking picar's only link to the vehicle with it, on a rover with a
+  live pack. Two independent defects: the hardcoded path, and the restart budget being far too
+  small to outlast USB enumeration (`fix/systemd-restart-limits` addresses the second only).
+  Fix `systemd/mavproxy.service` to use `/dev/serial/by-id/...`, which follows the board by
+  serial number. rover1 carries a local drop-in as a stopgap
+  (`/etc/systemd/system/mavproxy.service.d/by-id-master.conf`); rover3 does not, and will hit
+  this the first time its FC reboots.
 
-  **Confirmed still present 2026-08-12 (later).** rover1 came back online and `/status` on
-  `948cdcc` reported `verified: ["RC3_DZ", "RC3_TRIM"]` — i.e. the flight controller read those
-  values back. The deploy of `d7018b3` suppresses the overlay and empties the verified list, so
-  the corruption is no longer VISIBLE through picar, which makes this task easier to forget and
-  no less real. Deploy access is via the **`salt`** account, not `saltenna` — see `HANDOFF.md`.
+- **[P1] Nothing in picar can see the parameters that decide whether the vehicle can move at
+  all** — `BRD_SAFETY_DEFLT=1` on rover1 inhibited every PWM output at the IO level while
+  `/status` reported `linkUp: true`, a fresh heartbeat, and **11/11 critical parameters
+  verified**. The ESC fast-blinked and the rover was undriveable, and picar's own health
+  reporting said everything was fine. `EXPECTED_CRITICAL_PARAMS` owns 13 of ~918 parameters and
+  says nothing about the rest. At minimum add the safety-switch state — `SYS_STATUS`'s
+  `MAV_SYS_STATUS_SENSOR_PREARM_CHECK` / safety bits, and the PreArm STATUSTEXT stream — to
+  telemetry, so "FC: ok" cannot mean "cannot move".
 
-  **BASELINE CAPTURED 2026-08-12, so a reflash is now safe to do.** All **1100** parameters
-  read off the board read-only via `PARAM_REQUEST_LIST`, no motion commanded, picar stopped for
-  the duration and restarted after. Stored deliberately **outside this repo** — a PX4 dump in
-  this tree is the exact mistake `chore/remove-px4-param-dump` deleted, and `*.parm` is
-  gitignored:
+- **[P1] rover1 performs worse than rover3 and the cause is UNDIAGNOSED** — reported by the
+  operator 2026-08-12; rover1 went unreachable before flight mode, CPU load or video
+  configuration could be measured, so nothing below is confirmed. Candidates, in the order worth
+  checking:
+  1. **Flight mode.** rover3 is documented running `MANUAL` with `RCMAP_THROTTLE=3`, direct
+     passthrough. A freshly reflashed rover1 has default modes, and anything other than MANUAL
+     changes throttle response completely. Check first — it is the cheapest and the most likely.
+  2. **Software H.264.** rover1 is a CM5 and has NO hardware encoder (`/dev/video11` absent,
+     verified), so `webrtc_codec: softwareH264` is forced. rover3 is a CM4 and uses the hardware
+     encoder. Software encoding costs CPU and adds latency, and on a shared event loop that can
+     degrade the CONTROL path too, not just video (invariant 9). Measure picar's CPU and the
+     stream's latency before blaming it.
+  3. **Everything outside the 13 overlay parameters is at ArduPilot defaults** after the reflash,
+     while rover3 has accumulated tuning — `ATC_*`, `ATC_ACCEL_MAX`, `ATC_BRAKE`, steering rate
+     gains. picar owns 13 of ~918 and never compares the rest.
+  4. **No accelerometer or compass calibration** on rover1, so the EKF has no good attitude
+     solution. Does not block MANUAL driving; does affect anything using attitude.
 
-  - workstation `~/rover-fc-baselines/rover1-px4-2026-08-12.parm`
-  - rover1      `/home/salt/fc-baseline/rover1-px4-2026-08-12.parm`
-  - identical, `sha256:2ecbd6b31e2c2bb2…`
+  **The right tool here is a parameter DIFF against rover3, which is why rover3's baseline should
+  be captured the moment it is reachable** — same read-only method used for rover1
+  (`PARAM_REQUEST_LIST`, stopping picar for the single TCP slot), stored outside the repo.
 
-  Board identity recorded in the file header: PX4 **v1.16.0**, `board_version` 56, `vendor_id`
-  12677, `product_id` 56, `uid` 3473490278238992185; heartbeat `autopilot=12` `type=2`,
-  DISARMED at capture. `SYS_AUTOSTART=5001`, `CA_AIRFRAME=0`.
-
-  **The two picar wrote are in there at their MODIFIED values — `RC3_DZ=30`, `RC3_TRIM=1500`.
-  The baseline therefore records the corruption, it does not undo it,** and it cannot tell you
-  what `RC3_DZ` was before picar changed it. The 10 → 30 figure comes from the 2026-08-11
-  journal (`PARAM_SET RC3_DZ=30` against a prior read of 10), which is the only record of the
-  original value. PX4's own default for that parameter is the other reference point.
-
-  **A trap for whoever restores this.** PX4 sends integer parameters BYTEWISE — the INT32 bits
-  reinterpreted as a float — so a naive read gives `SYS_AUTOSTART=7.00789e-42` instead of 5001.
-  The captured file is already decoded and carries its per-parameter type in a third column; do
-  not re-derive values from raw floats. The first dump taken today had exactly this bug and was
-  discarded.
 
 - **[P1] `params.verified` has no freshness, so stale verification can authorise motion** —
   `pwm_mavproxy_servo.js` retains `verifiedCriticalParams` until the TCP link closes and stops
