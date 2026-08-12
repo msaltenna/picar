@@ -92,7 +92,41 @@ const TELEMETRY_STALE_MS = 3000;
 // Keep trims/endpoints in picar-config.json; only fix params that are out of line.
 // These are pushed on every MAVProxy connect so a fresh/replacement flight
 // controller (e.g. Pixhawk 6C mini) gets the right output mapping without
-// needing to load mav.parm by hand.
+// needing a parameter file loaded by hand.
+//
+// This comment used to name `mav.parm` as that hand-load fallback. That file was a
+// PX4 QUADCOPTER dump — MAV_TYPE 2, SYS_AUTOSTART 4001, CA_AIRFRAME, MC_ROLLRATE_P,
+// _HASH_CHECK, and zero ArduPilot-only parameters (no SERVOn_FUNCTION, no
+// FRAME_CLASS, no MOT_SLEWRATE). Loading it onto this ArduRover would have had 1028
+// of its 1101 names rejected while 72 shared RC entries applied, including
+// RC3_DZ=10 silently overwriting the 30 pushed below, and RC1_MIN/MAX reset to
+// quadcopter values that no read-back covers. It has been deleted rather than
+// corrected: a wrong baseline is worse than no baseline.
+//
+// WHAT TO USE INSTEAD, since deleting the file without saying that just invites the
+// next person to re-add one. rover3's measured baseline, recorded HERE so this comment
+// does not depend on a sibling branch landing first — an earlier revision pointed at
+// HANDOFF.md's `## Environment` section, which at this commit does not yet contain it:
+//
+//   ArduRover V4.6.3 (3fc7011a) · ChibiOS 88b84600 · Pixhawk6C · 918 parameters
+//   measured on rover3 2026-08-10/11 by PARAM_REQUEST_READ and tlog decode, read-only
+//
+// That is a record to DIFF against, not a file to load — a replacement board should be
+// configured deliberately, not by restoring somebody else's dump. The fuller survey,
+// including the failsafe, arming, RC, servo and battery values, lands in HANDOFF.md's
+// `## Environment` section with the audit record.
+//
+// The real baseline is the flight controller's own non-volatile memory, and it is NOT in
+// version control. A replacement or factory-reset board destroys it. What this overlay
+// owns is 13 of ~918 parameters; every other value on the board is whatever it happened
+// to hold, and nothing here detects that. Measured on rover3 2026-08-10, ArduRover
+// V4.6.3 (3fc7011a) on Pixhawk6C.
+//
+// And the deleted dump was not hypothetical waste: measured 2026-08-11, rover1's flight
+// controller runs PX4 reporting MAV_TYPE_QUADROTOR with 1101 parameters in the PX4
+// namespace and zero ArduPilot names — the same shape as that file. So a PX4 dump in
+// this repo was one careless `param load` away from being applied to the wrong vehicle
+// in a fleet that genuinely contains both firmwares.
 const DEFAULT_PARAM_OVERLAY = {
   // FIRST deliberately. applyParamOverlay spaces its writes 250 ms apart, and this
   // one is the flight controller's own stale-override failsafe — until it lands,
