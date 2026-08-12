@@ -42,6 +42,15 @@ So:
 - **A routine validation commands no motion.** Committed on-target scripts must refuse
   motion by default behind an explicit opt-in flag, with the operator physically present
   and the vehicle safe to drive. Do not pass that flag as part of a normal run.
+
+  **That is a requirement on the scripts, not a property you may assume of them.**
+  `npm run test:on-target` runs `control-e2e.js`, and on `main` that script's battery
+  check is a WARNING gate rather than a motion gate — it decides whether to print a
+  warning, then arms, steers and shifts the gearbox regardless of `--allow-motion`, and
+  rover3's 0.007 V reading makes it skip even the warning. **Read a script's gate before
+  running it.** The fail-closed rewrite is on `fix/motion-gate-fails-closed`; until that
+  merges, `npm run test:on-target` on this fleet is a motion-tier action whatever its
+  name suggests.
 - Compounding factor, and the reason this matters more than a documentation slip: **this
   flight controller refuses DISARM** — 222 consecutive ARMED heartbeats after a
   "successful" disarm in one capture, `COMMAND_ACK cmd=400 result=4 (FAILED)` in another —

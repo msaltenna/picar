@@ -348,8 +348,21 @@ rover3 by the Embedded Validator, which must gather **all** of:
    steering/throttle assignment looks identical to a correct one. The clause "with no motor
    power" stood here until 2026-08-11 and is removed: a pack is installed, and this section's own
    rule is to state what you measured rather than assert what the vehicle cannot do.
-3. **WebUI end-to-end** — drive the served UI: arm, move the controls, and trip each
-   fail-safe path, confirming server-side state and telemetry respond.
+3. **WebUI end-to-end, in two tiers.** This said "arm, move the controls, and trip each
+   fail-safe path" for *every* change, which contradicted this document's own rule two
+   sections down that a routine validation commands no motion. A validator following the
+   sentence armed a packed vehicle on every merge; a validator following the rule silently
+   weakened the gate. Both readings were available, which is the defect.
+   - **Read-only tier — always required.** The page is served over HTTPS, the Socket.IO
+     connection establishes, telemetry updates in the UI, `/status` agrees with what the
+     UI shows, and the browser console is clean. Commands nothing.
+   - **Motion tier — required for any change to the control path, the fail-safe paths,
+     the driver, or the arming logic; never routine.** Arm, move the controls, and trip
+     each fail-safe path. Requires the operator physically present, the vehicle safe to
+     drive, and the battery reading quoted in the record per the rule below.
+   A validator must state **which tier it performed**, because "WebUI end-to-end"
+   unqualified reads as the second. A motion-tier change validated only read-only is
+   **unvalidated**, not partially validated.
 4. **Scripted regression suite on-target** — the checks are committed scripts under
    `test/on-target/`, runnable on the rover, so validation is repeatable rather than ad hoc.
 5. **No regressions** — `npm test` clean, and previously validated behavior still works.
