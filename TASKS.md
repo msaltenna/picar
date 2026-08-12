@@ -98,6 +98,32 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   the corruption is no longer VISIBLE through picar, which makes this task easier to forget and
   no less real. Deploy access is via the **`salt`** account, not `saltenna` — see `HANDOFF.md`.
 
+  **BASELINE CAPTURED 2026-08-12, so a reflash is now safe to do.** All **1100** parameters
+  read off the board read-only via `PARAM_REQUEST_LIST`, no motion commanded, picar stopped for
+  the duration and restarted after. Stored deliberately **outside this repo** — a PX4 dump in
+  this tree is the exact mistake `chore/remove-px4-param-dump` deleted, and `*.parm` is
+  gitignored:
+
+  - workstation `~/rover-fc-baselines/rover1-px4-2026-08-12.parm`
+  - rover1      `/home/salt/fc-baseline/rover1-px4-2026-08-12.parm`
+  - identical, `sha256:2ecbd6b31e2c2bb2…`
+
+  Board identity recorded in the file header: PX4 **v1.16.0**, `board_version` 56, `vendor_id`
+  12677, `product_id` 56, `uid` 3473490278238992185; heartbeat `autopilot=12` `type=2`,
+  DISARMED at capture. `SYS_AUTOSTART=5001`, `CA_AIRFRAME=0`.
+
+  **The two picar wrote are in there at their MODIFIED values — `RC3_DZ=30`, `RC3_TRIM=1500`.
+  The baseline therefore records the corruption, it does not undo it,** and it cannot tell you
+  what `RC3_DZ` was before picar changed it. The 10 → 30 figure comes from the 2026-08-11
+  journal (`PARAM_SET RC3_DZ=30` against a prior read of 10), which is the only record of the
+  original value. PX4's own default for that parameter is the other reference point.
+
+  **A trap for whoever restores this.** PX4 sends integer parameters BYTEWISE — the INT32 bits
+  reinterpreted as a float — so a naive read gives `SYS_AUTOSTART=7.00789e-42` instead of 5001.
+  The captured file is already decoded and carries its per-parameter type in a third column; do
+  not re-derive values from raw floats. The first dump taken today had exactly this bug and was
+  discarded.
+
 - **[P1] `params.verified` has no freshness, so stale verification can authorise motion** —
   `pwm_mavproxy_servo.js` retains `verifiedCriticalParams` until the TCP link closes and stops
   re-requesting parameters after first success. A critical parameter changed later on the SAME

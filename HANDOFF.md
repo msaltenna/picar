@@ -104,6 +104,50 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-12 (later still) — rover1's flight-controller baseline captured before reflash
+
+Both rovers are now on `main` @ `b2a891d`, identical to `origin/main`. Same code, opposite
+reports, both correct: rover3 identifies as ArduPilot GROUND_ROVER with 11/11 critical
+parameters verified; rover1 identifies as PX4 QUADROTOR with the overlay suppressed and 0
+verified.
+
+**Why rover1's overlay is suppressed, settled with evidence rather than the heartbeat flag.**
+The two rovers have the SAME hardware — Pixhawk 6C mini — so `MAV_AUTOPILOT` is not reporting
+the board; it is the firmware reporting itself, and a Pixhawk 6C is a build target for both
+ArduPilot and PX4. rover1's is flashed with **PX4 v1.16.0** (`AUTOPILOT_VERSION`, captured
+2026-08-12). The parameter namespace settles it independently: `SYS_AUTOSTART`, `CA_AIRFRAME`,
+`MC_ROLLRATE_P` and `RC_MAP_THROTTLE` are present, while `SERVO1_FUNCTION`, `FRAME_CLASS`,
+`MOT_SLEWRATE` and `RC_OVERRIDE_TIME` are **absent**. Corroborated before the deploy, when the
+old code still requested all 11 names and got back only `RC3_DZ` and `RC3_TRIM` — the two that
+exist in both namespaces, and precisely the two picar overwrote.
+
+**Baseline captured.** 1100 parameters, read-only via `PARAM_REQUEST_LIST`, no motion. picar was
+stopped for the capture because MAVProxy's `--out=tcpin:127.0.0.1:5760` has a backlog of 1 and
+picar holds the slot; it was restarted immediately after, `NRestarts=0`. Stored **outside this
+repo** — `~/rover-fc-baselines/` on the workstation and `/home/salt/fc-baseline/` on rover1,
+byte-identical, `sha256:2ecbd6b31e2c2bb2…`. Not committed, and `*.parm` is gitignored: a PX4 dump
+in this tree is the exact mistake `chore/remove-px4-param-dump` removed.
+
+**The first dump was wrong and was discarded** — worth recording because it is the same class of
+error this repo keeps hitting. PX4 sends integer parameters BYTEWISE, the INT32 bits
+reinterpreted as a float, so `SYS_AUTOSTART` read as `7.00789e-42` rather than 5001. Every
+integer parameter in that file was silently corrupt while every float was fine, which would have
+made it a plausible-looking restore file that quietly bricked configuration. The kept version
+decodes by `param_type` and carries the type per row. A second, smaller error is also recorded in
+the file's own header: it initially cited `4001` as the true value, carried over from the deleted
+`mav.parm` — a different board.
+
+**rover1 is ready to reflash to ArduRover.** Nothing in picar needs changing: once the board
+reports `MAV_AUTOPILOT=3` and `MAV_TYPE=10`, the suppression clears on the next heartbeat with no
+restart and no config edit, and the overlay re-runs. That recovery path is covered by
+`a reflashed or swapped board recovers by RE-RUNNING the overlay` in
+`test/autopilot-identity.test.js`, but it has **not** been exercised on hardware — reflashing
+rover1 would be the first time.
+
+**Still not restored:** `RC3_DZ=30` and `RC3_TRIM=1500` are in the baseline at the values picar
+wrote, so the file records the corruption rather than undoing it. The only evidence of the
+original `RC3_DZ` is the 2026-08-11 journal showing 10 before the write.
+
 ### 2026-08-12 (later) — pushed to origin, and the refusal path validated on rover1 @ `d7018b3`
 
 **`origin/main` is no longer untouched.** `948cdcc..d7018b3`, fast-forward, no rewrite and no
