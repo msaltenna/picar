@@ -24,3 +24,4 @@ graphify-out/
 .claude/settings.json.graphify-bak
 .claude/skills/graphify/
 .claude/CLAUDE.md
+.gitattributes
