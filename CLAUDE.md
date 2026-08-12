@@ -343,9 +343,14 @@ rover3 by the Embedded Validator, which must gather **all** of:
    `journalctl` (autopilot heartbeat seen, critical params verified, stream config written).
 2. **MAVLink wire verification** — observe real traffic and the Pixhawk's response
    (RC_CHANNELS_OVERRIDE out; HEARTBEAT / PARAM_VALUE / COMMAND_ACK / SERVO_OUTPUT_RAW back).
-   This proves commands reach the FC and it reacts, **without commanding motion** — it does not
-   prove the output MAPPING, because every motion channel reads 1500 µs at neutral and a swapped
-   steering/throttle assignment looks identical to a correct one. The clause "with no motor
+   Read-only, and **weaker evidence than it looks**. It shows live bidirectional traffic and
+   output present at neutral. It does **not** prove a command was delivered or acted on: the
+   recorded MAVProxy wedge had picar's writes succeeding locally while 113 KB sat unread and the
+   flight controller held its last output for over an hour, and `SERVO_OUTPUT_RAW` reads 1500 µs
+   at neutral whether the override arrived or not. A dropped-command regression satisfies every
+   part of this check. Nor does it prove the output MAPPING — a swapped steering/throttle
+   assignment is observationally identical at neutral. Claiming delivery or reaction requires a
+   causally observed output CHANGE, which is motion tier. The clause "with no motor
    power" stood here until 2026-08-11 and is removed: a pack is installed, and this section's own
    rule is to state what you measured rather than assert what the vehicle cannot do.
 3. **WebUI end-to-end, in two tiers.** This said "arm, move the controls, and trip each

@@ -102,7 +102,16 @@ A pass requires every one of these. Missing evidence is a fail, not a partial pa
   `port` — so `port` is not the last byte of a v2 payload and the formula misdecodes output 9
   onward. Reading the message as though `port` followed `time_usec` puts every servo one byte
   out, which once looked exactly like "the light does not work".
-- Verify the arm path end to end — COMMAND_LONG out, COMMAND_ACK back — and the disarm path.
+- **Arm/disarm verification is MOTION TIER, not routine.** This said "verify the arm path end
+  to end — COMMAND_LONG out, COMMAND_ACK back — and the disarm path" unconditionally, sitting
+  above a WebUI section that carefully splits read-only from motion. Every requirement here is
+  mandatory, so the unconditional wording sent a routine validation to ARM a packed rover whose
+  channel buffer is pre-loadable and whose flight controller refuses DISARM — the same defect the
+  WebUI split fixes, one requirement earlier. So:
+  - *Read-only tier:* observe PASSIVE traffic only — RC_CHANNELS_OVERRIDE going out, and
+    HEARTBEAT / SYS_STATUS / PARAM_VALUE / SERVO_OUTPUT_RAW coming back. Commands nothing.
+  - *Motion tier, operator present and the vehicle safe to drive:* the arm path end to end
+    (COMMAND_LONG out, COMMAND_ACK back) and the disarm path.
 
 **3. WebUI end-to-end — in two tiers, because this requirement contradicted itself**
 

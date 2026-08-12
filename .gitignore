@@ -6,3 +6,11 @@ picar-cfg.local.json
 mediamtx.yml
 mav.tlog
 *.tlog
+
+# Local knowledge-graph tooling output. Machine-specific, regenerated on demand,
+# and 130k lines — it must never enter a diff. See the 2026-08-12 review finding.
+graphify-out/
+.claude/settings.json
+.claude/settings.json.graphify-bak
+.claude/skills/graphify/
+.claude/CLAUDE.md
