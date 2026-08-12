@@ -361,7 +361,11 @@ if (require.main === module) (async () => {
     // failure (the drivetrain probes, disarm, setLight) were still reaching the wire.
     if (linkLost) { log(`  REFUSING ${label}: the link was already lost earlier this run`); return false; }
     try {
-      const fresh = JSON.parse((await req('GET', '/status', null, { timeoutMs: 5000 })).body);
+      // Absolute deadline, for the same reason assertSafeToCommand has one: timeoutMs is a
+      // socket-INACTIVITY timeout, so a /status that trickles a byte every 4 s postpones it
+      // forever and the re-check hangs before the most consequential action of the run.
+      const fresh = JSON.parse((await withDeadline(
+        req('GET', '/status', null, { timeoutMs: 5000 }), 5000, `re-read of /status`)).body);
       const r = hardwareReadyForMotion(fresh.telemetry);
       if (!r.ready) {
         log(`\n  REFUSING ${label}: ${r.why}`);

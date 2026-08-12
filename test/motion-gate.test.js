@@ -237,9 +237,10 @@ test('unverified critical parameters refuse motion even WITH the flag', () => {
 // untestable — a permanently degraded stub makes every section refuse on its own, so removing
 // the latch changes nothing. Measured: that mutation survived until this existed.
 function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = Infinity,
-                     degradeTo = {} } = {}) {
+                     degradeTo = {}, stallStatusAfter = Infinity } = {}) {
   const https = require('node:https');
   const bodies = [];
+  const pendingAcks = [];
   let statusReads = 0;
   const server = https.createServer(
     { key: fs.readFileSync(KEY_PATH), cert: fs.readFileSync(CRT_PATH) },
@@ -252,6 +253,10 @@ function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = In
         // to re-check hardware readiness before its second ARM.
         if (rq.url.startsWith('/status')) {
           statusReads += 1;
+          // Accept the request, send NOTHING, and never end it. A socket-inactivity timeout
+          // cannot be relied on to fire here, which is the point: only an absolute deadline
+          // ends this. Left dangling deliberately; the server is destroyed at test end.
+          if (statusReads > stallStatusAfter) return;
           const degraded = statusReads > degradeStatusAfter && statusReads <= degradeUntil;
           const t = telemetry ? (degraded ? { ...telemetry, ...degradeTo } : telemetry) : null;
           rs.writeHead(200, { 'Content-Type': 'application/json' });
@@ -262,13 +267,27 @@ function startStub({ telemetry, degradeStatusAfter = Infinity, degradeUntil = In
           return rs.end('0' + JSON.stringify({ sid: 'stubsid0000', upgrades: [],
                                                pingInterval: 25000, pingTimeout: 20000 }));
         }
+        // ACK any event that asked for one. Without this the authorised-healthy run always
+        // exits 1 because setDrivetrain times out, which made the clean-PASS path unreachable by
+        // the entire suite — a red team showed process.exit(0) could be changed to exit(1) with
+        // nothing failing. `42<ackId>[...]` is answered with `43<ackId>[...]`.
+        if (rq.method === 'POST' && /^42\d/.test(raw)) {
+          const id = raw.slice(2, raw.indexOf('['));
+          const [name, payload] = JSON.parse(raw.slice(raw.indexOf('[')));
+          // Mirror the server's contract: reject a non-endpoint shift, apply shift: 1.
+          const ok = name !== 'setDrivetrain' || (payload && payload.shift === 1);
+          pendingAcks.push('43' + id + JSON.stringify([ok ? { ok: true, shift: 1 }
+                                                          : { ok: false, error: 'invalid shift' }]));
+        }
         rs.writeHead(200, { 'Content-Type': 'text/plain' });
         // Feed the initial events the script looks for, so it reaches the motion branch with a
         // telemetry frame we control.
         if (rq.method === 'GET' && telemetry) {
-          return rs.end(['42' + JSON.stringify(['streamConfig', {}]),
-                         '42' + JSON.stringify(['telemetryConfig', { telemetryIntervalMs: 1000 }]),
-                         '42' + JSON.stringify(['telemetry', telemetry])].join('\x1e'));
+          const frames = ['42' + JSON.stringify(['streamConfig', {}]),
+                          '42' + JSON.stringify(['telemetryConfig', { telemetryIntervalMs: 1000 }]),
+                          '42' + JSON.stringify(['telemetry', telemetry])];
+          while (pendingAcks.length) frames.push(pendingAcks.shift());
+          return rs.end(frames.join('\x1e'));
         }
         rs.end('');
       });
@@ -335,6 +354,9 @@ async function runScript(args, stubOpts = {}) {
       `the script was KILLED on timeout rather than exiting; output so far:\n${result.stdout}`);
     return { ...result, bodies, code: result.err ? result.err.code : 0 };
   } finally {
+    // A stalled /status leaves a live socket, and close() waits for it forever — the teardown
+    // itself would hang, which reads as a pass.
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
     await new Promise((r) => server.close(r));
   }
 }
@@ -430,7 +452,13 @@ test('WITH the flag AND healthy hardware, the control checks DO run', async () =
   assert.ok(sent.includes('arm'), `arm was never sent; decoded: ${JSON.stringify(sent)}`);
   assert.ok(sent.includes('fromclient'), 'fromclient was never sent');
   assert.ok(sent.includes('setDrivetrain'), 'setDrivetrain was never sent');
-  assert.notEqual(r.code, 4, 'an authorised run that exercised the control path is not INCOMPLETE');
+  // EXIT 0 explicitly. A red team found the clean-PASS branch unreachable by the whole suite:
+  // every code assertion was exit-4 or exit-1, and this test's own run could never reach 0
+  // because the stub did not ack setDrivetrain. Changing process.exit(0) to exit(1) survived.
+  assert.equal(r.code, 0,
+    `an authorised, healthy, fully-exercised run must exit 0 (PASS); got ${r.code}\n${r.stdout}`);
+  assert.match(r.stdout, /E2E PASSED/);
+  assert.doesNotMatch(r.stdout, /E2E INCOMPLETE|E2E FAILED/);
 });
 
 test('a link that wedges MID-RUN refuses the second arm', async () => {
@@ -517,4 +545,24 @@ test('requiring the script does not run the suite', () => {
   const mod = require('./on-target/control-e2e.js');
   assert.equal(typeof mod.assertSafeToCommand, 'function');
   assert.equal(typeof mod.motionFlagGiven, 'function');
+});
+
+test('a /status that accepts the request and never answers cannot hang the re-check', async () => {
+  // The re-checks used a socket-INACTIVITY timeout only. A picar that accepts the connection and
+  // then sends nothing produces no inactivity to time out on in the ways that matter, and the
+  // run stalls before the first ARM — neither a refusal nor an authorisation, and no operator
+  // watching a hung script can tell which. assertSafeToCommand already had an absolute deadline;
+  // its own comment says so, and the per-section re-checks added later did not inherit it.
+  // Stall from read 2 so the battery gate's own read (read 1) still succeeds and the run reaches
+  // the section re-checks. Safe: the local stub, never a rover.
+  const r = await runScript(['--allow-motion'],
+    { telemetry: OK_TELEMETRY, stallStatusAfter: 1 });
+
+  assert.match(r.stdout, /REFUSING THE FIRST ARM: could not re-read \/status/,
+    `a never-answering /status must REFUSE, not hang; got:\n${r.stdout}`);
+  assert.match(r.stdout, /deadline/,
+    'the refusal must name the deadline, so the operator knows it was not a refusal on evidence');
+  const sent = eventsSent(r.bodies);
+  assert.ok(!sent.includes('arm'), `arm was sent despite a dead re-check; decoded: ${JSON.stringify(sent)}`);
+  assert.equal(r.code, 1, 'a re-check that could not complete is a FAILURE, not a skip');
 });
