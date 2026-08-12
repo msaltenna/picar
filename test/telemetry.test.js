@@ -682,23 +682,29 @@ test('a heartbeat arriving AFTER the grace window does not restart the chain', a
     d.startServer();
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setTimeout(r, 700));
-    assert.deepEqual(tiers, ['preIdentity', 'full'], 'precondition: grace expired and applied');
+    assert.deepEqual(tiers, ['preIdentity'], 'precondition: grace expired and REFUSED');
 
     d.parseIncoming(frameV1(MSG.HEARTBEAT, heartbeatPayload({ autopilot: 3, base_mode: 129 })));
     assert.equal(d.pixhawkHeartbeatSeen, true, 'the late heartbeat is recognised');
     assert.deepEqual(tiers, ['preIdentity', 'full'],
-      'but it must not re-apply a tier that has already gone out');
+      'and a LATE identification still releases the tier the timeout withheld');
+    d.parseIncoming(frameV1(MSG.HEARTBEAT, heartbeatPayload({ autopilot: 3, base_mode: 129 })));
+    assert.deepEqual(tiers, ['preIdentity', 'full'],
+      'but only once — at 1 Hz an unguarded release never completes a chain');
   } finally {
     if (d) stopTimers(d);
     h.restore();
   }
 });
 
-test('with NO heartbeat at all, the configuration tier is still applied', async () => {
-  // The fail-open guard on the tiering. A one-way return path — wrong sysId, broken
-  // framing, a receive path that never delivers — must not leave SERVOn_FUNCTION at a
-  // replacement board's defaults, because that is "steering drives throttle". Deferring
-  // the tier is only acceptable because this bound exists.
+test('with NO heartbeat at all, the configuration tier is REFUSED, not written blind', async () => {
+  // This test asserted the opposite until 2026-08-12 and two reviewers overturned it. Applying
+  // the tier on timeout meant the protection vanished in exactly the degraded case it was
+  // built for — a missing or slow heartbeat — recreating the measured rover1 corruption after
+  // 2 s. A timeout is not evidence of an ArduRover.
+  //
+  // The cost is real and is accepted deliberately: a genuine ArduRover with a dead RETURN path
+  // never gets its output mapping. See the comment at the refusal for why that trade is taken.
   const h = withFakeConnect();
   let d;
   try {
@@ -707,8 +713,7 @@ test('with NO heartbeat at all, the configuration tier is still applied', async 
     const warnings = [];
     const origErr = console.error;
     console.error = (...a) => warnings.push(a.join(' '));
-    try { d.applyParamOverlay = (opts) => { tiers.push((opts && opts.tier) || 'full'); }; }
-    finally { /* restored in the outer finally */ }
+    d.applyParamOverlay = (opts) => { tiers.push((opts && opts.tier) || 'full'); };
     d._restoreErr = () => { console.error = origErr; };
     let watchArmed = 0;
     d.startOverlayReassertWatch = () => { watchArmed += 1; };
@@ -718,14 +723,37 @@ test('with NO heartbeat at all, the configuration tier is still applied', async 
     assert.equal(d.identityGraceMs, 500, 'precondition: the grace window is the one set');
 
     await new Promise((r) => setTimeout(r, 700));
-    assert.deepEqual(tiers, ['preIdentity', 'full'],
-      'grace expiry must apply the configuration tier anyway, unidentified');
+    assert.deepEqual(tiers, ['preIdentity'],
+      'the configuration tier must NOT be written to an unidentified flight controller');
+    assert.equal(watchArmed, 0, 'and no reassert chain is started for writes never made');
     assert.equal(d.pixhawkHeartbeatSeen, false, 'with no autopilot heartbeat received');
-    assert.equal(watchArmed, 1, 'and the reassert watch must be armed, or a lost overlay is never retried');
-    assert.match(warnings.join('\n'), /UNIDENTIFIED flight/,
-      'and it must say so — a silent blind write is how RC3_DZ reached rover1 unremarked');
+    assert.match(warnings.join('\n'), /REFUSING the ArduRover configuration overlay/);
+    assert.equal(d.getTelemetry().firmware.identityTimedOut, true,
+      'and /status must distinguish "never identified" from "identified and refused"');
   } finally {
     if (d && d._restoreErr) d._restoreErr();
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('RC_OVERRIDE_TIME still goes out when identification times out', async () => {
+  // The half that must NOT change with the refusal above. RC_OVERRIDE_TIME is the flight
+  // controller's own stale-override failsafe; withholding it because nothing identified the
+  // board would leave ArduPilot on its 3.0 s default while picar streams overrides at 20 Hz.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false, mavproxy_identity_grace_ms: 500 });
+    const tiers = [];
+    d.applyParamOverlay = (opts) => { tiers.push((opts && opts.tier) || 'full'); };
+    d.startOverlayReassertWatch = () => {};
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 700));
+    assert.deepEqual(tiers, ['preIdentity'],
+      'the pre-identity tier must still go out, timeout or not');
+  } finally {
     if (d) stopTimers(d);
     h.restore();
   }
@@ -1130,4 +1158,37 @@ test('telemetry-loop forwards fcSupported instead of manufacturing it', () => {
   });
   assert.equal(odd.getFcTelemetry().fcSupported, undefined,
     'and an unknown driver must stay undefined so the motion gate refuses it');
+});
+
+test('a stale autopilot identity does not survive into the next connection', async () => {
+  // autopilotIdent persisted across the 2 s reconnect loop, so a prior ArduRover identity
+  // suppressed the unidentified-controller warning while a REPLACEMENT board — the exact
+  // scenario the overlay exists for — was treated as already identified.
+  //
+  // This drives the REAL close handler through withFakeConnect. A first version assigned
+  // `d.autopilotIdent = null` by hand to stand in for it, which asserted the assignment
+  // rather than the code, and deleting the reset survived it.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false });
+    d.applyParamOverlay = () => {};
+    d.startOverlayReassertWatch = () => {};
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+
+    d.parseIncoming(frameV1(MSG.HEARTBEAT, heartbeatPayload({ autopilot: 3, base_mode: 129 })));
+    assert.equal(d.getTelemetry().firmware.autopilot, 3, 'precondition: identified');
+
+    d._connect = () => {};          // do not actually reconnect
+    h.handlers.close();
+
+    assert.equal(d.autopilotIdent, null,
+      'identity is per-connection evidence and must not carry into the next link');
+    assert.equal(d.identityTimedOut, false, 'and the timeout flag resets with it');
+    assert.equal(d.deferredOverlayDone, false, 'so the next connection re-runs the tiering');
+  } finally {
+    if (d) stopTimers(d);
+    h.restore();
+  }
 });

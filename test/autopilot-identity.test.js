@@ -18,7 +18,21 @@ const assert = require('node:assert/strict');
 
 const PWMMavproxy = require('../pwm_mavproxy_servo.js');
 
-const HEARTBEAT = { id: 0, crc: 50, len: 9 };
+const HEARTBEAT   = { id: 0,  crc: 50,  len: 9 };
+const PARAM_VALUE = { id: 22, crc: 220, len: 25 };
+
+// PARAM_VALUE wire order: param_value(float32), param_count(uint16), param_index(uint16),
+// param_id(char[16]), param_type(uint8) — fields ordered by DESCENDING SIZE, not declaration
+// order, which is the trap SERVO_OUTPUT_RAW is written up for elsewhere in this repo.
+function paramValue(name, value) {
+  const p = Buffer.alloc(PARAM_VALUE.len);
+  p.writeFloatLE(value, 0);
+  p.writeUInt16LE(1, 4);
+  p.writeUInt16LE(0, 6);
+  p.write(name, 8, 16, 'ascii');
+  p[24] = 9;                       // MAV_PARAM_TYPE_REAL32
+  return p;
+}
 
 // The values under test, spelled out rather than inlined as magic numbers.
 const ARDUPILOTMEGA = 3;
@@ -441,3 +455,63 @@ test('the full tier writes and reads back everything', () => {
     `the configuration tier must go out in full (sent: ${names.join(',')})`);
   assert.ok(reads.length > 1, 'and the whole critical set is read back');
 });
+
+// ── The three fixes from the second review round ─────────────────────────────
+
+test('an explicitly DISABLED overlay is not resurrected by a heartbeat', () => {
+  // mavproxy_apply_param_overlay: false was checked only at connection setup, so a valid
+  // ArduRover heartbeat called applyDeferredOverlay and scheduled the whole thing anyway —
+  // reproduced by a reviewer as 24 overlay timers plus a reassert timer, on a rover where the
+  // operator had explicitly asked for their flight-controller configuration to be left alone.
+  const d = driver({ mavproxy_apply_param_overlay: false });
+  const applied = [];
+  d.applyParamOverlay = (opts) => applied.push((opts && opts.tier) || 'full');
+  let watchArmed = 0;
+  d.startOverlayReassertWatch = () => { watchArmed += 1; };
+
+  capturing(() => d.parseIncoming(frameV1(HEARTBEAT, heartbeat())));
+  assert.deepEqual(applied, [], 'a heartbeat must not write to a rover with the overlay off');
+  assert.equal(watchArmed, 0, 'nor start a chain to reassert writes never made');
+});
+
+test('the overlay IS applied on a heartbeat when it is enabled', () => {
+  // Negative control: without it, `if (!this.applyParamOverlayOnConnect) return` could be
+  // hardwired and no rover would ever receive its overlay.
+  const d = driver();
+  const applied = [];
+  d.applyParamOverlay = (opts) => applied.push((opts && opts.tier) || 'full');
+  d.startOverlayReassertWatch = () => {};
+  capturing(() => d.parseIncoming(frameV1(HEARTBEAT, heartbeat())));
+  assert.deepEqual(applied, ['full']);
+});
+
+test('a read-back from a REFUSED controller cannot re-enter the verified set', () => {
+  // The mismatch handler clears verifiedCriticalParams once. Without quarantine the next
+  // PARAM_VALUE put entries straight back — reproduced by a reviewer as verified:["RC3_DZ"]
+  // after a PX4 heartbeat, because RC3_* is shared with PX4's namespace and a delayed reply
+  // from the cancelled chain still arrives. EXPECTED_CRITICAL_PARAMS describes an ArduRover;
+  // a value read from something else does not verify it, whatever the number says.
+  const d = driver();
+  capturing(() => d.parseIncoming(
+    frameV1(HEARTBEAT, heartbeat({ autopilot: PX4, type: QUADROTOR }))));
+  assert.equal(d.overlaySuppressed, true, 'precondition');
+
+  capturing(() => d.parseIncoming(frameV1(PARAM_VALUE, paramValue('RC3_DZ', 30))));
+  assert.deepEqual(d.getTelemetry().params.verified, [],
+    'a shared parameter read from a foreign board must not count as verified');
+});
+
+test('a read-back from a GOOD controller still verifies', () => {
+  // Negative control for the quarantine: hardwiring the early return would mean nothing ever
+  // verifies on any rover, and params.missing would stay full forever.
+  const d = driver();
+  capturing(() => d.parseIncoming(frameV1(HEARTBEAT, heartbeat())));
+  capturing(() => d.parseIncoming(frameV1(PARAM_VALUE, paramValue('RC3_DZ', 30))));
+  assert.deepEqual(d.getTelemetry().params.verified, ['RC3_DZ']);
+});
+
+// NOTE: "a stale identity does not survive into the next connection" lives in
+// test/telemetry.test.js, not here. Written here first, it set `d.autopilotIdent = null`
+// by hand to stand in for the close handler — so it asserted what it had just assigned, and
+// deleting the real reset survived it. telemetry.test.js has withFakeConnect(), which drives
+// the actual close handler.

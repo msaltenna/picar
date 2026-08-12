@@ -384,6 +384,9 @@ class PWMMavproxy {
       ? Math.min(10000, Math.max(500, graceMs)) : 2000;
     this.identityGraceTimer  = null;
     this.deferredOverlayDone = false;
+    // Reported on /status: the configuration tier was withheld because nothing identified
+    // the board. Distinct from overlaySuppressed, which means we identified it and refused.
+    this.identityTimedOut    = false;
 
     // Latest decoded telemetry. Each entry carries its own `at` timestamp so a
     // reader can tell a live reading from a stale one — reporting a last-known
@@ -559,12 +562,17 @@ class PWMMavproxy {
         this.overlayReassertTimer = null;
       }
       // Per-connection, unlike overlaySuppressed: a new link may be a different flight
-      // controller, so the next connect re-runs the tiering from the start.
+      // controller, so the next connect re-runs the tiering from the start. autopilotIdent
+      // goes with it — a stale identity from the PREVIOUS connection is not evidence about
+      // the board on this one, and leaving it set suppressed the unidentified warning while
+      // a replacement controller was configured on the strength of it.
+      this.autopilotIdent = null;
       if (this.identityGraceTimer) {
         clearTimeout(this.identityGraceTimer);
         this.identityGraceTimer = null;
       }
       this.deferredOverlayDone = false;
+      this.identityTimedOut    = false;
       this.paramOverlayApplied = false;
       this.verifiedCriticalParams.clear();
       this.paramVerificationFailures.clear();
@@ -984,12 +992,28 @@ class PWMMavproxy {
       // mutation could not kill it. The branch below decides only what to WARN.
       if (this.overlaySuppressed) return;
       if (!this.autopilotIdent) {
+        // REFUSE, do not write. This applied the configuration tier anyway, which meant the
+        // new protection vanished in exactly the degraded case it was built for — a missing
+        // or slow heartbeat — recreating the measured rover1 corruption after 2 s. Two
+        // reviewers called it the same way and they are right: a timeout is not evidence of
+        // an ArduRover.
+        //
+        // THE COST, stated because it is real and this is the trade: a genuine ArduRover
+        // whose RETURN path is dead never receives its output mapping, so SERVOn_FUNCTION
+        // stays at whatever a replacement board holds and steering can drive throttle. That
+        // is a hazard. It is accepted over the alternative because the alternative is
+        // MEASURED — picar wrote RC3_DZ 10 -> 30 into rover1's PX4 board — while this one
+        // requires an outbound-only link, has never been observed, and is now loud on the
+        // console and visible in /status. RC_OVERRIDE_TIME has already gone out either way,
+        // so the flight controller's own stale-override failsafe is correct regardless.
         console.error(
-          `MAVProxy: WARNING no autopilot heartbeat within ${this.identityGraceMs} ms — ` +
-          `applying the ArduRover configuration overlay to an UNIDENTIFIED flight ` +
-          `controller. If this board is not an ArduRover, parameters shared with its ` +
-          `firmware's namespace WILL be overwritten. Check SYSID_THISMAV and ` +
-          `mavproxy_target_system.`);
+          `MAVProxy: REFUSING the ArduRover configuration overlay — no autopilot heartbeat ` +
+          `within ${this.identityGraceMs} ms, so this flight controller is UNIDENTIFIED. ` +
+          `Output mapping (SERVOn_FUNCTION, FRAME_CLASS, RCMAP_*) has NOT been written and ` +
+          `may be wrong; RC_OVERRIDE_TIME was written on connect. Treat every critical ` +
+          `parameter as unverified and check SYSID_THISMAV and mavproxy_target_system.`);
+        this.identityTimedOut = true;
+        return;
       }
       this.applyDeferredOverlay();
     }, this.identityGraceMs);
@@ -999,6 +1023,13 @@ class PWMMavproxy {
   // reassert chain — its interval floor is derived from the chain length, so it must not
   // be armed before the chain it is checking has started.
   applyDeferredOverlay() {
+    // Honour the DISABLE switch here, not only in _connect. `mavproxy_apply_param_overlay:
+    // false` was checked once at connection setup, and then a valid ArduRover heartbeat
+    // called this and scheduled the whole overlay anyway — reproduced by a reviewer as 24
+    // overlay timers plus a reassert timer on a rover where the operator had explicitly
+    // asked for their flight-controller configuration to be left alone. Frame, servo mapping
+    // and control parameters would have been overwritten regardless of the setting.
+    if (!this.applyParamOverlayOnConnect) return;
     if (this.deferredOverlayDone) return;
     this.deferredOverlayDone = true;
     if (this.identityGraceTimer) {
@@ -1418,6 +1449,13 @@ class PWMMavproxy {
       const nameRaw = payload.subarray(8, 24).toString('ascii');
       const name = nameRaw.replace(/\0.*$/, '').trim();
       if (Object.prototype.hasOwnProperty.call(EXPECTED_CRITICAL_PARAMS, name)) {
+        // QUARANTINE read-backs from a flight controller we have refused. The mismatch
+        // handler clears verifiedCriticalParams ONCE; without this, the next PARAM_VALUE put
+        // entries straight back — reproduced by a reviewer as `verified: ["RC3_DZ"]` after a
+        // PX4 heartbeat, because RC3_* is shared with PX4's namespace and a delayed reply
+        // from the cancelled chain still arrives. EXPECTED_CRITICAL_PARAMS describes an
+        // ArduRover; a value read from something else does not verify it, whatever it says.
+        if (this.overlaySuppressed) return;
         const expected = EXPECTED_CRITICAL_PARAMS[name];
 
         let actual = value;
@@ -1550,6 +1588,10 @@ class PWMMavproxy {
         type:      this.autopilotIdent ? this.autopilotIdent.type : null,
         mismatch:  this.firmwareMismatch,
         overlaySuppressed: this.overlaySuppressed,
+        // True when the configuration tier was WITHHELD for lack of any identification, as
+        // opposed to refused after identifying a foreign board. The operator needs to tell
+        // those apart: this one usually means the return path is broken.
+        identityTimedOut: this.identityTimedOut,
       },
       params: {
         verified: [...this.verifiedCriticalParams].sort(),
