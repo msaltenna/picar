@@ -1311,11 +1311,21 @@ the only rover to deploy to unless told otherwise.
 > against unmeasured consumption, so it is not an independent reading either, and MAVProxy
 > logs "Flight battery 100 percent" from the same non-fact.
 >
-> Consequence for the on-target scripts: `test/on-target/control-e2e.js:107` gates motion on
-> `b.voltageV > 3`. With the sense reading 0.007 V that guard concludes "no battery" and skips
-> — which fails safe for the script, but means **the guard cannot currently distinguish a
-> disconnected pack from a broken sense.** Do not reason from it, and do not reason from
-> `/status` voltage, until the sense is fixed. Both are open in `TASKS.md`.
+> Consequence for the on-target scripts, and read this before running anything:
+> `test/on-target/control-e2e.js:107` is a WARNING gate, not a motion gate. With the sense
+> reading 0.007 V it concludes "no battery" and `return`s — **skipping the warning and then
+> arming, steering and shifting the gearbox anyway, with or without `--allow-motion`.**
+>
+> An earlier revision of this paragraph called that "fails safe for the script". **That is
+> withdrawn: it fails OPEN.** The broken reading removes the one thing that would have told
+> the operator to stop, on a rover with a pack installed and a flight controller that
+> refuses DISARM. The same wrong wording was in `TASKS.md` and is corrected there too.
+>
+> It also **cannot distinguish a disconnected pack from a broken sense**, which is the
+> reasoning error that produced the 2026-08-05 throttle probe. Do not reason from it, and do
+> not reason from `/status` voltage, until the sense is fixed. The fail-closed rewrite is on
+> `fix/motion-gate-fails-closed`; until it merges, treat `npm run test:on-target` as a
+> motion-tier action. Both are open in `TASKS.md`.
 >
 > What to do instead: look at the pack and the connector, physically. If a change cannot be
 > proven without actuation, report it unvalidated and stop.
@@ -1407,11 +1417,18 @@ Parse the tlog instead of attaching. The version matters because parameter *name
 releases: `GPS1_TYPE` exists and `GPS_TYPE` does not, and `SYSID_MYGCS` exists while
 `MAV_GCS_SYSID` does not, so 4.6.3 is the naming era this fleet is in.
 
-**The autopilot speaks MAVLink v2 only.** In a 200 kB live tail: 48 autopilot HEARTBEATs as v2
-(`0xFD`), **zero** as v1. picar's own traffic is v1 (`0xFE`, msgid 70 `RC_CHANNELS_OVERRIDE`
-×955). MAVProxy is therefore translating v2→v1 for picar's link, which is the only reason picar —
-whose parser drops v2 — sees heartbeats at all. Anything that changes MAVProxy's link handling can
-silently take picar's telemetry with it.
+**The autopilot speaks MAVLink v2 on the link that was captured.** In a 200 kB live tail: 48
+autopilot HEARTBEATs as v2 (`0xFD`), **zero** as v1. picar's own OUTBOUND traffic is v1 (`0xFE`,
+msgid 70 `RC_CHANNELS_OVERRIDE` ×955).
+
+**Do not read a translation dependency into that.** An earlier revision of this paragraph said
+MAVProxy "is therefore translating v2→v1 for picar's link, which is the only reason picar — whose
+parser drops v2 — sees heartbeats at all." Both halves are wrong. `parseIncoming` on `main`
+accepts `0xFE` **and** `0xFD`, validates CRCs on both, zero-extends v2 payloads and filters source
+IDs — this document says so itself under Current state. And the capture is of the FC-side link,
+which establishes nothing about what MAVProxy delivers on picar's TCP socket. The false version
+invited someone to "fix" a dependency that does not exist, or to regress the hardened parser to
+match it.
 
 **rover3's measured parameter baseline (2026-08-11).** Keep this: it is the first real baseline
 this project has had, and it replaces `mav.parm`, which was a **PX4 quadcopter dump** (1101

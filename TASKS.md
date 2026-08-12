@@ -300,11 +300,14 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   `BATT_VOLT_PIN=8`, `BATT_VOLT_MULT=18.18`, so it is an analog sense whose voltage side appears
   dead. `remainingPct` is arithmetic from `BATT_CAPACITY=3300` against unmeasured consumption, so
   it is not independent, and MAVProxy logs "Flight battery 100 percent" from the same non-fact.
-  **`test/on-target/control-e2e.js:107` gates motion on `b.voltageV > 3`** — with the sense at
-  0.007 V that guard reads "no battery" and skips. It fails safe for the script, but it cannot
-  distinguish a disconnected pack from a broken sense, which is the exact reasoning error that
-  produced the 2026-08-05 throttle probe. Fix the sense, and make the guard require a *positive*
-  determination rather than treating an implausible reading as "safe".
+  **`test/on-target/control-e2e.js:107` is a WARNING gate, not a motion gate** — with the sense
+  at 0.007 V it reads "no battery" and `return`s, skipping the warning and then arming, steering
+  and shifting the gearbox anyway, with or without `--allow-motion`. An earlier revision of this
+  entry said it "fails safe for the script"; **that is withdrawn — it fails OPEN**, and the same
+  wrong wording was in `HANDOFF.md`. It also cannot distinguish a disconnected pack from a broken
+  sense, which is the exact reasoning error that produced the 2026-08-05 throttle probe. Fix the
+  sense, and make the guard require a *positive* determination rather than treating an
+  implausible reading as "safe" (the rewrite is on `fix/motion-gate-fails-closed`).
 
 - **[P0] picar releases the mode channel, so it cannot recover the vehicle from Hold** —
   `pwm_mavproxy_servo.js:298` allocates `channels = new Uint16Array(8)` and assigns only indices
@@ -1189,16 +1192,32 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   actually written: **`RC3_DZ` went 10 → 30 on a PX4 flight controller**, confirmed by
   `PARAM_SET RC3_DZ=30` → `verified RC3_DZ=30` in the journal.
 
-  So picar silently reconfigures a flight controller it has not identified. The driver already
-  decodes `HEARTBEAT.autopilot` and `HEARTBEAT.type`; nothing consults them before
-  `applyParamOverlay()`. Fix: gate the overlay on `MAV_AUTOPILOT_ARDUPILOTMEGA`, refuse to push
-  anything otherwise, and say so loudly on `/status` — a rover whose firmware the overlay does
-  not model should report that, not appear to be a rover with 9 missing parameters. Note the
-  deleted tracked `mav.tlog` uniquely records 18 ArduPilot parameter writes sent to a PX4 board;
-  preserve it outside the repo before any authorized history rewrite.
+  So picar silently reconfigures a flight controller it has not identified.
+
+  **This entry said "the driver already decodes `HEARTBEAT.autopilot` and `HEARTBEAT.type`".
+  That was wrong and a reviewer caught it.** On `main`, `payload[5]` is only compared against 8
+  (is-it-a-GCS) and then discarded, and `payload[4]` — MAV_TYPE — is never read ANYWHERE in the
+  driver. So the fix cannot be "consult what is already decoded"; the decoding has to be written,
+  retained, and tested against both a PX4 and an ArduPilot heartbeat. Implementing the old
+  wording as written would have left the P0 open while looking closed.
+
+  The second trap in the naive fix: the overlay runs on **connect**, before any heartbeat can
+  have arrived, and that is deliberate — `_connect` documents why gating it on the heartbeat is
+  fail-OPEN. So identification cannot gate the first write without reintroducing that. The
+  overlay has to be split: the flight controller's own stale-override failsafe
+  (`RC_OVERRIDE_TIME`) goes out immediately whatever is on the other end, and the
+  vehicle-CONFIGURATION entries wait for identification — bounded, so a one-way link still gets
+  its output mapping rather than leaving `SERVOn_FUNCTION` at a replacement board's defaults.
+
+  Report the mismatch on `/status`: a rover whose firmware the overlay does not model should say
+  so, not appear to be a rover with 9 missing parameters. Note the deleted tracked `mav.tlog`
+  uniquely records 18 ArduPilot parameter writes sent to a PX4 board; preserve it outside the
+  repo before any authorized history rewrite.
 
   Raised as a blocking finding against `fix/overlay-merges-not-replaces`; scoped to its own
   branch on operator instruction because it is new safety logic rather than a correction.
+  **Implemented on `fix/identify-autopilot-before-overlay`** — not yet reviewed at its current
+  SHA and not validated on hardware, so this entry stays open until that branch lands.
 
 - **[P1] `test/on-target/control-e2e.js` should export a `run()` driven by an injected request
   transcript** — deferred from `fix/motion-gate-fails-closed` on operator instruction, and
