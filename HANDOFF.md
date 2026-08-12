@@ -104,6 +104,68 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-12 — six branches merged to local main, validated on rover3 @ `658f5d90`
+
+**What landed**, in merge order, all to **local `main` only — `origin` is untouched and nothing
+is pushed**: `chore/remove-px4-param-dump`, `fix/motion-gate-fails-closed`,
+`chore/validator-battery-premise`, `fix/overlay-allowlist`, `chore/record-audit-2026-08-11`,
+`fix/identify-autopilot-before-overlay`.
+
+**The substantive change is the two-tier parameter overlay.** picar pushed its ArduRover overlay
+at whatever answered on :5760, never reading `HEARTBEAT.type` (payload[4] was not read anywhere
+in the driver) and testing `HEARTBEAT.autopilot` only for "not a GCS". Measured consequence on
+rover1, 2026-08-11: all 13 ArduPilot names went to a **PX4** board; nine were rejected, but
+`RC3_DZ` and `RC3_TRIM` exist in both namespaces and were written — `RC3_DZ` 10 → 30 — and the
+read-back reported them **verified**. The overlay is now split: `RC_OVERRIDE_TIME` (the flight
+controller's own stale-override failsafe) goes out on connect unconditionally, and everything
+else waits for the autopilot to identify itself as ArduPilot with `MAV_TYPE` in
+{GROUND_ROVER, SURFACE_BOAT}. If nothing identifies it within `mavproxy_identity_grace_ms`
+(default 2000, clamped 500–10000) the configuration tier is **refused**, not written blind.
+
+**VALIDATION: PASS (read-only tier), rover3, 2026-08-12 17:57–18:0x BST, at `658f5d90`** — the
+exact SHA merged, deployed by `git bundle` rather than through `origin`.
+
+| Evidence | Result |
+| --- | --- |
+| Services | `picar`, `mavproxy`, `mediamtx` active; `NRestarts=0` |
+| Two-tier overlay | `Applying the pre-identity param overlay (1 of 13)` → `Received first Pixhawk heartbeat (sys=1 MAVLink 2)` → full overlay → `parameter overlay confirmed by read-back`, all inside ~7 s |
+| Identification | `/status` `firmware: {autopilot: 3, type: 10, mismatch: null, overlaySuppressed: false, identityTimedOut: false}` — correctly identifies rover3 as an ArduRover GROUND_ROVER |
+| `fcSupported` | now `true` on the wire. It was never emitted before, so the motion gate's `fcSupported === true` refused on every rover and `--allow-motion` could not pass on hardware at all |
+| Critical params | 11 verified, 0 missing, 0 mismatched; `FRAME_CLASS=1` read back |
+| Motion gate | `npm run test:on-target` → **exit 4 INCOMPLETE**, all five motion groups SKIPPED, nothing armed. This is the gate failing closed on real hardware |
+| `telemetry.sh` | exit 0, PASSED WITH WARNINGS; footer reports `BATTERY MEASURED AT 7.31 V drawing 0.44 A. A PACK IS CONNECTED — ASSUME THE WHEELS CAN TURN` |
+| Host suite on target | **385 pass, 0 fail** |
+
+**WHAT THIS VALIDATION DOES NOT COVER, and it matters.** This is the **read-only tier** as newly
+defined in `CLAUDE.md`. No motion was commanded: nothing armed, no steering, no drivetrain shift,
+no watchdog expiry, no light. By this session's own new rule, `fix/motion-gate-fails-closed` and
+`fix/identify-autopilot-before-overlay` are **control-path changes and therefore require the
+motion tier**, so they are **read-only validated only** — which the same rule defines as
+UNVALIDATED for their purpose. They were merged anyway on explicit operator instruction to merge
+on review pass. That is a real, deliberate departure from the gate and it is recorded here rather
+than smoothed over.
+
+**Also unvalidated by construction:** every refusal path. rover3 is a healthy ArduRover, so the
+PX4 suppression, the SURFACE_BOAT repair path and the identity timeout were exercised only by
+host tests. The one rover that would exercise them is rover1, which was unreachable all day.
+
+**Second Opinion:** every branch went through Codex adversarial review, most through two or three
+rounds; **13 findings across the first round alone** (one critical, nine high). All were fixed —
+see the individual commit bodies, which record what each round found and, where I disagreed, why.
+**No branch carries a `Reviewed-by:` trailer except `chore/remove-px4-param-dump`**, because every
+other tip moved after its last review to fix that review's findings, and an ancestor's review is
+not coverage for amended safety code.
+
+**Rover state left behind:** rover3 is on a local branch `deploy-main` @ `658f5d90`, NOT on
+`main` and NOT on the branch it started the day on (`fix/webrtc-require-udp` @ `370d39da`). Its
+untracked `picar-cfg.local.json` is preserved. `/tmp/main.bundle` was left in place.
+
+**A measurement that contradicts the record:** rover3's battery sense read **7.32 V at 0.46 A**
+all day. The 2026-08-11 finding of 0.007 V while current read 0.54 A did not reproduce after the
+rover's modifications. Either it was repaired or it is intermittent; those have very different
+consequences for every script that branches on plausibility, and it is filed in `TASKS.md`.
+
+
 Newest first.
 
 > **EVERY ACTUATION DISCLAIMER BELOW DATED BEFORE 2026-08-05 IS VOID.** Entries here say things
@@ -1377,9 +1439,18 @@ deploying a branch moves it, so record what it came from first. Identity is untr
 
 **The rover's clock is Europe/London (BST, +0100); the dev workstation is EDT (−0400).** Both
 agree in UTC. Local timestamps in journals and `ls` output are therefore **five hours ahead of
-workstation local time** — a log line reading "Aug 10 23:09" is 18:09 EDT the same day. Reading a
-rover timestamp as workstation-local makes a fresh file look ~5 h stale, and this session very
-nearly recorded a live tlog as frozen on exactly that mistake.
+workstation local time** — a log line reading "Aug 10 23:09" is 18:09 EDT the same day.
+
+**The failure direction was stated backwards here until 2026-08-12, and the correct one is the
+dangerous one.** Misreading a rover timestamp as workstation-local does NOT make a fresh file look
+stale. It makes a fresh file look ~5 h **in the future** — obvious, and self-correcting. What it
+actually does is make a file that is genuinely **five hours stale look current**, which is not
+obvious at all. That is the direction that hides a frozen tlog or a wedged MAVProxy: the exact
+observability failure this fleet has already had.
+
+So do not compare local timestamps. **Compare in UTC** (`date -u`, `ls --time-style=full-iso`,
+`journalctl --utc`), or establish freshness by sampling a file's SIZE twice a few seconds apart —
+which `test/on-target/telemetry.sh` does, and which no clock error can fake.
 
 **MAVProxy's tlogs are 450 MB in tmpfs and growing (measured 2026-08-11).**
 `/tmp/mav.tlog` 272 MB + `/tmp/mav.tlog.raw` 178 MB, growing ~3–4 KB/s (measured by sampling the

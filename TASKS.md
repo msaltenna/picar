@@ -13,10 +13,21 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ## In progress
 
-- **[P0] Nine branches are open, ALL reviewed, NONE cleared, NONE validated** (2026-08-11, second
-  session). Every one is local, unpushed, carries no `Reviewed-by:` trailer and has no Embedded
-  Validator pass. **rover3 has not been deployed to at all** — it is still on
-  `fix/webrtc-require-udp` @ `370d39da`, so nothing here has run on hardware.
+- **[P1] Four branches remain open; this ledger is a HISTORICAL record, not a claim about
+  current tips** (rewritten 2026-08-12). Six merged to local main on 2026-08-12 with on-rover
+  evidence recorded in `HANDOFF.md`. **`origin` is untouched and nothing is pushed.**
+
+  The heading said "Nine branches, ALL reviewed", which a reviewer correctly called false:
+  several tips had advanced past their reviewed SHA, and `fix/identify-autopilot-before-overlay`
+  was absent from the table while the same diff recorded it as unreviewed. Treating an ancestor's
+  review as coverage for amended safety code is how the Second Opinion stage gets skipped without
+  anyone deciding to. **Reviewed SHA and current SHA are separate below, and a moved tip is
+  PENDING RE-REVIEW whatever its ancestor scored.**
+
+  Still open, none validated, none pushed: `fix/verify-gps-disable-params` @ `66df00c`,
+  `fix/align-steering-rc-range` @ `add9294`, `feature/fc-failsafe-params` @ `583f18c`,
+  `fix/systemd-restart-limits` @ `b2ef26e`, and the parked, never-reviewed
+  `fix/webrtc-require-udp` @ `370d39d`.
 
   Codex verdicts, one review per branch, each in its own detached `git worktree`:
 
@@ -72,6 +83,43 @@ Open work only. Completed tasks are **deleted** from this file — their record 
   the network first. rover3 has no gearbox, so this cannot be reproduced there at all.
 
 ## Backlog
+
+- **[P0] rover1's PX4 flight controller still holds parameters picar wrote to it** — measured
+  2026-08-11: `RC3_DZ` went **10 → 30** and `RC3_TRIM` was written, on a board running PX4 with
+  1101 parameters in the PX4 namespace. `fix/identify-autopilot-before-overlay` stops FUTURE
+  writes; nothing restores what was already changed, and closing the firmware-gating P0 on the
+  guard alone would leave rover1 operating from a corrupted baseline. Capture rover1's current
+  parameters, restore `RC3_DZ=10` and `RC3_TRIM` to its authoritative prior value, read both
+  back, and record the rover's exact checkout and controller state. **rover1 was unreachable
+  (no SSH, no ICMP) from 2026-08-12; it resolves to 192.168.31.168.**
+
+- **[P1] `params.verified` has no freshness, so stale verification can authorise motion** —
+  `pwm_mavproxy_servo.js` retains `verifiedCriticalParams` until the TCP link closes and stops
+  re-requesting parameters after first success. A critical parameter changed later on the SAME
+  connection stays reported verified indefinitely, and `hardwareReadyForMotion` in
+  `test/on-target/control-e2e.js` treats that set as current evidence. Add per-parameter
+  verification timestamps, a bounded on-demand read-back before each state-changing section, and
+  fail closed on timeout or staleness. Raised twice by review against the motion gate.
+
+- **[P1] The fail-safe stop cannot be confirmed, only requested** — `app.js` zeroes its local
+  `steering`/`throttle` BEFORE attempting `neutralizeAndDisarm()`, so `/status` reads neutral even
+  when the MAVProxy write fails, the link wedges, or the flight controller keeps its last output.
+  `control-e2e.js`'s final stop now says so explicitly rather than claiming the vehicle stopped,
+  but the real fix is the handler returning `neutralSent`/`disarmSent` plus fresh MAVLink
+  evidence. This is the "a successful write() is not proof of delivery" P0 in its most
+  consequential form.
+
+- **[P1] `setDrivetrain` revalidates nothing before actuating** — the on-target script checks
+  readiness once, then production waits a further ~1 s settle before moving the gearbox. A client
+  precheck cannot close that race; the server handler must revalidate link and heartbeat
+  freshness immediately before actuation and cancel on link loss.
+
+- **[P2] rover3's battery voltage sense read 7.32 V on 2026-08-12, not 0.007 V** — the broken-
+  sense finding recorded on 2026-08-11 did not reproduce after the rover's modifications. Either
+  it was repaired or it is intermittent, and the two have very different consequences for every
+  script that branches on plausibility. Re-measure across a few power cycles and settle which,
+  then correct the several places that describe the sense as broken.
+
 
 ### P0 — safety and security
 
