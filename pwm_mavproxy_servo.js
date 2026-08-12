@@ -8,7 +8,7 @@ const {
   overlayChainMs, clampOverlayReassert, clampOverlayAttempts,
   // The schedule below is driven by these, shared with the bound that depends on it.
   OVERLAY_WRITE_SPACING_MS, OVERLAY_SETTLE_MS, OVERLAY_READ_SPACING_MS,
-  sanitizeParamOverlay,
+  sanitizeParamOverlay, OVERRIDABLE_PARAMS,
 } = require('./config-bounds');
 
 const MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE = 70;
@@ -117,7 +117,42 @@ const TELEMETRY_STALE_MS = 3000;
 // Keep trims/endpoints in picar-config.json; only fix params that are out of line.
 // These are pushed on every MAVProxy connect so a fresh/replacement flight
 // controller (e.g. Pixhawk 6C mini) gets the right output mapping without
-// needing to load mav.parm by hand.
+// needing a parameter file loaded by hand.
+//
+// This comment used to name `mav.parm` as that hand-load fallback. That file was a
+// PX4 QUADCOPTER dump — MAV_TYPE 2, SYS_AUTOSTART 4001, CA_AIRFRAME, MC_ROLLRATE_P,
+// _HASH_CHECK, and zero ArduPilot-only parameters (no SERVOn_FUNCTION, no
+// FRAME_CLASS, no MOT_SLEWRATE). Loading it onto this ArduRover would have had 1028
+// of its 1101 names rejected while 72 shared RC entries applied, including
+// RC3_DZ=10 silently overwriting the 30 pushed below, and RC1_MIN/MAX reset to
+// quadcopter values that no read-back covers. It has been deleted rather than
+// corrected: a wrong baseline is worse than no baseline.
+//
+// WHAT TO USE INSTEAD, since deleting the file without saying that just invites the
+// next person to re-add one. rover3's measured baseline, recorded HERE so this comment
+// does not depend on a sibling branch landing first — an earlier revision pointed at
+// HANDOFF.md's `## Environment` section, which at this commit does not yet contain it:
+//
+//   ArduRover V4.6.3 (3fc7011a) · ChibiOS 88b84600 · Pixhawk6C · 918 parameters
+//   measured on rover3 2026-08-10/11 by PARAM_REQUEST_READ and tlog decode, read-only
+//
+// That is a record to DIFF against, not a file to load — a replacement board should be
+// configured deliberately, not by restoring somebody else's dump. The fuller survey,
+// including the failsafe, arming, RC, servo and battery values, lands in HANDOFF.md's
+// `## Environment` section with the audit record.
+//
+// The real baseline is the flight controller's own non-volatile memory, and it is NOT in
+// version control. A replacement or factory-reset board destroys it. What this overlay
+// owns is 13 of ~918 parameters; every other value on the board is whatever it happened
+// to hold, and nothing here detects that. Measured on rover3 2026-08-10, ArduRover
+// V4.6.3 (3fc7011a) on Pixhawk6C.
+//
+// And the deleted dump was not hypothetical waste: measured 2026-08-11, rover1's flight
+// controller runs PX4 reporting MAV_TYPE_QUADROTOR with 1101 parameters in the PX4
+// namespace and zero ArduPilot names — the same shape as that file. So a PX4 dump in
+// this repo was one careless `param load` away from being applied to the wrong vehicle
+// in a fleet that genuinely contains both firmwares.
+
 // Which overlay entries may be written BEFORE the autopilot has identified itself.
 //
 // Only RC_OVERRIDE_TIME, and it stays here for the reason _connect gives at length: it is
@@ -228,18 +263,34 @@ class PWMMavproxy {
     // picar-cfg.local.json, so a typo here silently disables the overlay that
     // corrects FRAME_CLASS. See sanitizeParamOverlay() for the two shapes that
     // did exactly that.
-    const overlayCheck = sanitizeParamOverlay(config.mavproxy_param_overlay, DEFAULT_PARAM_OVERLAY);
+    // OVERRIDABLE_PARAMS is an ALLOWLIST and is currently empty, so untracked config cannot
+    // change any parameter this driver pushes. An earlier version of this passed
+    // EXPECTED_CRITICAL_PARAMS as a blacklist, which let through everything outside that
+    // 11-name table — including RCMAP_THROTTLE, which decides which channel IS the throttle.
+    const overlayCheck = sanitizeParamOverlay(
+      config.mavproxy_param_overlay,
+      DEFAULT_PARAM_OVERLAY,
+      OVERRIDABLE_PARAMS
+    );
     this.paramOverlay = overlayCheck.overlay;
     for (const bad of overlayCheck.rejected) {
       console.error(`MAVProxy: REJECTED mavproxy_param_overlay entry — ${bad}`);
     }
-    if (overlayCheck.rejected.length && overlayCheck.usedFallback) {
-      console.error('MAVProxy: falling back to the built-in critical-parameter overlay');
+    // Fires whenever nothing the operator supplied survived, not only on a bad outer shape —
+    // the previous `usedFallback` flag was false for a well-formed object whose every entry
+    // was rejected, so the one case where the message matters most stayed silent.
+    if (overlayCheck.rejected.length && !overlayCheck.applied.length) {
+      console.error('MAVProxy: no mavproxy_param_overlay entry survived validation — ' +
+                    'using the built-in critical-parameter overlay unchanged');
     }
+    // Now reachable only if DEFAULT_PARAM_OVERLAY itself is empty, since the sanitizer merges
+    // over it rather than replacing it. Kept as a guard against that being emptied by mistake:
+    // an overlay that pushes nothing makes every read-back confirm whatever the flight
+    // controller already holds, which is how rover3 came to run as a boat.
     if (Object.keys(this.paramOverlay).length === 0) {
-      console.error('MAVProxy: mavproxy_param_overlay is EMPTY — NO critical parameters ' +
-                    'will be pushed, and every read-back will confirm whatever the flight ' +
-                    'controller already holds');
+      console.error('MAVProxy: the critical-parameter overlay is EMPTY — NO critical ' +
+                    'parameters will be pushed, and every read-back will confirm whatever ' +
+                    'the flight controller already holds');
     }
 
     this.applyParamOverlayOnConnect = config.mavproxy_apply_param_overlay !== false;
@@ -1472,6 +1523,15 @@ class PWMMavproxy {
       battery: fresh(this.telemetry.battery) ? { ...this.telemetry.battery } : null,
       power:   fresh(this.telemetry.power)   ? { ...this.telemetry.power }   : null,
       radio:   fresh(this.telemetry.radio)   ? { ...this.telemetry.radio }   : null,
+      // This driver IS the flight-controller driver. telemetry-loop emits
+      // `{ fcSupported: false }` for the four GPIO drivers, which have no getTelemetry at
+      // all, and forwards this object unchanged otherwise — so without this the field was
+      // simply ABSENT on every rover. Anything reading `fcSupported === true` therefore saw
+      // undefined and refused: control-e2e's motion gate could never authorise motion on
+      // real hardware, and only passed in host tests because they synthesised the field.
+      // Emitted rather than defaulted at the reader, because `undefined` must keep meaning
+      // "unknown driver, refuse" there.
+      fcSupported: true,
       linkUp:  !!(this.client && !this.client.destroyed),
       // Coerced: `fresh()` short-circuits to null on a missing entry, and a
       // consumer checking this field deserves a boolean, not null-vs-false.

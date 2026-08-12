@@ -37,8 +37,12 @@ Read `CLAUDE.md` for the git rules and `HANDOFF.md` for access details.
 
 ## Deploying to rover3
 
-rover3 is the only deploy target unless told otherwise. It is powered but **has no flight
-battery**, so nothing actuates.
+rover3 is the only deploy target unless told otherwise. **Assume it CAN MOVE — a flight
+battery is installed, and this flight controller refuses DISARM.** This paragraph said "it
+is powered but has no flight battery, so nothing actuates" until 2026-08-11; that was false,
+`CLAUDE.md` reversed the premise on 2026-08-05, and it was acted on. A deploy restarts
+services on a vehicle that may be armed with a throttle value still in the channel buffer,
+so treat a restart as a motion risk rather than a formality.
 
 Deploy the branch as a real git checkout so it is inspectable and revertible — never rsync
 a dirty working tree:

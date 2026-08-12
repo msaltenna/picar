@@ -343,9 +343,31 @@ rover3 by the Embedded Validator, which must gather **all** of:
    `journalctl` (autopilot heartbeat seen, critical params verified, stream config written).
 2. **MAVLink wire verification** — observe real traffic and the Pixhawk's response
    (RC_CHANNELS_OVERRIDE out; HEARTBEAT / PARAM_VALUE / COMMAND_ACK / SERVO_OUTPUT_RAW back).
-   This proves commands reach the FC and it reacts, with no motor power.
-3. **WebUI end-to-end** — drive the served UI: arm, move the controls, and trip each
-   fail-safe path, confirming server-side state and telemetry respond.
+   Read-only, and **weaker evidence than it looks**. It shows live bidirectional traffic and
+   output present at neutral. It does **not** prove a command was delivered or acted on: the
+   recorded MAVProxy wedge had picar's writes succeeding locally while 113 KB sat unread and the
+   flight controller held its last output for over an hour, and `SERVO_OUTPUT_RAW` reads 1500 µs
+   at neutral whether the override arrived or not. A dropped-command regression satisfies every
+   part of this check. Nor does it prove the output MAPPING — a swapped steering/throttle
+   assignment is observationally identical at neutral. Claiming delivery or reaction requires a
+   causally observed output CHANGE, which is motion tier. The clause "with no motor
+   power" stood here until 2026-08-11 and is removed: a pack is installed, and this section's own
+   rule is to state what you measured rather than assert what the vehicle cannot do.
+3. **WebUI end-to-end, in two tiers.** This said "arm, move the controls, and trip each
+   fail-safe path" for *every* change, which contradicted this document's own rule two
+   sections down that a routine validation commands no motion. A validator following the
+   sentence armed a packed vehicle on every merge; a validator following the rule silently
+   weakened the gate. Both readings were available, which is the defect.
+   - **Read-only tier — always required.** The page is served over HTTPS, the Socket.IO
+     connection establishes, telemetry updates in the UI, `/status` agrees with what the
+     UI shows, and the browser console is clean. Commands nothing.
+   - **Motion tier — required for any change to the control path, the fail-safe paths,
+     the driver, or the arming logic; never routine.** Arm, move the controls, and trip
+     each fail-safe path. Requires the operator physically present, the vehicle safe to
+     drive, and the battery reading quoted in the record per the rule below.
+   A validator must state **which tier it performed**, because "WebUI end-to-end"
+   unqualified reads as the second. A motion-tier change validated only read-only is
+   **unvalidated**, not partially validated.
 4. **Scripted regression suite on-target** — the checks are committed scripts under
    `test/on-target/`, runnable on the rover, so validation is repeatable rather than ad hoc.
 5. **No regressions** — `npm test` clean, and previously validated behavior still works.
@@ -386,10 +408,19 @@ there.
 
 **Compounding factor, and the reason this matters more than a documentation slip:** this
 flight controller ignores DISARM (P0 in `TASKS.md`, demonstrated on rover3 — 222
-consecutive ARMED heartbeats with no `COMMAND_ACK`). Neutral-before-disarm still stops
-motion, so the fail-safe's *stopping* function works. But the vehicle does not actually
-disarm, and it will act on the next command it receives. Under the old false premise that
-was a paperwork problem. With a pack installed it is not.
+consecutive ARMED heartbeats with no `COMMAND_ACK`). The vehicle does not actually disarm, and
+it will act on the next command it receives. Under the old false premise that was a paperwork
+problem. With a pack installed it is not.
+
+An earlier revision of this paragraph added "Neutral-before-disarm still stops motion, so the
+fail-safe's *stopping* function works." **That is withdrawn — it is one claim too far.** Neutral
+stops motion only if the neutral *packet reaches the flight controller*, and the recorded
+MAVProxy wedge proves it need not: `sendPacket()` returned true, the 20 Hz loop logged normal
+values, no fail-safe fired, and 113 KB sat unread on the socket while the FC held its last output
+for over an hour. Invariant 6 gets the ORDER right on the wire; whether the packet arrives is the
+separate, still-open "a successful `write()` is not proof of delivery" P0. Do not describe a
+fail-safe as having stopped the vehicle unless the flight controller's own output was observed
+to change.
 
 ---
 
