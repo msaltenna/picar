@@ -8,7 +8,7 @@ const {
   overlayChainMs, clampOverlayReassert, clampOverlayAttempts,
   // The schedule below is driven by these, shared with the bound that depends on it.
   OVERLAY_WRITE_SPACING_MS, OVERLAY_SETTLE_MS, OVERLAY_READ_SPACING_MS,
-  sanitizeParamOverlay,
+  sanitizeParamOverlay, OVERRIDABLE_PARAMS,
 } = require('./config-bounds');
 
 const MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE = 70;
@@ -218,18 +218,34 @@ class PWMMavproxy {
     // picar-cfg.local.json, so a typo here silently disables the overlay that
     // corrects FRAME_CLASS. See sanitizeParamOverlay() for the two shapes that
     // did exactly that.
-    const overlayCheck = sanitizeParamOverlay(config.mavproxy_param_overlay, DEFAULT_PARAM_OVERLAY);
+    // OVERRIDABLE_PARAMS is an ALLOWLIST and is currently empty, so untracked config cannot
+    // change any parameter this driver pushes. An earlier version of this passed
+    // EXPECTED_CRITICAL_PARAMS as a blacklist, which let through everything outside that
+    // 11-name table — including RCMAP_THROTTLE, which decides which channel IS the throttle.
+    const overlayCheck = sanitizeParamOverlay(
+      config.mavproxy_param_overlay,
+      DEFAULT_PARAM_OVERLAY,
+      OVERRIDABLE_PARAMS
+    );
     this.paramOverlay = overlayCheck.overlay;
     for (const bad of overlayCheck.rejected) {
       console.error(`MAVProxy: REJECTED mavproxy_param_overlay entry — ${bad}`);
     }
-    if (overlayCheck.rejected.length && overlayCheck.usedFallback) {
-      console.error('MAVProxy: falling back to the built-in critical-parameter overlay');
+    // Fires whenever nothing the operator supplied survived, not only on a bad outer shape —
+    // the previous `usedFallback` flag was false for a well-formed object whose every entry
+    // was rejected, so the one case where the message matters most stayed silent.
+    if (overlayCheck.rejected.length && !overlayCheck.applied.length) {
+      console.error('MAVProxy: no mavproxy_param_overlay entry survived validation — ' +
+                    'using the built-in critical-parameter overlay unchanged');
     }
+    // Now reachable only if DEFAULT_PARAM_OVERLAY itself is empty, since the sanitizer merges
+    // over it rather than replacing it. Kept as a guard against that being emptied by mistake:
+    // an overlay that pushes nothing makes every read-back confirm whatever the flight
+    // controller already holds, which is how rover3 came to run as a boat.
     if (Object.keys(this.paramOverlay).length === 0) {
-      console.error('MAVProxy: mavproxy_param_overlay is EMPTY — NO critical parameters ' +
-                    'will be pushed, and every read-back will confirm whatever the flight ' +
-                    'controller already holds');
+      console.error('MAVProxy: the critical-parameter overlay is EMPTY — NO critical ' +
+                    'parameters will be pushed, and every read-back will confirm whatever ' +
+                    'the flight controller already holds');
     }
 
     this.applyParamOverlayOnConnect = config.mavproxy_apply_param_overlay !== false;
