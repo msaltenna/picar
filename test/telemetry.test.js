@@ -105,7 +105,11 @@ function radioStatusPayload({ rxerrors, fixed, rssi, remrssi, txbuf, noise, remn
 function heartbeatPayload({ autopilot = 3, base_mode = 0 } = {}) {
   const p = Buffer.alloc(MSG.HEARTBEAT.len);
   p.writeUInt32LE(0, 0);      // custom_mode
-  p[4] = 11;                  // type: ground rover
+  // 10 is GROUND_ROVER. This said `11` with the comment "ground rover" — 11 is
+  // SURFACE_BOAT, the same FRAME_CLASS=2 confusion that had rover3 genuinely running as a
+  // boat until 2026-08-04. Harmless while nothing read MAV_TYPE; it stops being harmless
+  // now that the driver identifies the vehicle from this field.
+  p[4] = 10;                  // MAV_TYPE_GROUND_ROVER
   p[5] = autopilot;
   p[6] = base_mode;
   p[7] = 4;                   // system_status
@@ -617,28 +621,126 @@ test('the overlay is applied even when no autopilot heartbeat ever arrives', asy
   }
 });
 
-test('a heartbeat does not re-apply the overlay a second time', async () => {
-  // The heartbeat is now for VERIFICATION only. It must not re-trigger the overlay,
-  // or every reconnect-plus-heartbeat would stack overlapping PARAM_SET chains.
+test('the heartbeat releases the deferred overlay EXACTLY once, not once per second', async () => {
+  // This test's assertion changed on 2026-08-12 and the change is deliberate. It used to
+  // require that a heartbeat never applied the overlay at all — the design where the
+  // heartbeat was for VERIFICATION only. The overlay is now tiered: RC_OVERRIDE_TIME goes
+  // out on connect for the fail-open reason _connect documents, and the CONFIGURATION tier
+  // waits to learn what the autopilot is, because pushing it blind overwrote RC3_DZ on
+  // rover1's PX4 board (10 -> 30, measured).
+  //
+  // What has NOT changed is the reason the old assertion existed: overlapping PARAM_SET
+  // chains. That reason is now MORE load-bearing, not less — heartbeats arrive at 1 Hz
+  // forever, so an unguarded release would clear the in-flight timers and restart the
+  // chain every second, and the overlay would never complete on any rover. That is what
+  // the loop below is for.
   const h = withFakeConnect();
   let d;
   try {
     d = new PWMMavproxy({ mavproxy_autostart: false });
-    let overlayCalls = 0;
-    d.applyParamOverlay = () => { overlayCalls += 1; };
+    const tiers = [];
+    d.applyParamOverlay = (opts) => { tiers.push((opts && opts.tier) || 'full'); };
+    d.startOverlayReassertWatch = () => {};
     d.startServer();
     await new Promise((r) => setImmediate(r));
-    assert.equal(overlayCalls, 1);
+    assert.deepEqual(tiers, ['preIdentity'],
+      'connect must apply the pre-identity tier and nothing else');
 
-    // A genuine autopilot heartbeat: autopilot != 8, sysId == target.
-    d.parseIncoming(frameV1(MSG.HEARTBEAT,
-      heartbeatPayload({ type: 11, autopilot: 3, base_mode: 129 })));
+    const hb = () => d.parseIncoming(frameV1(MSG.HEARTBEAT,
+      heartbeatPayload({ autopilot: 3, base_mode: 129 })));
+
+    hb();
     assert.equal(d.pixhawkHeartbeatSeen, true, 'the heartbeat is still recognised');
-    assert.equal(overlayCalls, 1, 'but it must not apply the overlay again');
+    assert.deepEqual(tiers, ['preIdentity', 'full'],
+      'the first autopilot heartbeat releases the configuration tier');
+
+    for (let i = 0; i < 20; i++) hb();
+    assert.deepEqual(tiers, ['preIdentity', 'full'],
+      'twenty more heartbeats must not restart the chain — at 1 Hz that never completes');
+    // Honest note on WHAT stops the repeat here: noteAutopilotIdentity returns early when
+    // the identity is unchanged, so this loop does not exercise applyDeferredOverlay's own
+    // idempotence guard. Deleting that guard survived this test. The next test covers it.
   } finally {
     if (d) stopTimers(d);
     h.restore();
   }
+});
+
+test('a heartbeat arriving AFTER the grace window does not restart the chain', async () => {
+  // The case the loop above cannot reach, and the one the idempotence guard exists for: a
+  // slow or late autopilot. Grace expires and applies the tier unidentified; the heartbeat
+  // then arrives and identifies a genuine ArduRover, which is a CHANGE of identity, so the
+  // early-return in noteAutopilotIdentity does not apply. Without the guard the whole
+  // PARAM_SET chain is cancelled and restarted, mid-flight.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false, mavproxy_identity_grace_ms: 500 });
+    const tiers = [];
+    d.applyParamOverlay = (opts) => { tiers.push((opts && opts.tier) || 'full'); };
+    d.startOverlayReassertWatch = () => {};
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 700));
+    assert.deepEqual(tiers, ['preIdentity', 'full'], 'precondition: grace expired and applied');
+
+    d.parseIncoming(frameV1(MSG.HEARTBEAT, heartbeatPayload({ autopilot: 3, base_mode: 129 })));
+    assert.equal(d.pixhawkHeartbeatSeen, true, 'the late heartbeat is recognised');
+    assert.deepEqual(tiers, ['preIdentity', 'full'],
+      'but it must not re-apply a tier that has already gone out');
+  } finally {
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('with NO heartbeat at all, the configuration tier is still applied', async () => {
+  // The fail-open guard on the tiering. A one-way return path — wrong sysId, broken
+  // framing, a receive path that never delivers — must not leave SERVOn_FUNCTION at a
+  // replacement board's defaults, because that is "steering drives throttle". Deferring
+  // the tier is only acceptable because this bound exists.
+  const h = withFakeConnect();
+  let d;
+  try {
+    d = new PWMMavproxy({ mavproxy_autostart: false, mavproxy_identity_grace_ms: 500 });
+    const tiers = [];
+    const warnings = [];
+    const origErr = console.error;
+    console.error = (...a) => warnings.push(a.join(' '));
+    try { d.applyParamOverlay = (opts) => { tiers.push((opts && opts.tier) || 'full'); }; }
+    finally { /* restored in the outer finally */ }
+    d._restoreErr = () => { console.error = origErr; };
+    let watchArmed = 0;
+    d.startOverlayReassertWatch = () => { watchArmed += 1; };
+    d.startServer();
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(tiers, ['preIdentity']);
+    assert.equal(d.identityGraceMs, 500, 'precondition: the grace window is the one set');
+
+    await new Promise((r) => setTimeout(r, 700));
+    assert.deepEqual(tiers, ['preIdentity', 'full'],
+      'grace expiry must apply the configuration tier anyway, unidentified');
+    assert.equal(d.pixhawkHeartbeatSeen, false, 'with no autopilot heartbeat received');
+    assert.equal(watchArmed, 1, 'and the reassert watch must be armed, or a lost overlay is never retried');
+    assert.match(warnings.join('\n'), /UNIDENTIFIED flight/,
+      'and it must say so — a silent blind write is how RC3_DZ reached rover1 unremarked');
+  } finally {
+    if (d && d._restoreErr) d._restoreErr();
+    if (d) stopTimers(d);
+    h.restore();
+  }
+});
+
+test('the grace window is bounded however the untracked overlay sets it', () => {
+  // Invariant 8 is still open: picar-cfg.local.json can set any key with no review. This
+  // one delays a safety-relevant write, so its range is clamped rather than trusted.
+  const mk = (v) => new PWMMavproxy({ mavproxy_autostart: false, mavproxy_identity_grace_ms: v });
+  assert.equal(mk(0).identityGraceMs, 500, 'zero must not mean "never wait" by accident');
+  assert.equal(mk(-1).identityGraceMs, 500);
+  assert.equal(mk(1e9).identityGraceMs, 10000, 'nor may it defer the mapping indefinitely');
+  assert.equal(mk('nonsense').identityGraceMs, 2000, 'a non-numeric value falls back to the default');
+  assert.equal(mk(undefined).identityGraceMs, 2000);
+  assert.equal(mk(1500).identityGraceMs, 1500, 'a sane value is honoured');
 });
 
 test('a reconnect discards the voltage smoothing window', async () => {
@@ -752,13 +854,21 @@ test('the overlay is reasserted when read-back does not confirm it', async () =>
     d.applyParamOverlay = () => { attempts += 1; };
     d.startServer();
     await new Promise((r) => setImmediate(r));
-    assert.equal(attempts, 1, 'the first attempt happens on connect');
-    // Assert the WIRING, not just the mechanism: _connect must arm the watch itself.
-    // Calling startOverlayReassertWatch() by hand below would pass even if _connect
-    // never armed it — which is exactly how the first version of this test was
-    // vacuous, and mutation proved it.
+    assert.equal(attempts, 1, 'the pre-identity tier happens on connect');
+    // Assert the WIRING, not just the mechanism — calling startOverlayReassertWatch() by
+    // hand below would pass even if nothing armed it, which is exactly how the first
+    // version of this test was vacuous and mutation proved it.
+    //
+    // The watch is armed by the DEFERRED chain rather than by _connect as of 2026-08-12.
+    // It must not be armed earlier: its interval floor is derived from the chain length,
+    // so arming it up to identityGraceMs before the chain starts lets the first check fire
+    // mid-chain, find params missing, and cancel the writes still in flight.
+    assert.equal(d.overlayReassertTimer, null,
+      'the watch must not be armed before the chain it checks has started');
+    d.parseIncoming(frameV1(MSG.HEARTBEAT, heartbeatPayload({ autopilot: 3, base_mode: 129 })));
+    assert.equal(attempts, 2, 'identification releases the configuration tier');
     assert.notEqual(d.overlayReassertTimer, null,
-      '_connect must arm the reassert watch, or a lost overlay is never retried');
+      'and arms the reassert watch, or a lost overlay is never retried');
 
     // Nothing verified: the watch must fire another attempt.
     d.overlayReassertMs = 1;

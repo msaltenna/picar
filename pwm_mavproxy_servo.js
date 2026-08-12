@@ -46,6 +46,13 @@ const LIGHT_CHANNEL = 'light';
 // definitions on the target, not from memory — the framing here is hand-rolled, so
 // a wrong constant fails silently rather than loudly.
 const MSG_HEARTBEAT    = 0;
+
+// HEARTBEAT identity fields. MAV_AUTOPILOT_INVALID (8) is what a GCS sends, including
+// this driver's own heartbeat. The other two are what the ArduRover parameter overlay
+// assumes about the thing on the other end of the link and never checked.
+const MAV_AUTOPILOT_INVALID       = 8;
+const MAV_AUTOPILOT_ARDUPILOTMEGA = 3;
+const MAV_TYPE_GROUND_ROVER       = 10;
 const MSG_SYS_STATUS   = 1;    // battery voltage / current / remaining
 const MSG_RADIO_STATUS = 109;  // SiK telemetry link quality
 const MSG_POWER_STATUS = 125;  // board and servo rail voltages
@@ -93,6 +100,25 @@ const TELEMETRY_STALE_MS = 3000;
 // These are pushed on every MAVProxy connect so a fresh/replacement flight
 // controller (e.g. Pixhawk 6C mini) gets the right output mapping without
 // needing to load mav.parm by hand.
+// Which overlay entries may be written BEFORE the autopilot has identified itself.
+//
+// Only RC_OVERRIDE_TIME, and it stays here for the reason _connect gives at length: it is
+// the flight controller's OWN stale-override failsafe, and until it lands ArduPilot sits on
+// its 3.0 s default while picar is already streaming overrides at 20 Hz. Waiting on a
+// heartbeat for that one is the fail-open this driver deliberately avoids.
+//
+// Everything else is output MAPPING and control FEEL. Being wrong for the ~1 s a heartbeat
+// takes costs nothing, and pushing it blind is MEASURED harm, not a hypothetical: deploying
+// main to rover1 on 2026-08-11 pushed all 13 names at a PX4 board. Nine were rejected, but
+// RC3_DZ and RC3_TRIM exist in PX4's namespace TOO and were actually written — RC3_DZ went
+// 10 -> 30, journal `PARAM_SET RC3_DZ=30` then `verified RC3_DZ=30`. So the read-back also
+// confirmed two parameters on a flight controller the overlay was never written for.
+//
+// RC_OVERRIDE_TIME being FIRST in DEFAULT_PARAM_OVERLAY is load-bearing for this split, not
+// incidental: the deferred chain re-issues the whole set from index 0, so the pre-identity
+// write is re-scheduled at the same 0 ms offset rather than delayed by the tiering.
+const PRE_IDENTITY_PARAMS = new Set(['RC_OVERRIDE_TIME']);
+
 const DEFAULT_PARAM_OVERLAY = {
   // FIRST deliberately. applyParamOverlay spaces its writes 250 ms apart, and this
   // one is the flight controller's own stale-override failsafe — until it lands,
@@ -278,6 +304,17 @@ class PWMMavproxy {
     this.overlayChainMs = chainMs;
     this.overlayReassertMs  = clampOverlayReassert(config.mavproxy_overlay_reassert_ms, chainMs);
     this.maxOverlayAttempts = clampOverlayAttempts(config.mavproxy_overlay_max_attempts);
+    // How long to wait for the autopilot to identify itself before applying the
+    // vehicle-configuration tier of the overlay anyway. Bounded hard: this is reachable
+    // from the untracked per-rover overlay (invariant 8, still open), so the worst an
+    // unreviewed value can do is move it inside 0.5-10 s. Two heartbeats at 1 Hz by
+    // default. Expiry is NOT a refusal — a one-way return path must still get its output
+    // mapping, or steering drives throttle.
+    const graceMs = Number(config.mavproxy_identity_grace_ms);
+    this.identityGraceMs = Number.isFinite(graceMs)
+      ? Math.min(10000, Math.max(500, graceMs)) : 2000;
+    this.identityGraceTimer  = null;
+    this.deferredOverlayDone = false;
 
     // Latest decoded telemetry. Each entry carries its own `at` timestamp so a
     // reader can tell a live reading from a stale one — reporting a last-known
@@ -291,6 +328,13 @@ class PWMMavproxy {
     // consumed by /status, by the fleet dashboard, or by a future arming gate.
     this.verifiedCriticalParams = new Set();
     this.paramVerificationFailures = new Map();
+    // What the autopilot says it IS, from its HEARTBEAT, and null until one arrives.
+    // Sticky across reconnects on purpose: the suppression below must survive the
+    // 2 s reconnect loop, or every reconnect re-pushes a rover overlay at a copter.
+    // Self-correcting — a heartbeat identifying an ArduRover clears it again.
+    this.autopilotIdent   = null;
+    this.firmwareMismatch = null;
+    this.overlaySuppressed = false;
     this.heartbeatWatch = null;
     this.heartbeatTimeoutMs = config.mavproxy_heartbeat_timeout_ms ?? 10000;
     this.client = null;   // the connected MAVProxy client socket
@@ -383,9 +427,15 @@ class PWMMavproxy {
       // Transmission does not depend on hearing anything, so neither does this.
       // The genuine heartbeat is still required, but for VERIFICATION — read-back
       // and reporting — which is what hearing the autopilot can actually prove.
+      // The pre-identity tier goes out immediately, for the fail-open reason above. The
+      // rest waits for the autopilot to say what it is — bounded, see startIdentityGrace.
+      // The reassert watch starts with the DEFERRED chain, not here: its floor is derived
+      // from the chain length, so arming it up to identityGraceMs early would let the
+      // first check fire mid-chain, find params missing, and cancel the writes still in
+      // flight — the never-completing loop clampOverlayReassert's comment describes.
       if (this.applyParamOverlayOnConnect) {
-        this.applyParamOverlay();
-        this.startOverlayReassertWatch();
+        this.applyParamOverlay({ tier: 'preIdentity' });
+        this.startIdentityGrace();
       }
 
       // Still warn when the autopilot never identifies itself: the overlay has now
@@ -439,6 +489,13 @@ class PWMMavproxy {
         clearTimeout(this.overlayReassertTimer);
         this.overlayReassertTimer = null;
       }
+      // Per-connection, unlike overlaySuppressed: a new link may be a different flight
+      // controller, so the next connect re-runs the tiering from the start.
+      if (this.identityGraceTimer) {
+        clearTimeout(this.identityGraceTimer);
+        this.identityGraceTimer = null;
+      }
+      this.deferredOverlayDone = false;
       this.paramOverlayApplied = false;
       this.verifiedCriticalParams.clear();
       this.paramVerificationFailures.clear();
@@ -683,9 +740,100 @@ class PWMMavproxy {
     return buf;
   }
 
-  applyParamOverlay() {
-    const entries = Object.entries(this.paramOverlay || {});
+  // Decide whether this autopilot is the one the overlay is written for, and stop
+  // writing at it when it is not.
+  //
+  // EXPECTED_CRITICAL_PARAMS and paramOverlay are ArduRover-specific. Pushing them at
+  // something else is not merely useless: on ArduCopter FRAME_CLASS is the airframe
+  // selector and 1 means Quad, so this driver would silently reconfigure a hexacopter's
+  // frame. On PX4 the names do not exist, so every read-back comes back missing and the
+  // operator is told to "check FRAME_CLASS=1 (Rover)" about firmware that has no such
+  // parameter. rover1 was measured on 2026-08-11 running PX4 and reporting a QUADROTOR
+  // MAV_TYPE while this driver pushed the rover overlay at it, unremarked.
+  //
+  // This CANNOT gate the first push on connect, and deliberately does not try. Gating
+  // the overlay on hearing a heartbeat is the fail-open documented at length in
+  // _connect: RC_OVERRIDE_TIME=0.2 is the flight controller's own stale-override
+  // failsafe, outbound writes work whether or not the return path does, and a one-way
+  // link would leave the vehicle drivable on ArduPilot's 3.0 s default. Identification
+  // arrives ~1 s after connect at the earliest, so what it can do is stop every
+  // subsequent write — the reassert chain and every later reconnect — and make sure
+  // nothing reads as verified against a vehicle we have misidentified.
+  noteAutopilotIdentity(autopilot, type) {
+    const same = this.autopilotIdent
+      && this.autopilotIdent.autopilot === autopilot
+      && this.autopilotIdent.type === type;
+    if (same) return;      // heartbeats arrive at 1 Hz forever; act only on a CHANGE
+    this.autopilotIdent = { autopilot, type };
+
+    const why = [];
+    if (autopilot !== MAV_AUTOPILOT_ARDUPILOTMEGA) {
+      why.push(`MAV_AUTOPILOT=${autopilot} (expected ${MAV_AUTOPILOT_ARDUPILOTMEGA} ` +
+               `ARDUPILOTMEGA)`);
+    }
+    if (type !== MAV_TYPE_GROUND_ROVER) {
+      why.push(`MAV_TYPE=${type} (expected ${MAV_TYPE_GROUND_ROVER} GROUND_ROVER)`);
+    }
+    this.firmwareMismatch = why.length ? why.join('; ') : null;
+
+    if (!this.firmwareMismatch) {
+      // A previously misidentified link that now identifies correctly — a swapped or
+      // reflashed board — must be able to recover without a process restart.
+      if (this.overlaySuppressed) {
+        console.log('MAVProxy: autopilot now identifies as ArduPilot / GROUND_ROVER — ' +
+          'the parameter overlay is no longer suppressed');
+        this.overlaySuppressed = false;
+      }
+      // Identified as the vehicle the overlay is written for: release the tier that was
+      // held back. This is the normal path on a healthy rover, and it is what makes the
+      // blind configuration write disappear rather than merely happen less often.
+      this.applyDeferredOverlay();
+      return;
+    }
+
+    this.overlaySuppressed = true;
+    // Without this the grace timer still fires and applies the very tier just refused.
+    if (this.identityGraceTimer) {
+      clearTimeout(this.identityGraceTimer);
+      this.identityGraceTimer = null;
+    }
+    this.clearOverlayTimers();          // the in-flight chain's remaining PARAM_SETs
+    if (this.overlayReassertTimer) {
+      clearTimeout(this.overlayReassertTimer);
+      this.overlayReassertTimer = null;
+    }
+    // Nothing may read as verified against a vehicle we have misidentified. Read-back
+    // proves a parameter's value; it does not prove the parameter means here what
+    // EXPECTED_CRITICAL_PARAMS assumes it means.
+    this.verifiedCriticalParams.clear();
+    this.paramOverlayApplied = false;
+    console.error(
+      `MAVProxy: WARNING this autopilot is NOT an ArduRover: ${this.firmwareMismatch}. ` +
+      `The ArduRover parameter overlay has been SUPPRESSED — the first push on connect ` +
+      `had already been sent before this heartbeat arrived, so treat this flight ` +
+      `controller's parameters as MODIFIED and check them. Every critical parameter is ` +
+      `now reported unverified.`);
+  }
+
+  applyParamOverlay({ tier = 'full' } = {}) {
+    const all = Object.entries(this.paramOverlay || {});
+    // The pre-identity tier reads back only what it wrote. Requesting the whole critical
+    // set here would record mismatches for parameters not yet pushed, so the status bar
+    // would show real-looking failures for the length of the grace window.
+    const entries = tier === 'preIdentity'
+      ? all.filter(([name]) => PRE_IDENTITY_PARAMS.has(name)) : all;
+    const readBack = tier === 'preIdentity'
+      ? Object.keys(EXPECTED_CRITICAL_PARAMS).filter((n) => PRE_IDENTITY_PARAMS.has(n))
+      : Object.keys(EXPECTED_CRITICAL_PARAMS);
     if (entries.length === 0) return;
+    // Checked HERE rather than only at the call sites. There are three — connect, the
+    // reassert chain, and the sysId-change path — and CLAUDE.md names "a correct rule
+    // with an untouched consumer" as this repo's dominant defect shape.
+    if (this.overlaySuppressed) {
+      console.error('MAVProxy: REFUSING to apply the ArduRover parameter overlay — ' +
+        `${this.firmwareMismatch}`);
+      return;
+    }
 
     // Deliberately NOT clearing verifiedCriticalParams here. It is cleared on close
     // (:416), which is the event that genuinely invalidates it — a new link means a
@@ -698,7 +846,10 @@ class PWMMavproxy {
     // Not clearing is also the fail-CLOSED direction for paramVerificationFailures: a
     // recorded mismatch persists until a read-back actually contradicts it, so a
     // reassert whose reads are all lost leaves the warning up rather than clearing it.
-    console.log('MAVProxy: Applying minimal Pixhawk param overlay...');
+    console.log(tier === 'preIdentity'
+      ? `MAVProxy: Applying the pre-identity param overlay (${entries.length} of ${all.length}) ` +
+        '— the rest waits for the autopilot to identify itself...'
+      : 'MAVProxy: Applying minimal Pixhawk param overlay...');
 
     // Every timer is tracked and cleared on the next overlay or on close. The
     // overlay now runs on EVERY connect rather than once per first-heartbeat, so
@@ -721,11 +872,55 @@ class PWMMavproxy {
     // anything doesn't match. This catches the "steering also drives
     // throttle" class of failure on a fresh board.
     const writeWindowMs = entries.length * OVERLAY_WRITE_SPACING_MS + OVERLAY_SETTLE_MS;
-    Object.keys(EXPECTED_CRITICAL_PARAMS).forEach((name, index) => {
+    readBack.forEach((name, index) => {
       this.overlayTimers.push(setTimeout(() => {
         this.sendPacket(this.buildParamRequestRead(name));
       }, writeWindowMs + index * OVERLAY_READ_SPACING_MS));
     });
+  }
+
+  // Bounded wait for the autopilot to identify itself, after which the configuration tier
+  // is applied ANYWAY.
+  //
+  // Expiry is deliberately not a refusal. A return path that never delivers is the case
+  // _connect's fail-open argument is about, and SERVOn_FUNCTION left at a replacement
+  // board's defaults means steering drives throttle — a hazard in its own right. So the
+  // choice on expiry is between two bad outcomes, and this keeps today's: push, and say
+  // loudly that it went to an unidentified flight controller.
+  startIdentityGrace() {
+    if (this.identityGraceTimer) clearTimeout(this.identityGraceTimer);
+    this.identityGraceTimer = setTimeout(() => {
+      this.identityGraceTimer = null;
+      // Only a REFUSAL stops this. Note there is ONE apply path, not one per branch: an
+      // earlier draft returned early whenever the autopilot had been identified, which was
+      // both a hole (identification arriving on an already-destroyed socket skipped the
+      // apply, and then so did this) and untestable — no test could reach the skip, so
+      // mutation could not kill it. The branch below decides only what to WARN.
+      if (this.overlaySuppressed) return;
+      if (!this.autopilotIdent) {
+        console.error(
+          `MAVProxy: WARNING no autopilot heartbeat within ${this.identityGraceMs} ms — ` +
+          `applying the ArduRover configuration overlay to an UNIDENTIFIED flight ` +
+          `controller. If this board is not an ArduRover, parameters shared with its ` +
+          `firmware's namespace WILL be overwritten. Check SYSID_THISMAV and ` +
+          `mavproxy_target_system.`);
+      }
+      this.applyDeferredOverlay();
+    }, this.identityGraceMs);
+  }
+
+  // Apply the configuration tier exactly once per connection, and only then start the
+  // reassert chain — its interval floor is derived from the chain length, so it must not
+  // be armed before the chain it is checking has started.
+  applyDeferredOverlay() {
+    if (this.deferredOverlayDone) return;
+    this.deferredOverlayDone = true;
+    if (this.identityGraceTimer) {
+      clearTimeout(this.identityGraceTimer);
+      this.identityGraceTimer = null;
+    }
+    this.applyParamOverlay();
+    this.startOverlayReassertWatch();
   }
 
   // Cancel any in-flight overlay. Bounded and idempotent.
@@ -750,6 +945,13 @@ class PWMMavproxy {
     const check = () => {
       this.overlayReassertTimer = null;
       if (!this.client || this.client.destroyed) return;      // close handler owns this
+      // A suppressed overlay can never be confirmed by read-back, so the chain would run
+      // to maxOverlayAttempts logging a reassert it is not performing.
+      if (this.overlaySuppressed) {
+        console.error('MAVProxy: abandoning the overlay reassert chain — ' +
+          `${this.firmwareMismatch}`);
+        return;
+      }
       const missing = Object.keys(EXPECTED_CRITICAL_PARAMS)
         .filter((n) => !this.verifiedCriticalParams.has(n));
       if (missing.length === 0) {
@@ -1104,9 +1306,13 @@ class PWMMavproxy {
       // MAV_AUTOPILOT_INVALID (8) is what a GCS sends — including this driver's
       // own heartbeat — so accepting it would mean announcing a flight controller
       // because we heard ourselves.
-      if (payload[5] === 8) return;
+      if (payload[5] === MAV_AUTOPILOT_INVALID) return;
       if (metadata.sysId !== undefined && metadata.sysId !== this.target_system) return;
       this.telemetry.heartbeat = { at: Date.now(), armed: (payload[6] & 0x80) !== 0 };
+      // payload[4] (MAV_TYPE) had never been read anywhere in this driver, and
+      // payload[5] was only tested for "not a GCS". They are the only evidence on the
+      // link of WHAT the overlay is being written to — see noteAutopilotIdentity.
+      this.noteAutopilotIdentity(payload[5], payload[4]);
       if (!this.pixhawkHeartbeatSeen) {
         console.log('MAVProxy: Received first Pixhawk heartbeat ' +
           `(sys=${metadata.sysId ?? '?'} MAVLink ${metadata.mavlinkVersion ?? '?'})`);
@@ -1146,8 +1352,16 @@ class PWMMavproxy {
           console.error(
             `MAVProxy: WARNING ${name}=${actual} on flight controller ` +
             `but expected ${expected}. Outputs will be miswired ` +
-            `(e.g. steering will drive throttle). Check FRAME_CLASS=1 (Rover) ` +
-            `and that the firmware is ArduRover, then power-cycle.`
+            `(e.g. steering will drive throttle). ` +
+            // Two corrections to this advice. It told the operator to check FRAME_CLASS
+            // on firmware that may have no such parameter — say what was actually
+            // measured instead. And "power-cycle" was wrong even on ArduRover: the
+            // FRAME_CLASS change on 2026-08-04 was observed taking effect live, with the
+            // HEARTBEAT MAV_TYPE moving 11 SURFACE_BOAT -> 10 GROUND_ROVER and no reboot.
+            (this.firmwareMismatch
+              ? `This autopilot is not an ArduRover (${this.firmwareMismatch}), so this ` +
+                `parameter may not exist or may not mean what is expected here.`
+              : `Check FRAME_CLASS=1 (Rover) and that the firmware is ArduRover.`)
           );
         } else {
           this.paramVerificationFailures.delete(name);
@@ -1227,9 +1441,21 @@ class PWMMavproxy {
       // Coerced: `fresh()` short-circuits to null on a missing entry, and a
       // consumer checking this field deserves a boolean, not null-vs-false.
       autopilotHeartbeat: !!fresh(this.telemetry.heartbeat),
-      // True when we are connected but have never identified the autopilot, which
-      // means the parameter overlay has not been applied.
+      // True when we are connected but have never identified the autopilot. It does NOT
+      // mean the overlay is unapplied — the overlay is pushed on connect, before this
+      // can be known (see noteAutopilotIdentity). The comment here said the opposite
+      // until 2026-08-12, describing behaviour removed when the overlay moved off the
+      // heartbeat.
       awaitingAutopilot: !!(this.client && !this.client.destroyed && !this.pixhawkHeartbeatSeen),
+      // What the autopilot says it is, and whether that matches what the overlay is
+      // written for. Surfaced so /status can show a misidentified flight controller
+      // rather than leaving it in the journal.
+      firmware: {
+        autopilot: this.autopilotIdent ? this.autopilotIdent.autopilot : null,
+        type:      this.autopilotIdent ? this.autopilotIdent.type : null,
+        mismatch:  this.firmwareMismatch,
+        overlaySuppressed: this.overlaySuppressed,
+      },
       params: {
         verified: [...this.verifiedCriticalParams].sort(),
         missing: Object.keys(EXPECTED_CRITICAL_PARAMS)
