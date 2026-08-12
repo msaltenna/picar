@@ -53,6 +53,24 @@ const MSG_HEARTBEAT    = 0;
 const MAV_AUTOPILOT_INVALID       = 8;
 const MAV_AUTOPILOT_ARDUPILOTMEGA = 3;
 const MAV_TYPE_GROUND_ROVER       = 10;
+const MAV_TYPE_SURFACE_BOAT       = 11;
+
+// The vehicle types an ArduRover reports. BOTH are ArduRover — 11 is what a rover with
+// FRAME_CLASS=2 reports, which is the exact misconfiguration `FRAME_CLASS: 1` in this
+// overlay exists to repair, and which rover3 genuinely ran until 2026-08-04.
+//
+// So SURFACE_BOAT must NOT suppress the overlay. An earlier revision treated every type
+// but GROUND_ROVER as foreign firmware, which meant a normal early heartbeat suppressed
+// the chain before FRAME_CLASS was written and the sticky flag blocked every later
+// reconnect: the rover would have been left permanently as a boat, by the very code added
+// to protect it. A reviewer caught it, and a test in this branch had pinned the defect.
+//
+// The set is exactly {10, 11} because no other ArduPilot vehicle firmware reports either:
+// ArduCopter reports QUADROTOR/HEXAROTOR/…, ArduPlane FIXED_WING, ArduSub SUBMARINE. So
+// membership here really does mean "ArduRover", and non-membership on an ArduPilot board
+// means a different vehicle firmware, where FRAME_CLASS selects an AIRFRAME and writing 1
+// would reconfigure a hexacopter as a quad.
+const ARDUROVER_TYPES = new Set([MAV_TYPE_GROUND_ROVER, MAV_TYPE_SURFACE_BOAT]);
 const MSG_SYS_STATUS   = 1;    // battery voltage / current / remaining
 const MSG_RADIO_STATUS = 109;  // SiK telemetry link quality
 const MSG_POWER_STATUS = 125;  // board and servo rail voltages
@@ -771,18 +789,35 @@ class PWMMavproxy {
       why.push(`MAV_AUTOPILOT=${autopilot} (expected ${MAV_AUTOPILOT_ARDUPILOTMEGA} ` +
                `ARDUPILOTMEGA)`);
     }
-    if (type !== MAV_TYPE_GROUND_ROVER) {
-      why.push(`MAV_TYPE=${type} (expected ${MAV_TYPE_GROUND_ROVER} GROUND_ROVER)`);
+    if (!ARDUROVER_TYPES.has(type)) {
+      why.push(`MAV_TYPE=${type} (expected ${MAV_TYPE_GROUND_ROVER} GROUND_ROVER or ` +
+               `${MAV_TYPE_SURFACE_BOAT} SURFACE_BOAT, the two an ArduRover reports)`);
     }
     this.firmwareMismatch = why.length ? why.join('; ') : null;
 
     if (!this.firmwareMismatch) {
+      // An ArduRover reporting SURFACE_BOAT is the repairable case, not a foreign board:
+      // FRAME_CLASS=1 in the overlay is precisely the fix, and it was measured taking
+      // effect LIVE on rover3 (MAV_TYPE moved 11 -> 10 with no power cycle). Say so, or an
+      // operator reading only the journal sees a boat and no explanation.
+      if (type === MAV_TYPE_SURFACE_BOAT) {
+        console.error(
+          'MAVProxy: this ArduRover reports MAV_TYPE=11 SURFACE_BOAT, i.e. FRAME_CLASS=2. ' +
+          'Applying the overlay AS THE REPAIR — FRAME_CLASS=1 should move it to 10 ' +
+          'GROUND_ROVER on this link, without a power cycle. Until it does, its steering ' +
+          'and throttle outputs are wired for a boat.');
+      }
       // A previously misidentified link that now identifies correctly — a swapped or
       // reflashed board — must be able to recover without a process restart.
       if (this.overlaySuppressed) {
-        console.log('MAVProxy: autopilot now identifies as ArduPilot / GROUND_ROVER — ' +
+        console.log('MAVProxy: autopilot now identifies as an ArduRover — ' +
           'the parameter overlay is no longer suppressed');
         this.overlaySuppressed = false;
+        // The suppression CANCELLED whatever chain was in flight, so the configuration tier
+        // must be re-runnable even if it had already been marked done on this connection.
+        // Clearing the flag alone left the board unconfigured while the log above claimed
+        // recovery — a reviewer's finding, and the worst kind: a reassuring message.
+        this.deferredOverlayDone = false;
       }
       // Identified as the vehicle the overlay is written for: release the tier that was
       // held back. This is the normal path on a healthy rover, and it is what makes the

@@ -127,10 +127,47 @@ test('ArduPilot running the WRONG vehicle type is still flagged', () => {
     'the autopilot field matched, so it must not be reported as a mismatch');
 });
 
-test('SURFACE_BOAT — the value rover3 really reported — is flagged', () => {
+test('SURFACE_BOAT does NOT suppress — it is the case the overlay exists to repair', () => {
+  // THIS TEST ASSERTED THE OPPOSITE and was wrong; a reviewer caught it. An ArduRover with
+  // FRAME_CLASS=2 reports MAV_TYPE=11, which is exactly what rover3 genuinely ran until
+  // 2026-08-04, and `FRAME_CLASS: 1` in the overlay is the repair. Suppressing on it meant a
+  // normal early heartbeat cancelled the chain before FRAME_CLASS was written, and the
+  // sticky flag blocked every later reconnect — the rover left permanently a boat by the
+  // code added to protect it. Pinning a defect in a test is the failure mode CLAUDE.md
+  // lists, and this file had done it.
   const d = driver();
+  const out = capturing(() => d.parseIncoming(frameV1(HEARTBEAT, heartbeat({ type: SURFACE_BOAT }))));
+  const f = d.getTelemetry().firmware;
+  assert.equal(f.overlaySuppressed, false, 'the repair must not be suppressed');
+  assert.equal(f.mismatch, null);
+  assert.equal(f.type, SURFACE_BOAT, 'and the type is still reported honestly');
+  assert.match(out, /Applying the overlay AS THE REPAIR/,
+    'and the operator is told why a boat is on the link');
+});
+
+test('the boat repair still applies the configuration tier', () => {
+  // The consumer half. Reporting the boat while withholding FRAME_CLASS would be the same
+  // defect with better logging.
+  const d = driver();
+  const applied = [];
+  d.applyParamOverlay = (opts) => applied.push((opts && opts.tier) || 'full');
+  d.startOverlayReassertWatch = () => {};
   capturing(() => d.parseIncoming(frameV1(HEARTBEAT, heartbeat({ type: SURFACE_BOAT }))));
-  assert.equal(d.getTelemetry().firmware.overlaySuppressed, true);
+  assert.deepEqual(applied, ['full'],
+    'FRAME_CLASS=1 must actually be written, or the rover stays a boat');
+});
+
+test('an ArduPilot vehicle that is NOT a rover is still suppressed', () => {
+  // The other side of widening the accepted set. ArduCopter reports QUADROTOR/HEXAROTOR,
+  // ArduPlane FIXED_WING, ArduSub SUBMARINE — none of which is in ARDUROVER_TYPES — and on
+  // those firmwares FRAME_CLASS selects an AIRFRAME, so writing 1 reconfigures a hexacopter
+  // as a quad. Widening to "any ArduPilot" would be the failure this guards.
+  for (const t of [QUADROTOR, 13 /* HEXAROTOR */, 1 /* FIXED_WING */, 12 /* SUBMARINE */]) {
+    const d = driver();
+    capturing(() => d.parseIncoming(frameV1(HEARTBEAT, heartbeat({ type: t }))));
+    assert.equal(d.getTelemetry().firmware.overlaySuppressed, true,
+      `MAV_TYPE=${t} is not a rover and must suppress the overlay`);
+  }
 });
 
 test('our OWN heartbeat cannot identify the autopilot', () => {
@@ -312,16 +349,32 @@ test('the reassert chain DOES run on a correctly identified ArduRover', async ()
 
 // ── Recovery ─────────────────────────────────────────────────────────────────
 
-test('a reflashed or swapped board can clear the suppression without a restart', () => {
+test('a reflashed or swapped board recovers by RE-RUNNING the overlay, not just unflagging', () => {
+  // A reviewer's finding, and the worst kind: the log said "no longer suppressed" while
+  // nothing was re-applied. The suppression had CANCELLED the in-flight chain and the
+  // reassert timer, so clearing the flag left the board unconfigured with a reassuring
+  // message — and arming is gated on nothing, so it could still be driven.
   const d = driver();
+  const applied = [];
+  d.applyParamOverlay = (opts) => applied.push((opts && opts.tier) || 'full');
+  let watchArmed = 0;
+  d.startOverlayReassertWatch = () => { watchArmed += 1; };
+
   capturing(() => d.parseIncoming(
     frameV1(HEARTBEAT, heartbeat({ autopilot: PX4, type: QUADROTOR }))));
   assert.equal(d.getTelemetry().firmware.overlaySuppressed, true, 'precondition');
+  assert.deepEqual(applied, [], 'precondition: nothing was applied while suppressed');
+  // Simulate the tier having been marked done before the mismatch, which is the state that
+  // made clearing the flag insufficient.
+  d.deferredOverlayDone = true;
 
   const out = capturing(() => d.parseIncoming(frameV1(HEARTBEAT, heartbeat())));
   assert.equal(d.getTelemetry().firmware.overlaySuppressed, false);
   assert.equal(d.getTelemetry().firmware.mismatch, null);
   assert.match(out, /no longer suppressed/);
+  assert.deepEqual(applied, ['full'],
+    'recovery must re-run the configuration tier that the suppression cancelled');
+  assert.equal(watchArmed, 1, 'and re-arm the verification watch it also cancelled');
 });
 
 test('the mismatch survives the reconnect loop', () => {
