@@ -104,6 +104,120 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-12 (final) — rover1 reflashed to ArduRover; the fleet is now homogeneous
+
+**rover1's flight controller was reflashed from PX4 v1.16.0 to ArduRover V4.6.3 (3fc7011a),
+the byte-identical build rover3 runs.** Firmware fetched from `firmware.ardupilot.org`
+(`Rover/stable-4.6.3/Pixhawk6C/ardurover.apj`, `board_id 56`, `summary Pixhawk6C`,
+`git_identity 3fc7011a`) and written with ArduPilot's own `uploader.py`. The operator ran the
+flash; the staging, verification and post-flash checks are below.
+
+Boot banner on rover1 now: `ArduRover V4.6.3 (3fc7011a)` · `ChibiOS: 88b84600` · `Pixhawk6C` —
+matching rover3's recorded baseline exactly. USB identity moved from
+`usb-Auterion_PX4_FMU_v6C.x` to `usb-Holybro_Pixhawk6C_3F0046000151343039373535`.
+
+**THE IDENTITY GATE'S RECOVERY PATH RAN ON HARDWARE FOR THE FIRST TIME, and the journal has
+both halves of it on one vehicle 21 minutes apart:**
+
+    15:57  Applying the pre-identity param overlay (1 of 13) …
+           PARAM_SET RC_OVERRIDE_TIME=0.2
+           WARNING this autopilot is NOT an ArduRover: MAV_AUTOPILOT=12 …; MAV_TYPE=2 … SUPPRESSED
+                                                       ← one parameter, then refused
+
+    16:18  Applying the pre-identity param overlay (1 of 13) …
+           PARAM_SET RC_OVERRIDE_TIME=0.2
+           Applying minimal Pixhawk param overlay…
+           PARAM_SET SERVO1_FUNCTION=26 … SERVO6_FUNCTION=1, FRAME_CLASS=1, MOT_SLEWRATE=250,
+           RC3_DZ=30, RC3_TRIM=1500, AHRS_GPS_USE=0, GPS1_TYPE=0
+           parameter overlay confirmed by read-back
+                                                       ← identified, all 13 applied
+
+`/status` before → after: `autopilot 12 → 3`, `type 2 → 10`, `mismatch <string> → None`,
+`overlaySuppressed true → false`, params `0 verified / 11 missing` → **11 verified, 0 missing,
+0 mismatched**. No picar restart was needed for the suppression to clear; the heartbeat did it,
+which is exactly what `a reflashed or swapped board recovers by RE-RUNNING the overlay` in
+`test/autopilot-identity.test.js` asserts.
+
+**On-target behaviour is now identical to rover3**, which is the point of the exercise:
+
+| check | rover1 before flash | rover1 after | rover3 |
+| --- | --- | --- | --- |
+| `npm run test:on-target` | exit **1** FAILED (11 params missing) | exit **4** INCOMPLETE | exit 4 INCOMPLETE |
+| `telemetry.sh` | exit **1** CHECKS FAILED | exit **0** PASSED WITH WARNINGS | exit 0 PASSED WITH WARNINGS |
+| host suite | 385/385 | 385/385 | 385/385 |
+
+**Config aligned, with ONE deliberate difference.** `steering_neutral_us: 1450` was dropped from
+rover1's untracked `picar-cfg.local.json` so it uses the repo's 1500, as rover3 does; the previous
+file is backed up at `/home/salt/fc-baseline/picar-cfg.local.json.bak-2026-08-12`.
+**`webrtc_codec: softwareH264` is KEPT and must stay.** rover1 is a Compute Module 5, and
+`/dev/video11` — the hardware H.264 encoder node — is absent on it, verified on the box. Forcing
+the repo's `hardwareH264` would break rover1's video. This is a hardware difference between CM4
+and CM5, not configuration drift, and it is the one key that should NOT be made to match.
+
+**⚠ `steering_neutral_us` IS A MECHANICAL TRIM AND WAS CHANGED WITHOUT PHYSICAL VERIFICATION.**
+1450 → 1500 moves where rover1's wheels point at neutral. Nobody has looked at the vehicle since.
+**Check the wheels are straight at neutral before driving rover1**, and restore 1450 from the
+backup if they are not.
+
+**The rover1 parameter-corruption P0 is CLOSED, by erasure rather than by restoration.** The
+reflash wipes the PX4 parameter set entirely, so the `RC3_DZ=30` / `RC3_TRIM=1500` picar had
+written into a PX4 board no longer exist in that form. ArduRover's `RC3_DZ=30` and `RC3_TRIM=1500`
+are now present because the overlay puts them there deliberately, which is correct for a rover.
+The pre-flash baseline is kept as the historical record of what that board held —
+`~/rover-fc-baselines/rover1-px4-2026-08-12.parm` and `/home/salt/fc-baseline/` on rover1, 1100
+parameters, `sha256:2ecbd6b31e2c2bb2…`.
+
+**AFTER THE FLASH THE ESC FAST-BLINKED — no PWM was reaching it. Three things had to be fixed.**
+
+1. **`BRD_SAFETY_DEFLT` was 1**, the ArduPilot default. That engages the hardware safety switch at
+   boot and inhibits **all PWM output at the IO level, regardless of armed state** — so the ESC saw
+   no pulses at all. Set to 0, confirmed by read-back, flight controller rebooted;
+   `PreArm: Hardware safety switch` then disappeared from the log and `SERVO_OUTPUT_RAW` appeared:
+   `ch1=1500 ch2=2000 ch3=1500 ch4=2000 ch5=1000 ch6=1000`. Throttle (ch3) at 1500 µs is a valid
+   neutral, which is what the ESC needed.
+
+   **CONSEQUENCE, and it is a real one: rover1's outputs are now live from the moment it boots,**
+   with no button press, and picar force-arms past pre-arm anyway. The wheels can turn without
+   any deliberate action. Set it back to 1 to restore the button requirement.
+
+   Note this was NOT discoverable from picar: the parameter is outside the 13 the overlay owns, so
+   `/status` showed 11/11 verified and a healthy link while the vehicle could not move an inch.
+
+2. **MAVProxy then failed and stayed down.** The flight controller's reboot did not release
+   `/dev/ttyACM0`, so it re-enumerated as `ttyACM1`/`ttyACM2` — and the unit hardcodes
+   `--master=/dev/ttyACM0`. MAVProxy failed five times in two seconds, hit
+   `Start request repeated too quickly`, and gave up, taking picar's link with it. This is exactly
+   the failure `fix/systemd-restart-limits` is open for, observed for the first time.
+
+   Fixed on rover1 with a drop-in at `/etc/systemd/system/mavproxy.service.d/by-id-master.conf`
+   pointing `--master` at
+   `/dev/serial/by-id/usb-Holybro_Pixhawk6C_3F0046000151343039373535-if00`, which follows the
+   board by serial number rather than enumeration order. **The tracked unit still hardcodes
+   `/dev/ttyACM0` and every rover will hit this after any FC reboot** — filed in `TASKS.md`.
+
+3. **Two pre-arm failures remain and cannot be cleared remotely:** `3D Accel calibration needed`
+   and `Compass not calibrated`. Both need the vehicle physically rotated. picar force-arms past
+   them, so they do not block driving, but the EKF has no good attitude solution until the accel
+   calibration is done.
+
+**rover1 became unreachable again** (no SSH) shortly after this, before flight mode, CPU load and
+video configuration could be measured. So the reported "worse performance than rover3" is
+UNDIAGNOSED — see `TASKS.md` for the candidates and what to measure.
+
+**Still read-only tier.** Nothing was armed on either rover today. rover1 holds a pack at 7.43 V
+drawing 0.49 A. A freshly reflashed flight controller has ArduPilot defaults for everything
+outside the 13 the overlay owns — RC calibration, compass, accelerometer — so **rover1 is not
+ready to drive** until those are done, independently of anything in this repo.
+
+**rover3 was unreachable at the end of the session** (no ICMP, no SSH, by name or IP) and is on
+`b2a891d`, two documentation-only commits behind. It may have been left with `picar` stopped: the
+last command sent to it was `stop picar → fetch → merge → start picar` and it dropped mid-way.
+Not a motion risk — with picar down nothing sends RC overrides and `RC_OVERRIDE_TIME=0.2` expires
+them in 200 ms — but its state is unverified. Bring it level with:
+
+    ssh saltenna@rover3 'cd /opt/picar && sudo systemctl start picar && git fetch origin && \
+      git merge --ff-only origin/main && sudo systemctl restart picar'
+
 ### 2026-08-12 (later still) — rover1's flight-controller baseline captured before reflash
 
 Both rovers are now on `main` @ `b2a891d`, identical to `origin/main`. Same code, opposite
