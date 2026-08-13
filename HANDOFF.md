@@ -104,6 +104,86 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-13 — ICE-over-UDP landed, codecs measured, reader count replaces the viewer cap
+
+**Fleet state:** rover1 and rover2 both on `main` @ `8da0120`, identical to `origin/main`,
+services active, `NRestarts=0`. **rover3 was unreachable all session** (no SSH, no ICMP, by
+name or IP) and is two commits behind at `b2a891d`.
+
+**ICE-over-UDP is on main and verified on hardware.** Cherry-picked ALONE from the parked
+`fix/webrtc-require-udp` branch — none of that branch's adaptive-bitrate machinery, reduced
+video load or one-viewer cap came with it. `main` had been writing
+`webrtcLocalTCPAddress: :8189` unconditionally, so every session could silently fall back to
+ICE-over-TCP; measured on rover3 on 2026-08-06 that produced 544 `QBUF failed` in 112 s at
+200 kbps AND 12 `no input for 1000 ms` control fail-safe trips in ~100 s. Verified on rover2:
+the generated `mediamtx.yml` now carries only `webrtcLocalUDPAddress`. **Not verified with a
+real browser session** — confirming the selected candidate pair needs `getStats()`.
+
+**Why this mattered so much:** rover3 ran that parked branch for weeks and was the
+best-performing rover in the fleet. Moving it to `main` on 2026-08-12 REMOVED the fix from it,
+and rover1 never had it. The "rover1 is worse than rover3" comparison was, in part, comparing
+a rover that had this fix against one that did not.
+
+**CODEC COSTS, MEASURED on rover2 (CM4 Rev 1.1), identical settings, `codec-benchmark.sh`:**
+
+| setting | hardwareH264 | softwareH264 | ratio |
+| --- | --- | --- | --- |
+| 480x360 @20, 350 kbps | 4.9% | 16.0% | 3.3x |
+| 1280x720 @30, 2000 kbps | 8.1% | **78.4%** | **9.7x** |
+
+Zero dropped frames and zero QBUF errors in all four runs — software KEEPS UP, it just costs
+more, and the gap widens with pixel rate because a dedicated block barely notices resolution
+while a software encoder scales with it. **softwareH264 cannot be tuned to match hardware**;
+the honest lever is keeping the pixel rate modest where software is forced, and at the shipped
+480x360@20 the delivered stream is identical for ~11 points of one core. rover1's CM5 has no
+hardware encoder at all, so it has no choice; its faster CPU should make the same work cheaper
+there, which is UNMEASURED because rover1 was down when the benchmark ran.
+
+Negative result worth keeping: **denoise is not the lever.** `cdn_off` measured 15.9% against
+`cdn_fast`'s 16.0%.
+
+**THE VIEWER CAP WAS REJECTED, and the reader count replaces it.** The parked branch capped
+the camera at one reader. That blocks the legitimate case — this fleet is meant to be a mesh,
+where reaching any node and having more than one client on a camera is the point — to hide the
+illegitimate one. And the real defect was never the second viewer: `streams/webrtc.js` returned
+`clientCount() { return 0; }`, a hardcoded stub, so a forgotten tab was INVISIBLE. `/status`
+now reports `video: { readers, readersError }` from MediaMTX's API, bound to **127.0.0.1 only**
+because this server still has no authentication. `null` deliberately means "could not
+determine", never 0.
+
+**rover2's uncommitted work was preserved and then ANALYSED — nothing is lost.** It arrived
+with an unresolved merge conflict in `picar-cfg.json` plus edits to `fleetmgr-client.js` (+118)
+and `socket.html` (+75) dating from 2026-07-23 on the `fleet-manager` branch. Preserved at
+`/home/saltenna/rover2-preserve-2026-08-13/` on the rover and `~/rover-preserve/` on the
+workstation, with full diffs. Compared line-by-line against current `main`: **2 unique lines of
+101** in `fleetmgr-client.js` (a log string and an export, both present on main in another
+form) and **27 of 941** in `socket.html`, all reformatted variants of code main already has.
+Every symbol — `candidateIps`, `discover`, `probeFleetId`, `PROBE_CONCURRENCY`,
+`KEY_STEERING_STEP`, `tlockFrontValue`, `STEERING_DEADZONE` — exists on main at equal or
+greater count. The work was superseded by what landed later; the preserved copies are kept
+anyway.
+
+**NETWORK DIAGNOSIS, and the cause is on the WORKSTATION, not the rovers.** OpenVPN installs
+`0.0.0.0/2` and `64.0.0.0/2` routes via `tun0`, which swallow the lab subnet — so traffic from
+`192.168.31.212` to a rover on `192.168.31.168`, same subnet, same room, goes through the
+tunnel and back at `ttl=61`. Measured over 60 packets:
+
+| | via VPN | direct LAN |
+| --- | --- | --- |
+| avg RTT | 18.5 ms | **6.0 ms** |
+| jitter | 6.8 ms | 3.8 ms |
+| loss | **1.7%** | 0% |
+
+1.7% packet loss on the link carrying control commands is the serious half. rover1's own WiFi
+hop to its gateway was clean — 2.9-14.6 ms, jitter 1.9 ms, 0% loss, 5 GHz ch149, -42 dBm — so
+**the rovers' RF is not the problem.** The workstation's WiFi also has `Power save: on`, which
+produced a 236 ms spike. Fix on the workstation, both reversible and runtime-only:
+
+    sudo ip route add 192.168.31.0/24 dev wlp194s0 src 192.168.31.212 metric 50
+    sudo iw dev wlp194s0 set power_save off
+
+
+
 ### 2026-08-12 (final) — rover1 reflashed to ArduRover; the fleet is now homogeneous
 
 **rover1's flight controller was reflashed from PX4 v1.16.0 to ArduRover V4.6.3 (3fc7011a),
