@@ -9,9 +9,46 @@ const fs   = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
+// ICE-TCP is OPT-IN, and off by default. This is a safety-relevant default, not a
+// preference.
+//
+// MEASURED ON ROVER3, 2026-08-06. Every WebRTC session during a failed out-of-sight drive
+// negotiated ICE over **TCP**, never UDP:
+//
+//   [session e7b1b545] peer connection established,
+//     local candidate: host/tcp/192.168.10.224/8189, remote candidate: prflx/tcp/…
+//
+// UDP 8189 was bound and listening and the rover has no firewall, so UDP was available on
+// the rover's side and simply lost the connectivity checks across that path. WebRTC then
+// did what ICE is designed to do — fell back to the next candidate — and that is the
+// problem: **the fallback is silent, and TCP is the wrong transport for real-time video.**
+// It keeps WebRTC's assumption that it may shed media freely while running on a transport
+// with head-of-line blocking that will not let it. The observed result was back-pressure
+// into MediaMTX's pipe and a starved hardware encoder: 544 `ioctl(VIDIOC_QBUF) failed` in
+// 112 s at only 200 kbps offered, with video stopping for every viewer until the session
+// was torn down.
+//
+// So the default is now UDP or nothing. A link that cannot carry UDP fails immediately and
+// visibly, which is strictly better than degrading into a transport that also takes the
+// control path down with it — video and commands share half-duplex airtime, and the same
+// drive logged 12 `no input for 1000 ms` fail-safe trips in ~100 s.
+//
+// Verified from the browser side with getStats() on the same day: with UDP reachable the
+// selected pair is `prflx/udp/… ↔ host/udp/<rover>:8189`, succeeded and nominated. Chrome
+// mDNS-obfuscates its own host candidate, which is why the rover observes `prflx` rather
+// than `host` — that is expected and not a symptom.
+//
+// Set `webrtc_ice_tcp: true` to restore the old behaviour deliberately, knowing the cost.
 function generateMediaMTXConfig(cfg, params) {
   const port    = cfg.webrtc_port     || 8889;
   const udpPort = cfg.webrtc_udp_port || 8189;
+  // Strict `=== true`: any other value, including a truthy string from a hand-edited
+  // overlay, leaves the safe default in place rather than silently enabling TCP.
+  const iceTcp  = cfg.webrtc_ice_tcp === true;
+  // Omitted entirely rather than set empty — MediaMTX treats an absent key as "no TCP
+  // listener", and an empty string has meant "listen on all interfaces" in some config
+  // parsers. Absent is the unambiguous form.
+  const iceTcpLine = iceTcp ? `webrtcLocalTCPAddress: :${udpPort}\n` : '';
   const keyPath  = cfg.mediamtx_key  || path.join(__dirname, '..', 'certs', 'key.pem');
   const certPath = cfg.mediamtx_cert || path.join(__dirname, '..', 'certs', 'cert.pem');
   const camPath  = (cfg.webrtc_path  || 'cam').replace(/^\/+/, '');
@@ -32,8 +69,7 @@ webrtcServerKey: ${keyPath}
 webrtcServerCert: ${certPath}
 webrtcAllowOrigins: ['*']
 webrtcLocalUDPAddress: :${udpPort}
-webrtcLocalTCPAddress: :${udpPort}
-webrtcIPsFromInterfaces: true
+${iceTcpLine}webrtcIPsFromInterfaces: true
 webrtcIPsFromInterfacesList: []
 webrtcAdditionalHosts: []
 webrtcHandshakeTimeout: 20s
@@ -184,3 +220,9 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     },
   };
 };
+
+// Exported for tests. The generated yml is the only place the ICE transport policy is
+// expressed, and it reaches MediaMTX as a file rather than as an API call — so without
+// this the default that decides whether video can silently fall back to TCP is
+// unassertable, which is how it stayed wrong.
+module.exports.generateMediaMTXConfig = generateMediaMTXConfig;
