@@ -50,6 +50,28 @@ ssh saltenna@rover3 'cd /opt/picar && sudo test/on-target/video-drop.sh'
 | Script | Proves |
 | --- | --- |
 | `video-drop.sh` | The frame-drop path actually sheds frames on real hardware, keyframes survive a delta-level backlog, and the parse buffers stay bounded |
+| `codec-benchmark.sh` | What a video codec actually COSTS this rover, measured, so hardwareH264 and softwareH264 are compared on identical settings instead of by impression |
+
+## codec-benchmark.sh
+
+Measures encoder CPU at a fixed resolution/fps/bitrate, and counts the failures that do NOT
+show up as CPU — starved-encoder `QBUF` errors and MediaMTX's `reader is too slow` frame
+discards. `sourceOnDemand: false` means the camera encodes continuously, so no browser is
+needed to make the measurement.
+
+It restores the original `picar-cfg.local.json` and restarts picar on **every** exit path,
+including a failure or Ctrl-C — a benchmark that leaves the rover on the codec it was
+measuring is a configuration change wearing a lab coat.
+
+It commands **no motion**. It is still not routine: it restarts the video pipeline, so any
+viewer loses their stream.
+
+    sudo test/on-target/codec-benchmark.sh softwareH264 60
+    sudo WIDTH=1280 HEIGHT=720 FPS=30 BITRATE=2000 test/on-target/codec-benchmark.sh hardwareH264 45
+
+**What it does not measure:** delivered quality, latency, or what a real viewer sees. A codec
+can be cheap here and still stutter at the browser. Those need `getStats()` from a real
+session.
 
 ## Why video-drop.sh needs care
 
