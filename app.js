@@ -85,6 +85,16 @@ const appServer = https.createServer(options, (req, res) => {
       throttle: old_throttle,
       steering: old_steering,
       telemetry: currentTelemetry(),
+      // How many clients are pulling video RIGHT NOW, and why that is unknown when it is.
+      // Surfaced rather than capped: a hard one-viewer limit was proposed for this, and it
+      // would block the legitimate case (two operators, a mesh peer) to hide the illegitimate
+      // one. A forgotten tab that halves the link is a VISIBILITY problem — it went unnoticed
+      // during a range test on 2026-08-06 precisely because nothing reported it. `null` means
+      // picar could not determine it, which is NOT the same as nobody watching.
+      video: {
+        readers: typeof stream.clientCount === 'function' ? stream.clientCount() : null,
+        readersError: typeof stream.clientCountError === 'function' ? stream.clientCountError() : null,
+      },
     }));
   } else if (parsed.pathname === '/manifest.json') {
     const roverId = config.rover_id ?? 1;
