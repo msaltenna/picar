@@ -84,6 +84,22 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ## Backlog
 
+- **[P3] Hardware-only encoder options are emitted even when the codec is software** —
+  `streams/webrtc.js` writes `rpiCameraHardwareH264Profile` and `rpiCameraHardwareH264Level`
+  unconditionally, so a rover running `softwareH264` (which rover1's CM5 is FORCED onto — no
+  hardware encoder) receives hardware-encoder settings that do not apply to it. Harmless today,
+  because MediaMTX ignores them, but it is a generated config that lies about what the encoder
+  is doing, and the next person tuning software H.264 will reasonably believe profile/level are
+  in play. Emit them only when the codec is `hardwareH264`.
+
+- **[P2] Nothing measures whether encoder CPU reaches the CONTROL path** — `codec-benchmark.sh`
+  shows softwareH264 at 78.4% of a core at 720p30 on a CM4, on the same four cores as the
+  control loop, the 20 Hz override stream and the input watchdog. Invariant 9 says a blocked
+  event loop is a safety failure, and no measurement connects the two. Add event-loop lag
+  sampling (`perf_hooks.monitorEventLoopDelay`) to the telemetry tick, so the cost of a video
+  setting is visible as a control-path number rather than inferred from `%CPU`.
+
+
 - **[P0] The tracked `mavproxy.service` hardcodes `/dev/ttyACM0`, which does not survive a flight
   controller reboot** — observed on rover1, 2026-08-12. Rebooting the FC (any parameter change
   requiring it, or a reflash) does not release the old handle, so the board re-enumerates as
