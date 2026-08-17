@@ -278,7 +278,16 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
 
   const API_HOST = '127.0.0.1';
   const API_PORT = config.mediamtx_api_port || 9997;
-  const READER_POLL_MS      = Math.max(1000, config.webrtc_reader_poll_ms ?? 3000);
+  // Finite-integer clamp, not Math.max. `Math.max(1000, "invalid")` is NaN, and Node schedules
+  // a NaN interval at 1 ms — an HTTP GET every millisecond on the event loop that carries the
+  // 20 Hz override stream and the input watchdog (invariant 9). It also breaks the stall
+  // detector below, which counts equal samples rather than elapsed time: at 1 ms, many polls
+  // land between two 20 fps frames, so a HEALTHY encoder is declared dead and MediaMTX is
+  // restarted. One malformed key in the untracked overlay, two failures. Found by review.
+  const READER_POLL_MS = (() => {
+    const n = Number(config.webrtc_reader_poll_ms);
+    return Number.isFinite(n) ? Math.min(60000, Math.max(1000, Math.round(n))) : 3000;
+  })();
   const READER_TIMEOUT_MS   = 1500;
 
   function pollReaders() {
@@ -305,6 +314,7 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
           const parsed = JSON.parse(body);
           readerCount   = Array.isArray(parsed.readers) ? parsed.readers.length : null;
           readerPollErr = readerCount === null ? 'no readers array in API response' : null;
+          noteSourceProgress(parsed);
         } catch (e) {
           readerPollErr = `unparseable API response: ${e.message}`;
         }
@@ -312,6 +322,160 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     });
     req.on('timeout', () => { readerPollErr = 'API timeout'; req.destroy(); });
     req.on('error', (e) => { readerPollErr = e.message; });
+  }
+
+  // ── Dead-source detection ──────────────────────────────────────────────────
+  //
+  // MEASURED ON ROVER2, 2026-08-14. Its hardware encoder entered a permanent failure state:
+  // `encoder_hardware_h264_encode(): ioctl(VIDIOC_QBUF) failed` at ~21/s, 229,561 errors and
+  // counting. The decisive symptom is not the log spam — it is that the path still reported
+  //
+  //     ready: true,  readers: 0,  bytesReceived rate: 0 B/s
+  //
+  // against rover3's healthy 46,840 B/s on identical hardware and identical config. MediaMTX
+  // advertises the path as available while producing nothing, so any viewer that connects
+  // gets a black screen and no error. Restarting mediamtx is the only known recovery.
+  //
+  // DETECTED FROM bytesReceived RATHER THAN THE JOURNAL, deliberately. Scraping journalctl for
+  // QBUF lines would need a subprocess on a timer and would be coupled to one encoder's error
+  // string; this reuses the API poll that already exists for the reader count, costs nothing
+  // extra, and measures the thing that actually matters — whether video is being produced.
+  //
+  // `ready` is the load-bearing guard. With sourceOnDemand the camera is legitimately stopped
+  // when nobody is watching, and bytesReceived correctly does not advance then — but the path
+  // reports ready:false, so an idle rover is never mistaken for a broken one.
+  let lastBytes      = null;
+  let stalledPolls     = 0;
+  let notReadyPolls    = 0;
+  let healthyPolls     = 0;
+  let sourceDead       = false;
+  let recoveryCount    = 0;     // per-incident, reset after a sustained healthy run
+  let totalRecoveries  = 0;     // lifetime, for observability only
+  // Whether the camera is genuinely on-demand. Must match what generateMediaMTXConfig wrote,
+  // or `ready:false` is misinterpreted in one direction or the other.
+  const onDemandEnabled = config.webrtc_camera_on_demand === true
+                          && config.webrtc_keep_camera_warm !== true;
+  // CLAMPED AS FINITE INTEGERS, not just Math.max'd. `Math.max(2, "invalid")` is NaN, and NaN
+  // defeats BOTH guards at once in the unsafe direction: `stalledPolls < NaN` is false, so a
+  // perfectly healthy path is declared dead on the first poll, and `recoveryCount >= NaN` is
+  // also false, so the restart cap never engages — an endless restart loop on a working
+  // rover. Both keys are reachable from the untracked overlay with no review (invariant 8).
+  // Found by adversarial review.
+  const clampInt = (v, fallback, min, max) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(n)));
+  };
+  const STALL_POLLS_TO_DECLARE_DEAD = clampInt(config.webrtc_source_stall_polls, 4, 2, 100);
+  const MAX_RECOVERIES              = clampInt(config.webrtc_max_source_recoveries, 3, 0, 20);
+  const HEALTHY_POLLS_TO_RESET      = clampInt(config.webrtc_healthy_polls_to_reset, 10, 3, 1000);
+
+  function noteSourceProgress(parsed) {
+    const bytes = Number(parsed && parsed.bytesReceived);
+    // Not ready = the camera is deliberately stopped (on-demand) or still starting. Neither
+    // is a fault, and both must reset the counter or an idle rover would eventually be
+    // declared dead and restarted in a loop.
+    if (!Number.isFinite(bytes)) { lastBytes = null; stalledPolls = 0; return; }
+    if (parsed.ready !== true) {
+      // `ready:false` is benign ONLY when the camera is deliberately stopped — that is,
+      // on-demand is enabled and nobody is watching. With the shipped always-on config it
+      // means the camera FAILED TO START or disappeared, and clearing the fault there
+      // reported a rover with no video as healthy: `/status` showed `dead:false`,
+      // `readersError:null`, and no recovery was attempted. Found by review, and it is the
+      // same "reports healthy while broken" shape this whole branch exists to remove.
+      lastBytes = null; stalledPolls = 0;
+      if (onDemandEnabled) { sourceDead = false; return; }
+      notReadyPolls += 1;
+      if (notReadyPolls >= STALL_POLLS_TO_DECLARE_DEAD && !sourceDead) {
+        sourceDead = true;
+        console.error(
+          'WebRTC: the camera path is NOT READY on an always-on configuration — the camera ' +
+          'failed to start or has disappeared. No viewer can get video.');
+        maybeRecover();
+      }
+      return;
+    }
+    notReadyPolls = 0;
+    // Three cases, kept distinct on purpose. Folding the first into the third is the bug the
+    // first draft of this fix had: a recovery resets lastBytes to null, so the very next poll
+    // looked like "forward progress" and cleared the fault it had just raised.
+    if (lastBytes === null) {
+      stalledPolls = 0;                       // first sample of a window: nothing to compare
+    } else if (bytes === lastBytes) {
+      stalledPolls += 1;                      // no data produced since the last poll
+    } else {
+      // GENUINE FORWARD PROGRESS CLEARS THE FAULT. Only `stalledPolls` was reset here
+      // originally, so `sourceHealth().dead` stayed true forever after a successful recovery
+      // and an operator would see a rover permanently reported broken while its video worked.
+      // A stale fault indicator is the same class of defect as a missing one: both stop being
+      // read. Found by adversarial review.
+      if (sourceDead) {
+        console.log('WebRTC: the camera source is producing data again — recovered.');
+        sourceDead = false;
+      }
+      stalledPolls = 0;
+      // A SUSTAINED healthy run resets the per-incident attempt budget. The cap exists to
+      // bound ONE restart loop, not to be spent across a process lifetime: three separate
+      // stalls, each successfully recovered, previously disabled automatic recovery for good,
+      // so a later recoverable stall stayed black until someone intervened. `totalRecoveries`
+      // keeps the lifetime figure for observability. Found by review.
+      healthyPolls += 1;
+      if (healthyPolls >= HEALTHY_POLLS_TO_RESET && recoveryCount > 0) {
+        console.log(`WebRTC: camera source healthy for ${healthyPolls} polls — ` +
+                    'resetting the recovery budget for any future incident.');
+        recoveryCount = 0;
+      }
+    }
+    lastBytes = bytes;
+
+    if (stalledPolls < STALL_POLLS_TO_DECLARE_DEAD) return;
+    if (!sourceDead) {
+      sourceDead = true;
+      console.error(
+        `WebRTC: the camera source is READY but has produced NO DATA for ${stalledPolls} ` +
+        `consecutive polls (${bytes} bytes, unchanged). MediaMTX is advertising a path that ` +
+        `delivers nothing — measured on rover2 as a permanently failed hardware encoder.`);
+    }
+    maybeRecover();
+  }
+
+  // Restart mediamtx, bounded and loudly.
+  //
+  // NOT gated on the reader count, and that is the deliberate choice: a dead source is
+  // delivering nothing to anyone, so a viewer has no video to lose. Withholding the restart
+  // while someone is connected would preserve a black screen instead of fixing it. The
+  // protection against a restart loop is the ATTEMPT CAP plus the ready/bytes guard, not a
+  // reader check.
+  // Injectable so the CAP is testable. restartMediamtx() sets `restarting` until the spawned
+  // child settles, and on a host with no mediamtx unit that timing is unpredictable — which
+  // paced attempts so unevenly that a test could not distinguish a capped implementation from
+  // an uncapped one. Measured: removing the cap survived the test until this existed. Same
+  // dependency-injection reasoning telemetry-loop.js gives for setIntervalFn and readWifi.
+  const doRestart = config._restartFn || restartMediamtx;
+  const pacedByRestart = !config._restartFn;
+
+  function maybeRecover() {
+    if (stopped || (pacedByRestart && restarting)) return;
+    if (recoveryCount >= MAX_RECOVERIES) {
+      return;   // already reported below on the transition; stay quiet rather than spam
+    }
+    recoveryCount += 1;
+    totalRecoveries += 1;
+    healthyPolls = 0;
+    console.error(
+      `WebRTC: restarting mediamtx to recover the dead camera source ` +
+      `(attempt ${recoveryCount}/${MAX_RECOVERIES}). A restart drops any active WebRTC ` +
+      `session; they are receiving no video anyway.`);
+    // Reset the detector so the next window is judged fresh rather than immediately
+    // re-triggering on the pre-restart byte count.
+    lastBytes = null; stalledPolls = 0;
+    doRestart();
+    if (recoveryCount >= MAX_RECOVERIES) {
+      console.error(
+        `WebRTC: that was the last automatic recovery attempt. If the source dies again it ` +
+        `will be REPORTED and not restarted — an endless restart loop hides a broken rover ` +
+        `rather than fixing it. Investigate the encoder.`);
+    }
   }
 
   const readerTimer = setInterval(pollReaders, READER_POLL_MS);
@@ -324,6 +488,15 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     // Why the count is null, for an operator who needs to tell "nobody watching" from
     // "picar cannot see MediaMTX".
     clientCountError() { return readerPollErr; },
+    // Exposed so the clamp is assertable — a bound nothing can observe is one nothing tests.
+    pollIntervalMs() { return READER_POLL_MS; },
+    // Whether the camera path is advertising itself as ready while producing nothing, and
+    // how many automatic recoveries have been spent. Surfaced so a rover that has exhausted
+    // its attempts is visible rather than quietly broken.
+    sourceHealth() {
+      return { dead: sourceDead, stalledPolls, notReadyPolls,
+               recoveries: recoveryCount, totalRecoveries, maxRecoveries: MAX_RECOVERIES };
+    },
     stop() {
       clearInterval(readerTimer);
       // Latch shutdown BEFORE clearing state. Otherwise a setVideoParams arriving

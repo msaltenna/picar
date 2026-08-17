@@ -99,6 +99,12 @@ const appServer = https.createServer(options, (req, res) => {
       video: {
         readers: typeof stream.clientCount === 'function' ? stream.clientCount() : null,
         readersError: typeof stream.clientCountError === 'function' ? stream.clientCountError() : null,
+        // Whether the camera path is advertising itself as ready while producing NOTHING —
+        // rover2 sat in exactly that state for hours, `ready:true` at 0 B/s, so a viewer got
+        // a black screen and no error. Reported here because a fault only the code can see is
+        // a fault nobody acts on: a reviewer pointed out sourceHealth() was read by tests and
+        // by nothing else.
+        source: typeof stream.sourceHealth === 'function' ? stream.sourceHealth() : null,
       },
     }));
   } else if (parsed.pathname === '/manifest.json') {
