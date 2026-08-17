@@ -446,21 +446,25 @@ test('an INACTIVE unit is the loudest thing on the bar', () => {
     uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: 50 }, throttled: { active: false, now: [], sinceBoot: [] },
-                         services: { picar: 'active', mavproxy: 'failed', mediamtx: 'active' } } },
+                         services: { picar: { ok: true, state: 'active' },
+                                     mavproxy: { ok: false, why: 'failed', state: 'failed' },
+                                     mediamtx: { ok: true, state: 'active' } } } },
   });
   assert.match(out, /SVC/);
   assert.match(out, /mavproxy:failed/);
   assert.doesNotMatch(out, /picar:/, 'a healthy unit must not add noise');
 });
 
-test('all-active services add nothing to the bar', () => {
+test('all-healthy services are STILL shown, in green', () => {
   const out = renderStatusBarWith({
     uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: 50 }, throttled: { active: false, now: [], sinceBoot: [] },
-                         services: { picar: 'active', mavproxy: 'active', mediamtx: 'active' } } },
+                         services: { picar: { ok: true }, mavproxy: { ok: true },
+                                     mediamtx: { ok: true } } } },
   });
-  assert.doesNotMatch(out, /SVC/);
+  assert.match(out, /SVC/, 'the line is permanent — healthy units are shown as healthy');
+  assert.doesNotMatch(out, /#f66/, 'but nothing is red');
 });
 
 test('a sampler that cannot read its sources says so', () => {
@@ -493,7 +497,9 @@ test('switching it OFF still surfaces a dead service', () => {
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: 50, busyPct: 2 },
                          throttled: { active: false, now: [], sinceBoot: [] },
-                         services: { picar: 'active', mavproxy: 'failed', mediamtx: 'active' } } },
+                         services: { picar: { ok: true, state: 'active' },
+                                     mavproxy: { ok: false, why: 'failed', state: 'failed' },
+                                     mediamtx: { ok: true, state: 'active' } } } },
   });
   assert.match(out, /mavproxy:failed/);
 });
@@ -504,7 +510,54 @@ test('switching it OFF hides the routine reading on a healthy rover', () => {
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: 55, busyPct: 5 },
                          throttled: { active: false, now: [], sinceBoot: [] },
-                         services: { picar: 'active', mavproxy: 'active', mediamtx: 'active' } } },
+                         services: { picar: { ok: true }, mavproxy: { ok: true },
+                                     mediamtx: { ok: true } } } },
   });
   assert.doesNotMatch(out, /CPU/, 'the toggle must actually do something');
+});
+
+
+// ── active is not the same as working, on the bar ────────────────────────────
+
+test('a CRASH-LOOPING unit renders red even though it is active', () => {
+  // The case the operator raised: a service can be `active` and still be failing. systemd
+  // reports a unit it restarts every few seconds as active/running most of the time.
+  const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 55, busyPct: 5 },
+                         throttled: { active: false, now: [], sinceBoot: [] },
+                         services: { picar: { ok: true },
+                                     mediamtx: { ok: false, why: 'restart-looping',
+                                                 state: 'active', sub: 'auto-restart' } } } },
+  });
+  assert.match(out, /restart-looping/, 'the REASON must be named, not just a red marker');
+  assert.match(out, /#f66/);
+});
+
+test('the service line names WHAT is wrong, per unit', () => {
+  // "mav:inactive" and "mav:restart-looping" call for completely different responses.
+  const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 55, busyPct: 5 },
+                         throttled: { active: false, now: [], sinceBoot: [] },
+                         services: { picar: { ok: true },
+                                     mavproxy: { ok: false, why: 'inactive' },
+                                     mediamtx: { ok: false, why: 'last-exit:exit-code' } } } },
+  });
+  assert.match(out, /inactive/);
+  assert.match(out, /last-exit:exit-code/);
+});
+
+test('services that could not be determined are not rendered as healthy', () => {
+  const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 55, busyPct: 5 },
+                         throttled: { active: false, now: [], sinceBoot: [] },
+                         services: null } },
+  });
+  assert.match(out, /SVC --/, 'unknown must not look like "all fine"');
+  assert.doesNotMatch(out, /\u2713/);
 });
