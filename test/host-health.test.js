@@ -307,3 +307,56 @@ test('a stalled source is reported rather than silently retried forever', async 
     assert.notEqual(s.errors, null, 'a wedged source must surface, not just read as absent');
   } finally { h.stop(); }
 });
+
+// ── Which units a rover is expected to run ───────────────────────────────────
+
+const { expectedUnits } = require('../host-health.js');
+
+test('a webrtc + mavproxy rover watches all three units', () => {
+  assert.deepEqual(expectedUnits({ stream_codec: 'webrtc', pwm_method: 'mavproxy' }),
+    ['picar', 'mavproxy', 'mediamtx']);
+});
+
+test('an h264 or mjpeg rover does NOT watch mediamtx', () => {
+  // install.sh disables MediaMTX for these codecs; picar serves the stream itself. Watching
+  // it would put a permanent red SVC warning on a healthy rover, which trains an operator to
+  // ignore the alert that is meant to reveal a real failure.
+  for (const codec of ['h264', 'mjpeg']) {
+    assert.deepEqual(expectedUnits({ stream_codec: codec }), ['picar', 'mavproxy'],
+      `${codec} must not expect mediamtx`);
+  }
+});
+
+test('a GPIO rover does NOT watch mavproxy', () => {
+  // Four of the five drivers are GPIO and speak no MAVLink at all.
+  assert.deepEqual(expectedUnits({ pwm_method: 'pigpio' }), ['picar', 'mediamtx']);
+  assert.deepEqual(expectedUnits({ pwm_method: 'mavproxy', use_mavproxy: false }),
+    ['picar', 'mediamtx'], 'use_mavproxy:false disables the unit even on the mavproxy driver');
+});
+
+test('the defaults match the shipped config', () => {
+  // picar-cfg.json ships stream_codec: webrtc and pwm_method: mavproxy.
+  assert.deepEqual(expectedUnits({}), ['picar', 'mavproxy', 'mediamtx']);
+});
+
+test('a permanently stalled source starts NO additional operations', async () => {
+  // The reviewer MEASURED the previous attempt failing this: outstanding reads grew from 5 at
+  // 0.6 s to 25 at 4.6 s, because racing a deadline abandons the read and reschedules anyway.
+  // The guard is now held until the work actually settles, so a wedged source must produce
+  // exactly ONE outstanding operation of each kind no matter how long it is left.
+  const h = createHostHealth({
+    readFile: () => new Promise(() => {}),          // never settles
+    run: () => new Promise(() => {}),
+    fastMs: 500, slowMs: 5000,
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 600));
+    const early = h.startedCount();
+    await new Promise((r) => setTimeout(r, 4000));
+    const late = h.startedCount();
+    assert.equal(late, early,
+      `operations started grew ${early} -> ${late} against a stalled source; ` +
+      'the in-flight guard is not holding');
+    assert.ok(late <= 2, `at most one fast and one slow poll may ever be outstanding, got ${late}`);
+  } finally { h.stop(); }
+});

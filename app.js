@@ -206,7 +206,7 @@ if (warnability) console.error(warnability);
 // systemctl blocked on a hung unit cannot pile up. On a non-Pi host vcgencmd simply does
 // not exist and the promise rejects, which host-health.js reports as an error and a null
 // reading rather than a fabricated zero.
-const { createHostHealth } = require('./host-health');
+const { createHostHealth, expectedUnits } = require('./host-health');
 const { execFile } = require('child_process');
 const hostHealth = createHostHealth({
   readFile: (p, enc) => fs.promises.readFile(p, enc),
@@ -220,6 +220,9 @@ const hostHealth = createHostHealth({
   }),
   fastMs: config.host_health_fast_ms,
   slowMs: config.host_health_slow_ms,
+  // Derived from the EFFECTIVE config, so a rover legitimately running without MediaMTX
+  // (h264/mjpeg codecs) or without MAVProxy (the GPIO drivers) is not reported as broken.
+  units: expectedUnits(config),
 });
 
 const telemetryLoop = startTelemetryLoop(

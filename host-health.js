@@ -37,6 +37,28 @@ const CPUFREQ_DIR  = '/sys/devices/system/cpu/cpu0/cpufreq';
 // makes a degraded-but-running state visible.
 const WATCHED_UNITS = ['picar', 'mavproxy', 'mediamtx'];
 
+// Which units this rover is actually EXPECTED to run, derived from the effective config.
+//
+// A reviewer caught the original watching all three unconditionally. That is wrong on
+// supported configurations: install.sh disables MediaMTX for the h264 and mjpeg stream
+// codecs, and MAVProxy is irrelevant to the four GPIO drivers. Those rovers are healthy, and
+// a permanent red "SVC mediamtx:inactive" on a healthy rover trains an operator to ignore the
+// exact alert that is supposed to reveal a real failure — the same way a status bar that
+// flickers 'FC: ok' -> 'FC: unverified' taught people to stop reading it.
+//
+// So an intentionally-absent service is not watched at all, rather than watched and excused.
+function expectedUnits(config = {}) {
+  const units = ['picar'];
+  // The mavproxy driver is the only one that speaks MAVLink; `use_mavproxy: false` disables
+  // the unit even when the driver is selected.
+  if ((config.pwm_method || 'mavproxy') === 'mavproxy' && config.use_mavproxy !== false) {
+    units.push('mavproxy');
+  }
+  // MediaMTX serves the webrtc codec only; h264 and mjpeg are served by picar itself.
+  if ((config.stream_codec || 'webrtc') === 'webrtc') units.push('mediamtx');
+  return units;
+}
+
 // ── Pure parsers ─────────────────────────────────────────────────────────────
 // Separated from I/O so they are testable without a Pi, and so a wrong bit mask fails a
 // host test rather than being discovered on a rover.
@@ -234,47 +256,80 @@ function createHostHealth({
     }
   }
 
-  // SELF-SCHEDULING, NOT setInterval — and this is a safety property, not a style choice.
+  // AT MOST ONE POLL OF EACH KIND EVER IN FLIGHT, and the guard is held until the underlying
+  // operation ACTUALLY SETTLES — not until a deadline expires.
   //
-  // setInterval fires on a fixed period regardless of whether the previous run finished. A
-  // sysfs read that blocks (a wedged driver) or a vcgencmd that hangs would leave one poll
-  // pending while every subsequent tick enqueued another, accumulating file handles and child
-  // processes without bound — on the same Node process that carries the 20 Hz override stream
-  // and the input watchdog. execFile's `timeout` signals the child; it does not guarantee the
-  // promise settles.
+  // This is the second attempt. The first replaced setInterval with a deadline-and-reschedule
+  // loop, and a reviewer measured it still accumulating: against a never-settling read,
+  // outstanding operations grew from 5 at 0.6 s to 25 at 4.6 s. Racing a deadline ABANDONS
+  // the underlying promise — Node offers no cancellation for an in-flight read — so
+  // rescheduling on deadline expiry starts a replacement while the original is still pending.
+  // The comment claiming "at most one in flight" was simply false.
   //
-  // So each poll schedules the NEXT one only after it has settled, and a hard deadline caps
-  // how long "settled" can take. At most one fast poll and one slow poll are ever in flight.
-  // Found by adversarial review; the original used setInterval for both.
+  // Why it matters: this runs in the process carrying the 20 Hz override stream and the input
+  // watchdog, so unbounded file handles and child processes are an invariant 9 failure. A
+  // late completion overwriting newer cache state is the second hazard, handled by the
+  // generation check below.
+  //
+  // The deadline still exists, but it only marks the sample STALE. It never launches a
+  // replacement.
   let fastTimer = null, slowTimer = null;
+  const inFlight = { fastPoll: false, slowPoll: false };
+  let generation = 0;
 
-  // Rejects if `p` has not settled within ms. The loser of the race is abandoned rather than
-  // cancelled — Node has no cancellation for an in-flight read — but because the NEXT poll is
-  // gated on this deadline rather than on the read itself, an abandoned read can no longer
-  // cause pile-up. That is the property that matters.
-  function withDeadline(p, ms, what) {
-    let timer;
-    return Promise.race([
-      Promise.resolve(p).finally(() => clearTimeout(timer)),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${what} exceeded ${ms} ms`)), ms);
-        if (typeof timer.unref === 'function') timer.unref();
-      }),
-    ]);
+  // ONE code path for the first poll and every later one. An earlier revision had a separate
+  // `startNow` that skipped the deadline, so a source wedged from the very first read was
+  // never reported — the failure mode most likely on a rover that boots with a bad sensor.
+  function runPoll(fn, intervalMs, deadlineMs, what, assign) {
+    if (stopped) return;
+    // THE BOUND IS THE RESCHEDULE POINT, not a flag. `arm()` is called ONLY from the
+    // `.finally()` below, so the next poll cannot start until this one has genuinely settled.
+    //
+    // An earlier revision also carried an `if (inFlight[what]) ...` guard here. Mutation
+    // testing showed it was UNREACHABLE — nothing can call runPoll while work is outstanding,
+    // precisely because arm() is gated on settle — so deleting it changed no behaviour and
+    // failed no test. Unreachable code that looks like a safety check is worse than none: it
+    // invites the reader to believe the bound lives somewhere it does not.
+    //
+    // The accepted cost: a source that NEVER settles freezes this poller permanently. That is
+    // deliberate. The alternative — rescheduling when a deadline expires — is what the
+    // previous attempt did, and a reviewer measured it growing from 5 outstanding operations
+    // at 0.6 s to 25 at 4.6 s, in the process that carries the override stream and the input
+    // watchdog. A frozen sampler is visible (`errors` reports the stall and the values go
+    // stale); an unbounded one takes the vehicle with it.
+    inFlight[what] = true;
+    ++generation;
+    let settled = false;
+    const deadline = setTimeout(() => {
+      if (!settled) note(what, new Error(`exceeded ${deadlineMs} ms`));
+    }, deadlineMs);
+    if (typeof deadline.unref === 'function') deadline.unref();
+
+    Promise.resolve()
+      .then(() => fn())
+      .catch((e) => note(what, e))
+      .finally(() => {
+        settled = true;
+        clearTimeout(deadline);
+        inFlight[what] = false;          // released only when the work truly finished
+        arm(fn, intervalMs, deadlineMs, what, assign);
+      });
   }
 
-  async function loop(fn, intervalMs, deadlineMs, what, assign) {
+  function arm(fn, intervalMs, deadlineMs, what, assign) {
     if (stopped) return;
-    try { await withDeadline(fn(), deadlineMs, what); }
-    catch (e) { note(what, e); }
-    if (stopped) return;
-    const t = setTimeout(() => loop(fn, intervalMs, deadlineMs, what, assign), intervalMs);
+    const t = setTimeout(() => runPoll(fn, intervalMs, deadlineMs, what, assign), intervalMs);
     if (typeof t.unref === 'function') t.unref();
     assign(t);
   }
 
-  loop(pollFast, fastInterval, Math.min(fastInterval, 5000), 'fastPoll', (t) => { fastTimer = t; });
-  loop(pollSlow, slowInterval, 10000, 'slowPoll', (t) => { slowTimer = t; });
+  runPoll(pollFast, fastInterval, Math.min(fastInterval, 5000), 'fastPoll', (t) => { fastTimer = t; });
+  runPoll(pollSlow, slowInterval, 10000, 'slowPoll', (t) => { slowTimer = t; });
+
+  // How many operations this sampler has ever started. Exposed so the BOUND is assertable
+  // against a stalled dependency — the previous version's claim could not be checked, which
+  // is why it stayed wrong for a round.
+  function startedCount() { return generation; }
 
   return {
     // Synchronous cache read. Never does I/O — see the invariant 9 note at the top.
@@ -289,6 +344,7 @@ function createHostHealth({
     // Exposed so the clamped values are assertable — a bound nothing can observe is a bound
     // nothing can test.
     intervals() { return { fastMs: fastInterval, slowMs: slowInterval }; },
+    startedCount,
     stop() {
       stopped = true;
       if (fastTimer) clearTimeout(fastTimer);
@@ -298,7 +354,7 @@ function createHostHealth({
 }
 
 module.exports = {
-  createHostHealth,
+  createHostHealth, expectedUnits,
   parseThrottled, parseProcStat, cpuBusyPct, parseTempMilli, parseUnitStates, parseKhz,
   THERMAL_ZONE, PROC_STAT, CPUFREQ_DIR, WATCHED_UNITS,
 };
