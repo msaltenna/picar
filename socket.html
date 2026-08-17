@@ -706,18 +706,40 @@
       const HOT_C = 75;
       const h = telemetry && telemetry.host;
       if (!h) return '';
+      const parts = [];
+
+      // A UNIT THAT IS NOT ACTIVE IS THE LOUDEST THING HERE. An earlier revision of this
+      // function ignored `services` entirely, so a dead mavproxy — no link to the flight
+      // controller at all — rendered exactly like a healthy rover: nothing. A reviewer
+      // caught it, and it is the same defect the whole feature exists to remove, reproduced
+      // inside the fix.
+      const svc = h.services;
+      if (svc) {
+        const down = Object.keys(svc).filter((k) => svc[k] !== 'active');
+        if (down.length) {
+          parts.push(`<span style="color:#f66">SVC ${down.map((k) => `${k}:${svc[k] || '?'}`).join(' ')}</span>`);
+        }
+      }
+
       const t = h.cpu ? h.cpu.tempC : null;
       const thr = h.throttled;
-      const hot = typeof t === 'number' && t >= HOT_C;
       const limited = thr && thr.active;
-      if (!hot && !limited) return '';
+      const hot = typeof t === 'number' && t >= HOT_C;
       const tempTxt = typeof t === 'number' ? `${t.toFixed(1)}°C` : '--°C';
       if (limited) {
         // Name what is being limited. "THROTTLED" alone sends someone looking for a
         // temperature problem when the cause may be under-voltage.
-        return `<span style="color:#f66">CPU ${tempTxt} — ${thr.now.join(', ')}</span>`;
+        parts.push(`<span style="color:#f66">CPU ${tempTxt} — ${thr.now.join(', ')}</span>`);
+      } else if (hot) {
+        parts.push(`<span style="color:#fc6">CPU ${tempTxt}</span>`);
       }
-      return `<span style="color:#fc6">CPU ${tempTxt}</span>`;
+
+      // A SAMPLER THAT CANNOT READ ITS SOURCES MUST SAY SO. Silence here would mean "this
+      // rover is cool and every service is up", which is precisely the claim it cannot make.
+      if (h.errors) {
+        parts.push(`<span style="color:#fc6">HEALTH? ${Object.keys(h.errors).join(',')}</span>`);
+      }
+      return parts.join('<br>');
     }
 
     function formatBattery() {

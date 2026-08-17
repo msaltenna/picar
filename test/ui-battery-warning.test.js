@@ -422,3 +422,36 @@ test('a rover reporting no host block at all renders nothing extra', () => {
   });
   assert.doesNotMatch(out, /CPU/);
 });
+
+test('an INACTIVE unit is the loudest thing on the bar', () => {
+  // The reviewer's finding: formatHost ignored `services` entirely, so a dead mavproxy —
+  // no link to the flight controller at all — rendered exactly like a healthy rover.
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 50 }, throttled: { active: false, now: [], sinceBoot: [] },
+                         services: { picar: 'active', mavproxy: 'failed', mediamtx: 'active' } } },
+  });
+  assert.match(out, /SVC/);
+  assert.match(out, /mavproxy:failed/);
+  assert.doesNotMatch(out, /picar:/, 'a healthy unit must not add noise');
+});
+
+test('all-active services add nothing to the bar', () => {
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 50 }, throttled: { active: false, now: [], sinceBoot: [] },
+                         services: { picar: 'active', mavproxy: 'active', mediamtx: 'active' } } },
+  });
+  assert.doesNotMatch(out, /SVC/);
+});
+
+test('a sampler that cannot read its sources says so', () => {
+  // Silence would assert "cool and all services up" — the one claim it cannot make.
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: null }, throttled: null,
+                         errors: { tempC: 'ENOENT', throttled: 'vcgencmd: not found' } } },
+  });
+  assert.match(out, /HEALTH\?/);
+  assert.match(out, /tempC/);
+});

@@ -268,3 +268,42 @@ test('stop() clears both timers so the process can exit', async () => {
   await new Promise((r) => setTimeout(r, 700));
   assert.equal(reads.length, after, 'polling continued after stop()');
 });
+
+test('a STALLED source cannot accumulate polls without bound', async () => {
+  // A reviewer's finding, and it is an invariant 9 defect rather than an inefficiency. The
+  // original used setInterval for both pollers, which fires on a fixed period whether or not
+  // the previous run finished — so one wedged sysfs read or hung vcgencmd would leave a poll
+  // pending while every later tick enqueued another, accumulating file handles and child
+  // processes on the process that carries the 20 Hz override stream and the input watchdog.
+  //
+  // Each poll now schedules the next only after it settles, under a hard deadline. At most
+  // one is ever in flight.
+  let started = 0;
+  const h = createHostHealth({
+    readFile: () => { started++; return new Promise(() => {}); },   // never settles, ever
+    run: () => new Promise(() => {}),
+    fastMs: 500,
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 2500));
+    // Five intervals have elapsed. With setInterval and no guard this would be ~5 concurrent
+    // polls, each issuing 5 reads. Bounded, it is one poll at a time — so the read count
+    // tracks deadline expiries, not wall-clock ticks.
+    assert.ok(started <= 15,
+      `${started} reads started against a never-settling source — polls are accumulating`);
+  } finally { h.stop(); }
+});
+
+test('a stalled source is reported rather than silently retried forever', async () => {
+  const h = createHostHealth({
+    readFile: () => new Promise(() => {}),
+    run: () => new Promise(() => {}),
+    fastMs: 500,
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 1200));
+    const s = h.snapshot();
+    assert.equal(s.cpu.tempC, null);
+    assert.notEqual(s.errors, null, 'a wedged source must surface, not just read as absent');
+  } finally { h.stop(); }
+});

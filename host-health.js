@@ -234,10 +234,47 @@ function createHostHealth({
     }
   }
 
-  const fastTimer = setInterval(pollFast, fastInterval);
-  const slowTimer = setInterval(pollSlow, slowInterval);
-  for (const t of [fastTimer, slowTimer]) if (typeof t.unref === 'function') t.unref();
-  pollFast(); pollSlow();
+  // SELF-SCHEDULING, NOT setInterval — and this is a safety property, not a style choice.
+  //
+  // setInterval fires on a fixed period regardless of whether the previous run finished. A
+  // sysfs read that blocks (a wedged driver) or a vcgencmd that hangs would leave one poll
+  // pending while every subsequent tick enqueued another, accumulating file handles and child
+  // processes without bound — on the same Node process that carries the 20 Hz override stream
+  // and the input watchdog. execFile's `timeout` signals the child; it does not guarantee the
+  // promise settles.
+  //
+  // So each poll schedules the NEXT one only after it has settled, and a hard deadline caps
+  // how long "settled" can take. At most one fast poll and one slow poll are ever in flight.
+  // Found by adversarial review; the original used setInterval for both.
+  let fastTimer = null, slowTimer = null;
+
+  // Rejects if `p` has not settled within ms. The loser of the race is abandoned rather than
+  // cancelled — Node has no cancellation for an in-flight read — but because the NEXT poll is
+  // gated on this deadline rather than on the read itself, an abandoned read can no longer
+  // cause pile-up. That is the property that matters.
+  function withDeadline(p, ms, what) {
+    let timer;
+    return Promise.race([
+      Promise.resolve(p).finally(() => clearTimeout(timer)),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} exceeded ${ms} ms`)), ms);
+        if (typeof timer.unref === 'function') timer.unref();
+      }),
+    ]);
+  }
+
+  async function loop(fn, intervalMs, deadlineMs, what, assign) {
+    if (stopped) return;
+    try { await withDeadline(fn(), deadlineMs, what); }
+    catch (e) { note(what, e); }
+    if (stopped) return;
+    const t = setTimeout(() => loop(fn, intervalMs, deadlineMs, what, assign), intervalMs);
+    if (typeof t.unref === 'function') t.unref();
+    assign(t);
+  }
+
+  loop(pollFast, fastInterval, Math.min(fastInterval, 5000), 'fastPoll', (t) => { fastTimer = t; });
+  loop(pollSlow, slowInterval, 10000, 'slowPoll', (t) => { slowTimer = t; });
 
   return {
     // Synchronous cache read. Never does I/O — see the invariant 9 note at the top.
@@ -254,8 +291,8 @@ function createHostHealth({
     intervals() { return { fastMs: fastInterval, slowMs: slowInterval }; },
     stop() {
       stopped = true;
-      clearInterval(fastTimer);
-      clearInterval(slowTimer);
+      if (fastTimer) clearTimeout(fastTimer);
+      if (slowTimer) clearTimeout(slowTimer);
     },
   };
 }
