@@ -104,6 +104,82 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-17 — rover1's thermal throttling found, fixed, and made visible
+
+**rover1 was thermally throttled and it was the measured cause of "rover1 performs worse than
+rover3".** Audited at **84-85 C** with the firmware reporting `SOFT TEMP LIMIT ACTIVE`, ARM
+clock pulled to 2256 of 2400 MHz, and no cooling device registered at all — against 56.9 C on
+rover2 and 62.3 C on rover3, both `throttled=0x0`, at the same moment.
+
+**It was not our software.** Total application CPU was under 3% of the box. The cause was the
+CPU governor: rover1 sat pinned at 2400 MHz under `performance` while both CM4s idled at
+1500 MHz under `ondemand`, at effectively identical core voltage (0.877 V vs 0.860 V).
+
+**And the governor was not ours either.** `cpu-performance.service` sets it deliberately —
+*"Artemis appliance — jitter fix, RUNBOOK §9"*. rover1 is a shared box: `salt` is Artemis,
+`saltenna` is picar.
+
+**RESULT, measured through picar's own new telemetry:**
+
+| | before | after |
+| --- | --- | --- |
+| temperature | 82.6-84.3 C | **68-69 C** |
+| throttle word | `0xf0008` — SOFT TEMP LIMIT **ACTIVE** | `0xf0000` — latched history only, **active=false** |
+| ARM clock | 2400 MHz pinned | 1500-1600 MHz, scaling |
+
+**~15 C, and the throttle cleared.** Changes, both on the host and both reversible:
+
+1. **Governor `performance` -> `schedutil`**, via a DROP-IN at
+   `/etc/systemd/system/cpu-performance.service.d/picar-schedutil.conf` so Artemis's unit is
+   untouched and the deviation is visible in `systemctl cat`. `schedutil` was chosen over
+   `ondemand` precisely to preserve what §9 wanted — it is driven by the scheduler's own
+   utilisation signal and ramps within a scheduling period rather than on a polling delay.
+   **Recorded as a deliberate deviation from RUNBOOK §9 so Artemis can object.** Revert by
+   deleting the drop-in.
+2. **`graphical.target` -> `multi-user.target`.** Both HDMI outputs read `disconnected` while
+   a desktop ran. Honest accounting: the compositor was gone after this but the remaining user
+   services measured **0.0% CPU and 114 MB**, so this contributed essentially nothing
+   thermally. The governor was the whole story.
+
+**AND IT IS NOW VISIBLE OFF-BOX**, which it never was. `telemetry.host` carries CPU
+temperature, busy percent, clock, governor, the decoded firmware throttle word, and the state
+of picar/mavproxy/mediamtx. Before this the only way to see 84 C was to SSH in — the same
+gap the audit filed as a P1 when `BRD_SAFETY_DEFLT` inhibited every PWM output while picar
+reported "FC: ok".
+
+**VALIDATION: PASS (read-only tier), 2026-08-17, at `3670a6b4`** — the exact SHA, on **both**
+rover3 (the mandated target) and rover1 (the motivating CM5). picar's readings were compared
+against independent host readings taken over SSH and agree exactly:
+
+| | picar reports | host reports | suite |
+| --- | --- | --- | --- |
+| rover3 | 63.3 C, `0x0`, ondemand | 63.3 C, `0x0`, ondemand | 438 pass, 0 fail |
+| rover1 | 69.4 C, `0xf0000`, schedutil | 69.4 C, `0xf0000`, schedutil | 438 pass, 0 fail |
+
+Services active on both, `NRestarts=0`, `errors: null`. Read-only tier is the correct tier:
+this touches no control path and commands no motion.
+
+**"mediamtx sometimes needs restarting" IS DIAGNOSED.** rover2's hardware encoder entered a
+permanent failure state — `ioctl(VIDIOC_QBUF) failed` at ~21/s, 229,561 errors — and the
+decisive measurement is not the log spam:
+
+    rover2   ready=True  readers=0  bytesReceived rate =      0 B/s
+    rover3   ready=True  readers=0  bytesReceived rate = 46,840 B/s
+
+MediaMTX advertises the path as available while producing **nothing**; a viewer gets a black
+screen and no error. Two hypotheses were tested and **both disconfirmed**: it is not uptime
+(rover3 passed rover2's failure point with zero errors) and not reader-triggered (rover2's
+last session closed nearly three days before). The trigger remains **unknown** — the only
+correlate is that rover2 served sessions logging "reader is too slow" and rover3 did not.
+Recovery is implemented on `fix/mediamtx-encoder-recovery`; the root cause is an open upstream
+question against mediamtx/libcamera.
+
+**Still to do on rover1:** it remains the hottest rover by ~6 C because its CM5 has no
+hardware H.264 encoder and must encode in software at 3.3x the cost. `perf/video-idle-and-profile`
+stops it encoding when nobody is watching, which is the remaining software lever.
+
+
+
 ### 2026-08-13 — ICE-over-UDP landed, codecs measured, reader count replaces the viewer cap
 
 **Fleet state:** rover1 and rover2 both on `main` @ `8da0120`, identical to `origin/main`,
