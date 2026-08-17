@@ -78,7 +78,19 @@ function generateMediaMTXConfig(cfg, params) {
   // codec its hardware cannot run — `hardwareH264` on a CM5 yields no video at all. An
   // explicit `webrtc_codec` still wins, because an operator overriding a detection needs to
   // be able to.
-  const codec = cfg.webrtc_codec || (hasHardwareEncoder(cfg) ? 'hardwareH264' : 'softwareH264');
+  // 'auto' (the shipped default) means DETECT. An explicit codec still wins, for a bisect or
+  // an encoder node that exists but is broken.
+  //
+  // This was `cfg.webrtc_codec || (detect...)`, which never ran the detection in production
+  // at all: picar-cfg.json shipped `"webrtc_codec": "hardwareH264"`, so the tracked config
+  // always won and a fresh CM5 would still have been handed a codec its hardware cannot run —
+  // the exact failure this was added to prevent. The tests missed it because they generated
+  // from `{}` rather than from the real shipped config. Found by adversarial review; there is
+  // now a test that uses picar-cfg.json itself.
+  const wantCodec = cfg.webrtc_codec;
+  const codec = (!wantCodec || wantCodec === 'auto')
+    ? (hasHardwareEncoder(cfg) ? 'hardwareH264' : 'softwareH264')
+    : wantCodec;
 
   // Profile and level are HARDWARE-encoder options. They were emitted unconditionally, so a
   // rover running software received settings that do not apply to it — harmless, because
@@ -89,7 +101,23 @@ function generateMediaMTXConfig(cfg, params) {
       `    rpiCameraHardwareH264Level: '${cfg.webrtc_h264_level || '4.1'}'\n`
     : '';
 
-  const keepWarm = cfg.webrtc_keep_camera_warm === true;
+  // ON-DEMAND IS OPT-IN, AND OFF BY DEFAULT ON THE PINNED MEDIAMTX.
+  //
+  // The saving is real — rover2 produced 9.58 GB with zero readers — but install.sh pins
+  // MediaMTX v1.17.1 (confirmed from rover1's journal), which has a known first-reader race
+  // with sourceOnDemand: a player that connects before SPS/PPS are available gets undecodable
+  // H.264 and stays BLACK, and the browser only retries if ICE reaches `failed`. Upstream
+  // fixed it in v1.19.2.
+  //
+  // A persistent black stream for the first operator of a teleoperated vehicle is a worse
+  // outcome than the encoder cost it saves, so the default stays off until MediaMTX is
+  // upgraded and a cold-start WHEP session is validated on hardware. Note the cold-start
+  // measurement taken on rover1 (0.60 s to `ready`) CANNOT detect this: path-ready is not the
+  // same as a browser decoding frames.
+  //
+  // Set `webrtc_camera_on_demand: true` to enable it once that upgrade and validation are done.
+  const onDemand = cfg.webrtc_camera_on_demand === true;
+  const keepWarm = !onDemand || cfg.webrtc_keep_camera_warm === true;
   // Clamped: reachable from the untracked overlay (invariant 8), and 0 would mean "tear the
   // camera down the instant the last viewer leaves", turning every page reload into a camera
   // restart mid-drive.
