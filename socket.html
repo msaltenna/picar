@@ -900,8 +900,21 @@
         const n = (v) => (v === null || v === undefined ? '--' : v);
         return `Radio: ${n(r.rssi)}/${n(r.noise)} rem ${n(r.remRssi)}`;
       }
-      // Otherwise report the Wi-Fi link that is actually carrying this session.
+      // Otherwise report the link actually carrying this session — WIRED or wireless.
+      //
+      // This read only /proc/net/wireless, so when the fleet moved to ethernet it rendered
+      // "Link: --" on rovers with a perfectly good gigabit connection. A blank reads as a dead
+      // link, on the one field meant to describe the connection the operator depends on.
       const w = telemetry.wifi;
+      if (w && w.kind === 'wired') {
+        // No carrier means the cable is out. That is the wired equivalent of no signal and is
+        // worth saying explicitly rather than showing a stale negotiated speed.
+        if (w.carrier === false) return `Link: ${w.iface} NO CARRIER`;
+        const bits = [];
+        if (w.speedMbps) bits.push(w.speedMbps >= 1000 ? `${w.speedMbps / 1000}Gb` : `${w.speedMbps}Mb`);
+        if (w.duplex && w.duplex !== 'unknown') bits.push(w.duplex);
+        return `Link: ${w.iface}${bits.length ? ' ' + bits.join(' ') : ''}`;
+      }
       if (w && (w.signalDbm !== null || w.qualityPct !== null)) {
         const bits = [];
         if (w.qualityPct !== null) bits.push(`${w.qualityPct}%`);

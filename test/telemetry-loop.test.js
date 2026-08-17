@@ -153,7 +153,7 @@ test('the wifi read is asynchronous — a tick never waits on /proc', async () =
   await new Promise((r) => setImmediate(r));
   h.loop.tick();
   assert.deepEqual(h.calls.emits[1][1].wifi,
-    { iface: 'wlan0', qualityPct: 93, signalDbm: -58 },
+    { iface: 'wlan0', qualityPct: 93, signalDbm: -58, kind: 'wireless' },
     'and the next tick must carry the reading the async read produced');
 });
 
@@ -412,4 +412,85 @@ test('the TRACKED config ships a pack that can actually raise a warning', () => 
     `batteryWarnVolts=${warn.warnVolts} is outside a sane 2S range — if the fleet's cell ` +
     'count changed, update this bound with it rather than deleting it');
   assert.equal(warn.warnOnNoReading, true, 'and an unreadable monitor must still warn');
+});
+
+// ── The link metric follows the default route ────────────────────────────────
+//
+// The fleet moved to ethernet and the link metric went blank, because it was read solely from
+// /proc/net/wireless — which on a wired rover holds only its two header lines. "Link: --" on a
+// rover with a gigabit connection reads as a dead link, on the field meant to describe the
+// connection the operator depends on.
+
+const { parseDefaultIface, parseWiredLink } = require('../telemetry-loop.js');
+
+const ROUTE = [
+  'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask',
+  'eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000',
+  'eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF',
+].join('\n');
+
+test('the default-route interface is identified from /proc/net/route', () => {
+  assert.equal(parseDefaultIface(ROUTE), 'eth0');
+});
+
+test('a non-default route is not mistaken for the default', () => {
+  // Destination must be 00000000. Matching on the UP flag alone would pick a subnet route.
+  const onlySubnet = [
+    'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask',
+    'eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF',
+  ].join('\n');
+  assert.equal(parseDefaultIface(onlySubnet), null);
+});
+
+test('with two default routes the LOWEST metric wins', () => {
+  // A rover with both wired and wireless up must report the one the kernel actually uses,
+  // not whichever appears first in the file.
+  const both = [
+    'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask',
+    'wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000',
+    'eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000',
+  ].join('\n');
+  assert.equal(parseDefaultIface(both), 'eth0');
+});
+
+test('a route that is not UP is ignored', () => {
+  const down = [
+    'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask',
+    'eth0\t00000000\t0101A8C0\t0002\t0\t0\t100\t00000000',
+  ].join('\n');
+  assert.equal(parseDefaultIface(down), null);
+});
+
+test('empty or malformed route data yields null, not a guess', () => {
+  for (const bad of ['', null, 'garbage', 'Iface\tDestination\n']) {
+    assert.equal(parseDefaultIface(bad), null);
+  }
+});
+
+test('wired link facts are read from sysfs — rover3s real values', () => {
+  const l = parseWiredLink('eth0', { speed: '1000\n', duplex: 'full\n',
+                                     carrier: '1\n', operstate: 'up\n' });
+  assert.equal(l.kind, 'wired');
+  assert.equal(l.speedMbps, 1000);
+  assert.equal(l.duplex, 'full');
+  assert.equal(l.carrier, true);
+  assert.equal(l.up, true);
+});
+
+test('a down interface reports unknown speed, not a number', () => {
+  // /sys/class/net/*/speed reads -1 (or errors) when the link is down. Reporting -1 Mb/s as a
+  // speed would be worse than saying nothing.
+  const l = parseWiredLink('eth0', { speed: '-1', duplex: 'unknown',
+                                     carrier: '0', operstate: 'down' });
+  assert.equal(l.speedMbps, null);
+  assert.equal(l.carrier, false);
+  assert.equal(l.up, false);
+});
+
+test('a wired link never reports a fake signal strength', () => {
+  // A consumer written for the wireless shape must not read a wired link as 0% / 0 dBm.
+  // Absent and zero are different facts.
+  const l = parseWiredLink('eth0', { speed: '1000', duplex: 'full', carrier: '1', operstate: 'up' });
+  assert.equal(l.qualityPct, null);
+  assert.equal(l.signalDbm, null);
 });

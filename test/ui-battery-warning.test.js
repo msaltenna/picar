@@ -561,3 +561,60 @@ test('services that could not be determined are not rendered as healthy', () => 
   assert.match(out, /SVC --/, 'unknown must not look like "all fine"');
   assert.doesNotMatch(out, /\u2713/);
 });
+
+// ── The link metric renders a WIRED connection ───────────────────────────────
+
+test('a wired link shows the interface and negotiated speed, not "--"', () => {
+  // The reported bug: the fleet moved to ethernet and this rendered "Link: --" on rovers with
+  // a perfectly good gigabit connection, because the value came only from /proc/net/wireless.
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 wifi: { iface: 'eth0', kind: 'wired', speedMbps: 1000, duplex: 'full',
+                         carrier: true, up: true, qualityPct: null, signalDbm: null } },
+  });
+  assert.match(out, /Link: eth0/);
+  assert.match(out, /1Gb/, 'a gigabit link should read 1Gb, not 1000Mb');
+  assert.doesNotMatch(out, /Link: --/);
+});
+
+test('a 100 Mb link is not rendered as gigabit', () => {
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 wifi: { iface: 'eth0', kind: 'wired', speedMbps: 100, duplex: 'full',
+                         carrier: true, up: true, qualityPct: null, signalDbm: null } },
+  });
+  assert.match(out, /100Mb/);
+});
+
+test('an unplugged cable says NO CARRIER rather than a stale speed', () => {
+  // The wired equivalent of no signal. Showing the last negotiated speed would imply a
+  // working link on a rover that has none.
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 wifi: { iface: 'eth0', kind: 'wired', speedMbps: 1000, duplex: 'full',
+                         carrier: false, up: false, qualityPct: null, signalDbm: null } },
+  });
+  assert.match(out, /NO CARRIER/);
+  assert.doesNotMatch(out, /1Gb/, 'a stale negotiated speed must not be shown');
+});
+
+test('a wireless link still renders its signal, unchanged', () => {
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 wifi: { iface: 'wlan0', kind: 'wireless', qualityPct: 93, signalDbm: -58 } },
+  });
+  assert.match(out, /93%/);
+  assert.match(out, /-58dBm/);
+});
+
+test('no link data at all still reads "--"', () => {
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true, wifi: null },
+  });
+  assert.match(out, /Link: --/);
+});
