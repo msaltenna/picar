@@ -31,6 +31,56 @@ const { clampTelemetryInterval } = require('./config-bounds');
 const { batteryTrouble }         = require('./battery-warning');
 
 const WIRELESS_PROC = '/proc/net/wireless';
+const NET_ROUTE     = '/proc/net/route';
+const SYS_NET       = '/sys/class/net';
+
+// Which interface carries the default route, from /proc/net/route.
+//
+// The fleet moved to ETHERNET, and the link metric went blank because it was read solely from
+// /proc/net/wireless — which on a wired rover contains only its two header lines. "Link: --"
+// on a rover with a perfectly good gigabit connection is worse than no field: it reads as a
+// dead link, on the one indicator that is supposed to describe the connection carrying the
+// session.
+//
+// Destination 00000000 with the UP flag (0x1) is the default route. Columns are:
+// Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+function parseDefaultIface(text) {
+  const lines = String(text || '').split('\n').slice(1);
+  let best = null;
+  for (const line of lines) {
+    const c = line.trim().split(/\s+/);
+    if (c.length < 8) continue;
+    if (c[1] !== '00000000') continue;
+    const flags = parseInt(c[3], 16);
+    if (!Number.isFinite(flags) || !(flags & 0x1)) continue;
+    const metric = Number(c[6]);
+    // Lowest metric wins, matching the kernel's own choice when several defaults exist —
+    // a rover with both wired and wireless up must report the one actually being used.
+    if (best === null || (Number.isFinite(metric) && metric < best.metric)) {
+      best = { iface: c[0], metric: Number.isFinite(metric) ? metric : Infinity };
+    }
+  }
+  return best ? best.iface : null;
+}
+
+// Wired link facts from sysfs. `speed` is Mb/s and reads -1 or errors when the interface is
+// down, so it is treated as unknown rather than as a number.
+function parseWiredLink(iface, { speed, duplex, carrier, operstate }) {
+  const mbps = Number(String(speed || '').trim());
+  return {
+    iface,
+    kind: 'wired',
+    speedMbps: Number.isFinite(mbps) && mbps > 0 ? mbps : null,
+    duplex: (String(duplex || '').trim() || null),
+    // carrier is 1 when a cable is physically connected and link is negotiated.
+    carrier: String(carrier || '').trim() === '1',
+    up: String(operstate || '').trim() === 'up',
+    // Kept null so a consumer written for the wireless shape does not read a wired link as a
+    // 0% signal — absent and zero are different facts, as everywhere else here.
+    qualityPct: null,
+    signalDbm: null,
+  };
+}
 
 // /proc/net/wireless is a two-line-header text file; parsing it costs nothing and
 // needs no external tool.
@@ -142,10 +192,34 @@ function startTelemetryLoop({
   const intervalMs = clampTelemetryInterval(config.telemetry_interval_ms);
   let wifi = null;
 
+  // Read the link that is actually carrying this session, wired or wireless.
+  //
+  // Wireless is tried first because it carries strictly more information (quality and signal
+  // strength, which vary continuously and matter while driving); a wired link's speed and
+  // duplex are effectively static. If the default route is a wired interface, or there is no
+  // wireless data, sysfs supplies the wired facts instead.
+  //
+  // Every read goes through the injected promise-returning reader — invariant 9: this runs at
+  // the telemetry rate on the loop carrying the 20 Hz override stream and the fail-safe.
   function refreshWifi() {
     return readWifi(WIRELESS_PROC, 'utf8')
-      .then((text) => { wifi = parseWirelessProc(text); })
-      .catch(() => { wifi = null; });
+      .then((text) => parseWirelessProc(text))
+      .catch(() => null)
+      .then((wireless) => {
+        if (wireless) { wifi = { ...wireless, kind: 'wireless' }; return; }
+        return readWifi(NET_ROUTE, 'utf8')
+          .then((routeText) => {
+            const iface = parseDefaultIface(routeText);
+            if (!iface) { wifi = null; return; }
+            const read = (f) => readWifi(`${SYS_NET}/${iface}/${f}`, 'utf8').catch(() => null);
+            return Promise.all([read('speed'), read('duplex'), read('carrier'),
+                                read('operstate')])
+              .then(([speed, duplex, carrier, operstate]) => {
+                wifi = parseWiredLink(iface, { speed, duplex, carrier, operstate });
+              });
+          })
+          .catch(() => { wifi = null; });
+      });
   }
 
   // The single source of truth for a telemetry snapshot, so /status, a joining
@@ -208,5 +282,6 @@ function startTelemetryLoop({
 }
 
 module.exports = { startTelemetryLoop, buildTelemetryWiring, batteryWarnCfgFrom,
+  parseDefaultIface, parseWiredLink,
                    batteryWarnabilityWarning,
                    parseWirelessProc, WIRELESS_PROC };
