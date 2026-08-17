@@ -451,3 +451,90 @@ test('a successfully recovered incident does not consume the budget forever', as
     assert.ok(h.totalRecoveries >= 1, 'while the lifetime figure is kept for observability');
   } finally { s.stop(); await new Promise((r) => server.close(r)); }
 });
+
+// ── Stale ICE candidates after an address change ─────────────────────────────
+//
+// MediaMTX enumerates interfaces ONCE at startup to build its ICE host-candidate list, so an
+// address that appears later is never advertised. Measured on rover3 2026-08-17: mediamtx
+// gathered candidates at 21:05:06, eth0 came up at 21:19:24 — 14m19s later — and from then on
+// every WebRTC session was created and closed as `terminated` while the service reported
+// perfectly healthy to systemd.
+
+const IF = (m) => () => m;
+const ETH = { eth0: [{ address: '192.168.31.222', family: 'IPv4', internal: false }] };
+const NONE = { lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true }] };
+
+test('an address appearing after startup restarts mediamtx to re-enumerate', async () => {
+  const restarts = [];
+  let ifaces = NONE;                       // booted before the cable was up
+  const s = mkStream({ mediamtx_api_port: nextPort++, webrtc_reader_poll_ms: 1000,
+                       _networkInterfaces: () => ifaces,
+                       _restartFn: () => restarts.push(1) });
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(restarts.length, 0, 'no restart while nothing has changed');
+    ifaces = ETH;                          // cable connected
+    await new Promise((r) => setTimeout(r, 1600));
+    assert.equal(restarts.length, 1, 'the new address must trigger exactly one restart');
+    assert.match(s.sourceHealth().addresses, /192\.168\.31\.222/);
+  } finally { s.stop(); }
+});
+
+test('a stable address set never restarts anything', () => {
+  // The negative control. Without it, "restart on change" could be hardwired and every rover
+  // would restart its video server every poll.
+  const restarts = [];
+  const s = mkStream({ mediamtx_api_port: nextPort++, _networkInterfaces: IF(ETH),
+                       _restartFn: () => restarts.push(1) });
+  try {
+    assert.equal(restarts.length, 0);
+    assert.match(s.sourceHealth().addresses, /eth0:192\.168\.31\.222/);
+  } finally { s.stop(); }
+});
+
+test('loopback and link-local changes do NOT trigger a restart', async () => {
+  // Neither is ever a usable ICE host candidate for a peer, so a change in them means nothing
+  // to MediaMTX — restarting on one would drop live video for no reason.
+  const restarts = [];
+  let ifaces = ETH;
+  const s = mkStream({ mediamtx_api_port: nextPort++, webrtc_reader_poll_ms: 1000,
+                       _networkInterfaces: () => ifaces,
+                       _restartFn: () => restarts.push(1) });
+  try {
+    ifaces = { ...ETH,
+               lo:    [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+               eth1:  [{ address: '169.254.7.7', family: 'IPv4', internal: false }] };
+    await new Promise((r) => setTimeout(r, 1600));
+    assert.equal(restarts.length, 0, 'loopback and 169.254/16 must be ignored');
+  } finally { s.stop(); }
+});
+
+test('the network going away does not trigger a restart', async () => {
+  // Restarting then would only make MediaMTX re-enumerate nothing, and it would do it while
+  // the rover is already unreachable.
+  const restarts = [];
+  let ifaces = ETH;
+  const s = mkStream({ mediamtx_api_port: nextPort++, webrtc_reader_poll_ms: 1000,
+                       _networkInterfaces: () => ifaces,
+                       _restartFn: () => restarts.push(1) });
+  try {
+    ifaces = NONE;
+    await new Promise((r) => setTimeout(r, 1600));
+    assert.equal(restarts.length, 0, 'an empty address set is the network leaving, not arriving');
+  } finally { s.stop(); }
+});
+
+test('address restarts are capped so a flapping link cannot loop forever', async () => {
+  const restarts = [];
+  let n = 0;
+  const s = mkStream({ mediamtx_api_port: nextPort++, webrtc_reader_poll_ms: 1000,
+                       // A different address every poll: a pathologically flapping link.
+                       _networkInterfaces: () => ({ eth0: [{ address: `10.0.0.${++n}`,
+                                                             family: 'IPv4', internal: false }] }),
+                       _restartFn: () => restarts.push(1) });
+  try {
+    await new Promise((r) => setTimeout(r, 9000));
+    assert.ok(restarts.length <= 5, `restarts must stop at the cap, got ${restarts.length}`);
+    assert.ok(restarts.length >= 1, 'and some must have been attempted');
+  } finally { s.stop(); }
+});
