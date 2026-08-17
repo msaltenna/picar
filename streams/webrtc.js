@@ -40,6 +40,18 @@ const { spawn } = require('child_process');
 // than `host` — that is expected and not a symptom.
 //
 // Set `webrtc_ice_tcp: true` to restore the old behaviour deliberately, knowing the cost.
+// Does this board have the hardware H.264 encoder? /dev/video11 is the V4L2 M2M encoder node
+// on CM4/Pi4; it is absent on CM5, verified on rover1.
+//
+// Synchronous, and that is deliberate rather than an oversight: this runs ONCE at config
+// generation, not on the control loop, and an async capability check would have to be awaited
+// by every caller of generateMediaMTXConfig for no benefit. Overridable for tests.
+function hasHardwareEncoder(cfg = {}) {
+  if (typeof cfg._hasHardwareEncoder === 'boolean') return cfg._hasHardwareEncoder;
+  try { return fs.existsSync(cfg.hw_encoder_node || '/dev/video11'); }
+  catch (_) { return false; }
+}
+
 function generateMediaMTXConfig(cfg, params) {
   const port    = cfg.webrtc_port     || 8889;
   const udpPort = cfg.webrtc_udp_port || 8189;
@@ -54,6 +66,64 @@ function generateMediaMTXConfig(cfg, params) {
   const keyPath  = cfg.mediamtx_key  || path.join(__dirname, '..', 'certs', 'key.pem');
   const certPath = cfg.mediamtx_cert || path.join(__dirname, '..', 'certs', 'cert.pem');
   const camPath  = (cfg.webrtc_path  || 'cam').replace(/^\/+/, '');
+
+  // ── Encoder capability ──────────────────────────────────────────────────────
+  //
+  // The fleet is not homogeneous: rover2 and rover3 are CM4s with a hardware H.264 block at
+  // /dev/video11; rover1 is a CM5 and has none, so it MUST use softwareH264. Measured with
+  // test/on-target/codec-benchmark.sh: software costs 3.3x the encoder CPU at 480x360@20 and
+  // 9.7x at 720p30, and it scales with pixel rate where a dedicated block barely notices.
+  //
+  // Detected rather than configured, so a board swap or a reflash cannot leave a rover with a
+  // codec its hardware cannot run — `hardwareH264` on a CM5 yields no video at all. An
+  // explicit `webrtc_codec` still wins, because an operator overriding a detection needs to
+  // be able to.
+  // 'auto' (the shipped default) means DETECT. An explicit codec still wins, for a bisect or
+  // an encoder node that exists but is broken.
+  //
+  // This was `cfg.webrtc_codec || (detect...)`, which never ran the detection in production
+  // at all: picar-cfg.json shipped `"webrtc_codec": "hardwareH264"`, so the tracked config
+  // always won and a fresh CM5 would still have been handed a codec its hardware cannot run —
+  // the exact failure this was added to prevent. The tests missed it because they generated
+  // from `{}` rather than from the real shipped config. Found by adversarial review; there is
+  // now a test that uses picar-cfg.json itself.
+  const wantCodec = cfg.webrtc_codec;
+  const codec = (!wantCodec || wantCodec === 'auto')
+    ? (hasHardwareEncoder(cfg) ? 'hardwareH264' : 'softwareH264')
+    : wantCodec;
+
+  // Profile and level are HARDWARE-encoder options. They were emitted unconditionally, so a
+  // rover running software received settings that do not apply to it — harmless, because
+  // MediaMTX ignores them, but a generated file that describes an encoder configuration the
+  // encoder is not using misleads the next person to tune it.
+  const hwProfileLines = codec === 'hardwareH264'
+    ? `    rpiCameraHardwareH264Profile: ${cfg.webrtc_h264_profile || 'baseline'}\n` +
+      `    rpiCameraHardwareH264Level: '${cfg.webrtc_h264_level || '4.1'}'\n`
+    : '';
+
+  // ON-DEMAND IS OPT-IN, AND OFF BY DEFAULT ON THE PINNED MEDIAMTX.
+  //
+  // The saving is real — rover2 produced 9.58 GB with zero readers — but install.sh pins
+  // MediaMTX v1.17.1 (confirmed from rover1's journal), which has a known first-reader race
+  // with sourceOnDemand: a player that connects before SPS/PPS are available gets undecodable
+  // H.264 and stays BLACK, and the browser only retries if ICE reaches `failed`. Upstream
+  // fixed it in v1.19.2.
+  //
+  // A persistent black stream for the first operator of a teleoperated vehicle is a worse
+  // outcome than the encoder cost it saves, so the default stays off until MediaMTX is
+  // upgraded and a cold-start WHEP session is validated on hardware. Note the cold-start
+  // measurement taken on rover1 (0.60 s to `ready`) CANNOT detect this: path-ready is not the
+  // same as a browser decoding frames.
+  //
+  // Set `webrtc_camera_on_demand: true` to enable it once that upgrade and validation are done.
+  const onDemand = cfg.webrtc_camera_on_demand === true;
+  const keepWarm = !onDemand || cfg.webrtc_keep_camera_warm === true;
+  // Clamped: reachable from the untracked overlay (invariant 8), and 0 would mean "tear the
+  // camera down the instant the last viewer leaves", turning every page reload into a camera
+  // restart mid-drive.
+  const closeAfter = Number(cfg.webrtc_on_demand_close_after_s);
+  const onDemandCloseAfterS = Number.isFinite(closeAfter) && closeAfter > 0
+    ? Math.min(600, Math.max(10, Math.round(closeAfter))) : 60;
 
   return `logLevel: info
 logDestinations: [stdout]
@@ -89,17 +159,26 @@ webrtcTrackGatherTimeout: 10s
 paths:
   ${camPath}:
     source: rpiCamera
-    sourceOnDemand: false
+    # ENCODE ONLY WHEN SOMEONE IS WATCHING. This was hardcoded false, so every rover
+    # encoded continuously whether or not a client existed — rover2 was measured having
+    # produced 9.58 GB with ZERO readers, and rover1 pays 3.3x for that because its CM5 has
+    # no hardware encoder and must use software.
+    #
+    # sourceOnDemandCloseAfter is what makes this safe for teleop: the camera stays warm
+    # for that long after the last viewer leaves, so a reconnect or a page reload never waits
+    # for a camera start, while a rover parked with nobody watching stops encoding entirely.
+    # Set webrtc_keep_camera_warm: true to restore the old always-on behaviour.
+    sourceOnDemand: ${keepWarm ? 'false' : 'true'}
+    sourceOnDemandStartTimeout: 10s
+    sourceOnDemandCloseAfter: ${onDemandCloseAfterS}s
     rpiCameraCamID: ${cfg.webrtc_cam_id ?? 0}
     rpiCameraWidth: ${params.width}
     rpiCameraHeight: ${params.height}
     rpiCameraFPS: ${params.fps}
-    rpiCameraCodec: ${cfg.webrtc_codec || 'hardwareH264'}
+    rpiCameraCodec: ${codec}
     rpiCameraIDRPeriod: ${params.idr_period}
     rpiCameraBitrate: ${params.bitrate * 1000}
-    rpiCameraHardwareH264Profile: ${cfg.webrtc_h264_profile || 'baseline'}
-    rpiCameraHardwareH264Level: '${cfg.webrtc_h264_level || '4.1'}'
-    rpiCameraDenoise: ${cfg.webrtc_denoise || 'cdn_fast'}
+${hwProfileLines}    rpiCameraDenoise: ${cfg.webrtc_denoise || 'cdn_fast'}
 `;
 }
 
@@ -300,3 +379,4 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
 // this the default that decides whether video can silently fall back to TCP is
 // unassertable, which is how it stayed wrong.
 module.exports.generateMediaMTXConfig = generateMediaMTXConfig;
+module.exports.hasHardwareEncoder = hasHardwareEncoder;

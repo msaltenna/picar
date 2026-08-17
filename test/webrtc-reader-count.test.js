@@ -173,3 +173,70 @@ test('stop() clears the poll timer so the process can exit', async () => {
   assert.ok(process._getActiveHandles().length <= before + 1,
     'stop() must not leave the reader poll interval running');
 });
+
+// ── On-demand encoding and encoder capability ────────────────────────────────
+
+const SHIPPED = require('../picar-cfg.json');   // the config that actually ships
+
+test('the SHIPPED config selects the codec by hardware, not by a hardcoded value', () => {
+  // This is the test whose absence hid a defect that made the whole feature a no-op.
+  // picar-cfg.json shipped `"webrtc_codec": "hardwareH264"`, and the code read
+  // `cfg.webrtc_codec || detect(...)` — so the tracked config always won and the detection
+  // never ran on any rover. A fresh CM5 would still have been handed a codec its hardware
+  // cannot run. The earlier tests generated from `{}` and so could never see it.
+  const sw = webrtc.generateMediaMTXConfig({ ...SHIPPED, _hasHardwareEncoder: false }, PARAMS());
+  assert.match(sw, /rpiCameraCodec: softwareH264/,
+    'a board with no hardware encoder must get software, even with the shipped config');
+  const hw = webrtc.generateMediaMTXConfig({ ...SHIPPED, _hasHardwareEncoder: true }, PARAMS());
+  assert.match(hw, /rpiCameraCodec: hardwareH264/);
+});
+
+test('an explicit codec in config still overrides detection', () => {
+  const yml = webrtc.generateMediaMTXConfig(
+    { ...SHIPPED, webrtc_codec: 'softwareH264', _hasHardwareEncoder: true }, PARAMS());
+  assert.match(yml, /rpiCameraCodec: softwareH264/);
+});
+
+test('on-demand is OFF by default on the pinned MediaMTX', () => {
+  // install.sh pins v1.17.1, confirmed running on rover1. That release has a first-reader
+  // race with sourceOnDemand — a player connecting before SPS/PPS are available gets
+  // undecodable H.264 and stays BLACK, and the browser retries only if ICE reaches `failed`.
+  // Fixed upstream in v1.19.2. A persistent black stream for the first operator of a
+  // teleoperated vehicle is worse than the encoder cost it saves.
+  const yml = webrtc.generateMediaMTXConfig({ ...SHIPPED }, PARAMS());
+  assert.match(yml, /^\s*sourceOnDemand: false$/m);
+});
+
+test('on-demand can be enabled deliberately, once MediaMTX is upgraded', () => {
+  const yml = webrtc.generateMediaMTXConfig(
+    { ...SHIPPED, webrtc_camera_on_demand: true }, PARAMS());
+  assert.match(yml, /^\s*sourceOnDemand: true$/m);
+  assert.match(yml, /sourceOnDemandCloseAfter: 60s/, 'and it must stay warm between viewers');
+});
+
+test('the close-after window is clamped against the untracked overlay', () => {
+  // invariant 8. Zero would tear the camera down the instant the last viewer left, turning a
+  // reload into a restart mid-drive.
+  const at = (v) => /sourceOnDemandCloseAfter: (\d+)s/.exec(webrtc.generateMediaMTXConfig(
+    { ...SHIPPED, webrtc_camera_on_demand: true, webrtc_on_demand_close_after_s: v }, PARAMS()))[1];
+  assert.equal(at(0), '60',    'zero must not mean "close immediately"');
+  assert.equal(at(-5), '60');
+  assert.equal(at(1), '10',    'clamped up to the floor');
+  assert.equal(at(99999), '600', 'and down to the ceiling');
+  assert.equal(at(120), '120', 'a sane value is honoured');
+});
+
+test('hardware-only encoder options are NOT emitted for a software encoder', () => {
+  const sw = webrtc.generateMediaMTXConfig({ ...SHIPPED, _hasHardwareEncoder: false }, PARAMS());
+  assert.doesNotMatch(sw, /rpiCameraHardwareH264Profile/);
+  assert.doesNotMatch(sw, /rpiCameraHardwareH264Level/);
+  const hw = webrtc.generateMediaMTXConfig({ ...SHIPPED, _hasHardwareEncoder: true }, PARAMS());
+  assert.match(hw, /rpiCameraHardwareH264Profile: baseline/);
+});
+
+test('the config still renders whole with the hardware block omitted', () => {
+  const sw = webrtc.generateMediaMTXConfig({ ...SHIPPED, _hasHardwareEncoder: false }, PARAMS());
+  assert.match(sw, /^\s*rpiCameraBitrate: \d+$/m);
+  assert.match(sw, /^\s*rpiCameraDenoise: \w+$/m);
+  assert.doesNotMatch(sw, /\$\{/, 'an unsubstituted placeholder means the literal broke');
+});
