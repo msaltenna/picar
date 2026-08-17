@@ -813,6 +813,11 @@
       // a fuel gauge and a hard acceleration would look like a failing pack.
       if (b.remainingPct !== null && b.remainingPct !== undefined) {
         parts.push(`${b.pctSource === 'voltage' ? '~' : ''}${b.remainingPct}%`);
+      } else if (b.pctSuppressed) {
+        // Say WHY there is no percentage. A bare missing gauge reads as a display fault; this
+        // is a monitor fault, and the difference decides whether someone goes looking at the
+        // pack or at the software. rover3 showed 77% beside 0.007 V before this existed.
+        parts.push('<span style="color:#f66">no pct: sensor</span>');
       }
       if (b.currentA !== null && b.currentA !== undefined) parts.push(`${b.currentA.toFixed(1)}A`);
       const text = parts.length ? parts.join(' ') : '--';

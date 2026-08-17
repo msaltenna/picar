@@ -1355,14 +1355,44 @@ class PWMMavproxy {
       // A signed byte carries 1..127, but only 1..100 is a valid percentage. 127
       // was being labelled 'flightcontroller' and rendered as 127%, which also
       // cleared the low-battery warning.
-      const fcPct = (remaining > 0 && remaining <= 100) ? remaining : null;
+      let fcPct = (remaining > 0 && remaining <= 100) ? remaining : null;
+
+      // A PERCENTAGE IS NOT REPORTED WHEN THE VOLTAGE CONTRADICTS IT.
+      //
+      // rover3 was showing 77% while reading 0.007 V. ArduPilot's battery_remaining is
+      // BATT_CAPACITY minus consumed mAh — arithmetic against an ASSUMED capacity, not a
+      // measurement of a pack — so with nothing connected it simply decays from 100% and keeps
+      // reporting a comfortable number forever. The code called that source "coulomb-counted
+      // and trustworthy".
+      //
+      // Both numbers come from the SAME monitor, so a voltage outside any physically possible
+      // range proves the monitor is not measuring a pack, and every figure derived from it is
+      // unusable. Reporting 77% next to 0 V is the worst available outcome: an operator reads
+      // charge remaining on a vehicle that has none.
+      //
+      // Same 3.0-30.0 V window telemetry.sh and control-e2e.js already use. Deliberately wide:
+      // a genuinely flat 2S pack reads ~6 V and MUST still report its percentage. Only a
+      // reading outside the window — 0.007 V is not a flat pack, it is no measurement —
+      // suppresses it.
+      //
+      // A voltage of null (BATT_MONITOR unset) does NOT suppress: there is nothing to
+      // contradict, and a vehicle that coulomb-counts without a voltage sense is legitimate.
+      let pctSuppressed = null;
+      if (voltageV !== null && (voltageV < 3.0 || voltageV > 30.0)) {
+        pctSuppressed = `voltage ${voltageV} V is outside 3.0-30.0 V, so the monitor is not ` +
+                        'reading a pack and any percentage from it is meaningless';
+        fcPct = null;
+      }
 
       // Fall back to a voltage estimate only when the flight controller has
       // nothing usable, so a vehicle that DOES coulomb-count keeps its more
       // accurate reading. pctSource tells the operator which they are looking at:
       // an estimate sags under load and must not be presented as a fuel gauge.
       const smoothedV    = voltageV === null ? null : this.smoothedBatteryVolts(voltageV);
-      const estimatedPct = fcPct === null ? this.batteryPctFromVolts(smoothedV) : null;
+      // The voltage estimate is suppressed by the same rule, and must be — interpolating a
+      // percentage from an implausible voltage is exactly the same error one step removed.
+      const estimatedPct = (fcPct === null && pctSuppressed === null)
+        ? this.batteryPctFromVolts(smoothedV) : null;
 
       this.telemetry.battery = {
         voltageV,
@@ -1372,6 +1402,10 @@ class PWMMavproxy {
         // 'voltage'          = interpolated from the configured pack range, smoothed.
         // null               = no percentage available at all.
         pctSource: fcPct !== null ? 'flightcontroller' : (estimatedPct !== null ? 'voltage' : null),
+        // Why there is no percentage, when there is a voltage but it cannot support one.
+        // Null when nothing was suppressed. An operator seeing a blank gauge deserves the
+        // reason, or they will read it as a display fault rather than a monitor fault.
+        pctSuppressed,
         at: Date.now(),
       };
       return;

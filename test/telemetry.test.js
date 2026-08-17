@@ -1223,3 +1223,51 @@ test('an invalid noise reading yields null SNR rather than a wrong one', () => {
   assert.equal(r.remSnrRaw, null);
   assert.equal(r.rssi, 190, 'while the rssi it did report survives');
 });
+
+test('no percentage is reported when the voltage contradicts it', () => {
+  // rover3 showed 77% beside 0.007 V. ArduPilot's battery_remaining is BATT_CAPACITY minus
+  // consumed mAh — arithmetic against an assumed capacity — so with no pack it decays from
+  // 100% and keeps reporting a comfortable number. Both figures come from the same monitor,
+  // so a physically impossible voltage proves the percentage is meaningless too.
+  const d = driver();
+  d.parseIncoming(frameV1(MSG.SYS_STATUS,
+    sysStatusPayload({ voltage_mV: 7, current_cA: 49, remaining: 77 })));
+  const b = d.getTelemetry().battery;
+  assert.equal(b.voltageV, 0.007, 'the voltage it measured is still reported');
+  assert.equal(b.remainingPct, null, '77% beside 0.007 V must not be shown');
+  assert.equal(b.pctSource, null);
+  assert.match(b.pctSuppressed, /outside 3\.0-30\.0 V/);
+});
+
+test('a genuinely FLAT pack still reports its percentage', () => {
+  // The window is deliberately wide. A flat 2S LiPo reads ~6 V and is exactly when an
+  // operator most needs the number — suppressing it there would be far worse than the bug.
+  const d = driver();
+  d.parseIncoming(frameV1(MSG.SYS_STATUS,
+    sysStatusPayload({ voltage_mV: 6000, current_cA: 49, remaining: 5 })));
+  const b = d.getTelemetry().battery;
+  assert.equal(b.remainingPct, 5);
+  assert.equal(b.pctSource, 'flightcontroller');
+  assert.equal(b.pctSuppressed, null);
+});
+
+test('a healthy pack is unaffected', () => {
+  const d = driver();
+  d.parseIncoming(frameV1(MSG.SYS_STATUS,
+    sysStatusPayload({ voltage_mV: 7900, current_cA: 41, remaining: 77 })));
+  const b = d.getTelemetry().battery;
+  assert.equal(b.remainingPct, 77);
+  assert.equal(b.pctSuppressed, null);
+});
+
+test('an absent voltage sense does NOT suppress a coulomb-counted percentage', () => {
+  // A vehicle that coulomb-counts without a voltage sense is legitimate. With no voltage there
+  // is nothing to contradict, so suppressing would remove a good reading for no reason.
+  const d = driver();
+  d.parseIncoming(frameV1(MSG.SYS_STATUS,
+    sysStatusPayload({ voltage_mV: 0, current_cA: 41, remaining: 77 })));
+  const b = d.getTelemetry().battery;
+  assert.equal(b.voltageV, null);
+  assert.equal(b.remainingPct, 77);
+  assert.equal(b.pctSuppressed, null);
+});
