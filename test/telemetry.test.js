@@ -1192,3 +1192,34 @@ test('a stale autopilot identity does not survive into the next connection', asy
     h.restore();
   }
 });
+
+test('RADIO_STATUS yields SNR for both ends of the SiK link', () => {
+  // rssi and noise were both parsed and neither was ever turned into the ratio that actually
+  // predicts whether the link holds.
+  const d = driver();
+  const p = Buffer.alloc(MSG.RADIO_STATUS.len);
+  p.writeUInt16LE(0, 0); p.writeUInt16LE(0, 2);
+  p[4] = 190;  // rssi
+  p[5] = 180;  // remrssi
+  p[6] = 0;    // txbuf
+  p[7] = 40;   // noise
+  p[8] = 35;   // remnoise
+  d.parseIncoming(frameV1(MSG.RADIO_STATUS, p));
+  const r = d.getTelemetry().radio;
+  assert.equal(r.snrRaw, 150, 'rssi - noise');
+  assert.equal(r.remSnrRaw, 145, 'remrssi - remnoise');
+});
+
+test('an invalid noise reading yields null SNR rather than a wrong one', () => {
+  // 255 is SiK's "no reading" sentinel. Treating it as a value would report a hugely negative
+  // SNR on a link that is merely not reporting its noise floor.
+  const d = driver();
+  const p = Buffer.alloc(MSG.RADIO_STATUS.len);
+  p.writeUInt16LE(0, 0); p.writeUInt16LE(0, 2);
+  p[4] = 190; p[5] = 180; p[6] = 0; p[7] = 255; p[8] = 255;
+  d.parseIncoming(frameV1(MSG.RADIO_STATUS, p));
+  const r = d.getTelemetry().radio;
+  assert.equal(r.snrRaw, null);
+  assert.equal(r.remSnrRaw, null);
+  assert.equal(r.rssi, 190, 'while the rssi it did report survives');
+});

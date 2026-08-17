@@ -618,3 +618,55 @@ test('no link data at all still reads "--"', () => {
   });
   assert.match(out, /Link: --/);
 });
+
+// ── SNR on the status bar ────────────────────────────────────────────────────
+
+test('a wireless link leads with SNR', () => {
+  // SNR predicts whether the link holds; raw RSSI alone does not. -58 dBm looks fine until
+  // you see the noise floor.
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 wifi: { iface: 'wlan0', kind: 'wireless', qualityPct: 93,
+                         signalDbm: -58, noiseDbm: -95, snrDb: 37 } },
+  });
+  assert.match(out, /snr 37dB/);
+  assert.match(out, /-58dBm/, 'the underlying signal is still shown');
+  assert.match(out, /nf -95/, 'and the noise floor it was measured against');
+});
+
+test('a wired link says SNR is n/a rather than leaving it blank', () => {
+  // An ethernet PHY has no signal-to-noise measurement. A blank reads as a failed
+  // measurement; "n/a" says the quantity does not exist for this link type.
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 wifi: { iface: 'eth0', kind: 'wired', speedMbps: 1000, duplex: 'full',
+                         carrier: true, up: true, qualityPct: null, signalDbm: null } },
+  });
+  assert.match(out, /snr n\/a/);
+  assert.match(out, /1Gb/);
+});
+
+test('the SiK radio shows SNR without claiming decibels', () => {
+  // SiK reports rssi and noise in raw radio units, not dBm, so their difference is not dB.
+  // Printing "dB" here would be a plausible unit nobody verified on this hardware.
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 radio: { rssi: 190, remRssi: 180, noise: 40, remNoise: 35,
+                          snrRaw: 150, remSnrRaw: 145 } },
+  });
+  assert.match(out, /snr 150/);
+  assert.doesNotMatch(out, /snr 150 ?dB/, 'raw SiK units must not be labelled dB');
+});
+
+test('an unmeasured noise floor renders as -- rather than a made-up SNR', () => {
+  const out = renderStatusBarWith({
+    uiCfg: { showRadio: true },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 radio: { rssi: 190, remRssi: 180, noise: null, remNoise: null,
+                          snrRaw: null, remSnrRaw: null } },
+  });
+  assert.match(out, /snr --/);
+});

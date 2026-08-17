@@ -1407,6 +1407,18 @@ class PWMMavproxy {
         remRssi,
         noise:    rssiOrNull(payload.readUInt8(7)),
         remNoise: rssiOrNull(payload.readUInt8(8)),
+        // Signal-to-noise for each end of the SiK link.
+        //
+        // Reported as `snrRaw`, NOT as dB, and that naming is deliberate. SiK reports rssi
+        // and noise in raw radio units where dBm is roughly value/1.9 - 127, so the RATIO is
+        // meaningful but a difference in raw units is not decibels. Converting would mean
+        // asserting a firmware-specific scale factor on hardware nobody has verified here —
+        // this repo has been bitten before by a plausible conversion applied to a unit nobody
+        // checked. A larger number is a better link; that is all this claims.
+        snrRaw: (rssi !== null && rssiOrNull(payload.readUInt8(7)) !== null)
+          ? rssi - rssiOrNull(payload.readUInt8(7)) : null,
+        remSnrRaw: (remRssi !== null && rssiOrNull(payload.readUInt8(8)) !== null)
+          ? remRssi - rssiOrNull(payload.readUInt8(8)) : null,
         rxErrors: payload.readUInt16LE(0),
         fixed:    payload.readUInt16LE(2),
         txbuf:    payload.readUInt8(6),
