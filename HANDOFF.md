@@ -104,6 +104,86 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-17 (final) — the mediamtx first-boot bug, and the blank link metric
+
+Both reported by the operator, both fixed and on `main` @ `46ad852`, deployed to all three
+rovers.
+
+**"mediamtx.service needs a restart when booting a rover for the first time" — ROOT-CAUSED AND
+FIXED.** The symptom was that every WebRTC session was created and then closed as `terminated`,
+so video never established, while the service reported perfectly healthy to systemd:
+`ActiveState=active`, `SubState=running`, `NRestarts=0`, `Result=success`. That is why the
+richer service-health work did not catch it — every systemd-level signal was genuinely fine.
+
+Proven from rover3's own boot timeline:
+
+    21:05:05  Started mediamtx.service
+    21:05:06  [WebRTC] listener opened on :8889, :8189      <- ICE candidates gathered HERE
+    21:19:24  eth0 "Activation: successful, device activated"  <- 14m19s LATER
+    22:03:46  operator restarts mediamtx -> video works
+
+`webrtcIPsFromInterfaces: true` makes MediaMTX enumerate interfaces ONCE at startup and never
+again. Started before any interface has an address, it gathers no usable host candidate, so a
+peer can negotiate a session but media can never flow.
+
+Two fixes, because neither covers the other's case:
+
+1. **`After=network-online.target` + `Wants=network-online.target`** on `systemd/mediamtx.service`,
+   replacing `After=network.target`. The latter means "networking is starting", not "there is an
+   address". `NetworkManager-wait-online.service` is enabled fleet-wide, so this is meaningful
+   rather than a no-op.
+2. **picar restarts mediamtx when the host's address set CHANGES.** Nothing in systemd covers a
+   cable connected after boot, which is what rover3's 14-minute gap looks like. Loopback and
+   169.254/16 are ignored (never usable ICE candidates), an EMPTY set is treated as the network
+   leaving rather than arriving, and restarts are capped at 5 with the condition reported past
+   the cap.
+
+**VERIFIED BY AN ACTUAL REBOOT of rover2**, which is the only way this could be proven:
+
+    22:36:21  Reached target network.target             <- the OLD trigger
+    22:36:25  eth0 carrier: link connected
+    22:36:25  eth0 Activation: successful
+    22:36:25  Reached target network-online.target      <- the NEW trigger
+    22:36:25  Started mediamtx.service                  <- now AFTER the address exists
+
+Result on that boot, with NO manual intervention: **380 kbps, `ready=True`, `NRestarts=0`, and
+ZERO `closed: terminated` sessions.** `addressRestarts=1` shows the second layer also fired as
+eth0 came up, which is the belt-and-braces working as intended.
+
+**DEPLOY NOTE, and it is easy to miss:** the tracked unit changed, and `git pull` alone leaves
+systemd running the OLD unit from `/etc/systemd/system`. The deploy copies it across, preserves
+the per-rover `User` (rover1 runs as `salt`, rover2/rover3 as `saltenna`), and runs
+`daemon-reload`. Any rover updated without that step still has the bug.
+
+**"Link metric is blank" — FIXED.** It was read solely from `/proc/net/wireless`, which on a
+wired rover contains only its two header lines. When the fleet moved to ethernet every rover
+rendered `Link: --` on a perfectly good gigabit connection — worse than no field, because a
+blank reads as a dead link on the one indicator describing the connection the operator depends
+on.
+
+The link now follows whichever interface carries the DEFAULT ROUTE, read from
+`/proc/net/route` (lowest metric wins, so a rover with both wired and wireless up reports the
+one actually in use), with wired facts from sysfs. All three now show `Link: eth0 1000Mb full`.
+An unplugged cable reads `NO CARRIER` rather than a stale negotiated speed, and a wired link
+reports `qualityPct`/`signalDbm` as `null` rather than as a fake 0% signal.
+
+**Fleet after deploy** — all on `46ad852`, all services healthy:
+
+| rover | CPU | link | services |
+| --- | --- | --- | --- |
+| rover1 | 71.6 C, 4% | eth0 1000Mb full | picar/mavproxy/mediamtx all ok |
+| rover2 | 60.9 C, 9% | eth0 1000Mb full | all ok |
+| rover3 | 63.8 C, 7% | eth0 1000Mb full | all ok |
+
+**Earlier the same day**, also merged: CPU/thermal telemetry is now shown PERMANENTLY on the
+status bar rather than only during a fault (an indicator that appears only when something is
+wrong cannot be sanity-checked beforehand), and service status is permanent and distinguishes
+ACTIVE from WORKING — a crash-looping unit is `active`/`running` to systemd almost all the
+time, so `is-active` alone rendered it green. It now fails on `auto-restart`, a climbing
+restart count, or a bad last exit result.
+
+
+
 ### 2026-08-17 (later) — video codec detection, on-demand held back, encoder recovery
 
 Merged to `main` @ `2540d3c` and deployed to all three rovers. 454 host tests pass.
