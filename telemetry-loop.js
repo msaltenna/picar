@@ -73,7 +73,7 @@ function parseWirelessProc(text) {
 //
 // So the wiring itself is a unit now. What remains untestable in app.js is one call
 // passing the real pwm/io/fs/config, which is as small as this boundary gets.
-function buildTelemetryWiring({ pwm, io, fleetClient, fs, config = {} }) {
+function buildTelemetryWiring({ pwm, io, fleetClient, fs, hostHealth, config = {} }) {
   return {
     // A driver with no telemetry support must yield an empty snapshot, not throw —
     // four of the five drivers are GPIO and have no getTelemetry at all.
@@ -85,6 +85,8 @@ function buildTelemetryWiring({ pwm, io, fleetClient, fs, config = {} }) {
     getFcTelemetry: () => (typeof pwm.getTelemetry === 'function'
       ? pwm.getTelemetry()
       : { fcSupported: false }),
+    // Same shape as getFcTelemetry: a synchronous cache read, never I/O. See host-health.js.
+    getHostHealth: () => (hostHealth ? hostHealth.snapshot() : null),
     fleetClient,
     emit: (event, payload) => io.emit(event, payload),
     // fs.promises, never fs.readFileSync. Invariant 9: this runs at the telemetry
@@ -128,6 +130,7 @@ function batteryWarnCfgFrom(config = {}) {
 
 function startTelemetryLoop({
   getFcTelemetry,
+  getHostHealth,
   fleetClient,
   emit,
   readWifi,
@@ -147,8 +150,15 @@ function startTelemetryLoop({
 
   // The single source of truth for a telemetry snapshot, so /status, a joining
   // socket, and the broadcast cannot disagree about what the vehicle is reporting.
+  //
+  // `host` rides this snapshot rather than being fetched separately for exactly that
+  // reason: an operator comparing the UI against /status must not see two different
+  // temperatures. getHostHealth is OPTIONAL — the four GPIO drivers and every host test
+  // construct this loop without one, and a missing sampler must yield `null` (unknown)
+  // rather than an object full of zeroes.
   function current() {
-    return { ...getFcTelemetry(), wifi };
+    const host = typeof getHostHealth === 'function' ? getHostHealth() : null;
+    return { ...getFcTelemetry(), wifi, host };
   }
 
   function tick() {

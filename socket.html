@@ -677,6 +677,11 @@
       // Always shown, not behind a uiCfg toggle: an operator must not be able to
       // hide the one indicator that distinguishes a live vehicle from a silent one.
       c3.push(formatFcLink());
+      // Same reasoning, same rule: rover1 spent 2026-08-14 thermally throttled at 84 C
+      // while every other indicator on this bar read healthy. Only rendered when there is
+      // something to say, so a cool rover does not carry a permanent extra line.
+      const host = formatHost();
+      if (host) c3.push(host);
       statusCol3.innerHTML = c3.join('<br>');
     }
 
@@ -686,6 +691,57 @@
     // Every one of these can legitimately be unavailable, and showing a stale or
     // invented value on a vehicle status display is worse than showing nothing. So
     // each returns an explicit "--" when the source is absent or stale.
+    // CPU temperature and throttling, shown ONLY when it is worth an operator's attention:
+    // the firmware says something is being limited right now, or the die is hot enough to be
+    // heading there. A number that is always on screen is a number nobody reads.
+    //
+    // `null` from the rover means "could not determine" and is rendered as such — it is not
+    // silently treated as cool, for the same reason the reader count distinguishes 0 from
+    // unknown.
+    function formatHost() {
+      // Declared INSIDE the function deliberately. test/ui-battery-warning.test.js executes
+      // the real formatters by extracting `function name()` blocks from this file one at a
+      // time, so a module-level constant would be out of scope there and the test would fail
+      // for a reason unrelated to what it asserts. Self-contained keeps it executable.
+      const HOT_C = 75;
+      const h = telemetry && telemetry.host;
+      if (!h) return '';
+      const parts = [];
+
+      // A UNIT THAT IS NOT ACTIVE IS THE LOUDEST THING HERE. An earlier revision of this
+      // function ignored `services` entirely, so a dead mavproxy — no link to the flight
+      // controller at all — rendered exactly like a healthy rover: nothing. A reviewer
+      // caught it, and it is the same defect the whole feature exists to remove, reproduced
+      // inside the fix.
+      const svc = h.services;
+      if (svc) {
+        const down = Object.keys(svc).filter((k) => svc[k] !== 'active');
+        if (down.length) {
+          parts.push(`<span style="color:#f66">SVC ${down.map((k) => `${k}:${svc[k] || '?'}`).join(' ')}</span>`);
+        }
+      }
+
+      const t = h.cpu ? h.cpu.tempC : null;
+      const thr = h.throttled;
+      const limited = thr && thr.active;
+      const hot = typeof t === 'number' && t >= HOT_C;
+      const tempTxt = typeof t === 'number' ? `${t.toFixed(1)}°C` : '--°C';
+      if (limited) {
+        // Name what is being limited. "THROTTLED" alone sends someone looking for a
+        // temperature problem when the cause may be under-voltage.
+        parts.push(`<span style="color:#f66">CPU ${tempTxt} — ${thr.now.join(', ')}</span>`);
+      } else if (hot) {
+        parts.push(`<span style="color:#fc6">CPU ${tempTxt}</span>`);
+      }
+
+      // A SAMPLER THAT CANNOT READ ITS SOURCES MUST SAY SO. Silence here would mean "this
+      // rover is cool and every service is up", which is precisely the claim it cannot make.
+      if (h.errors) {
+        parts.push(`<span style="color:#fc6">HEALTH? ${Object.keys(h.errors).join(',')}</span>`);
+      }
+      return parts.join('<br>');
+    }
+
     function formatBattery() {
       const b = telemetry && telemetry.battery;
       if (!b) {
