@@ -240,3 +240,100 @@ test('the config still renders whole with the hardware block omitted', () => {
   assert.match(sw, /^\s*rpiCameraDenoise: \w+$/m);
   assert.doesNotMatch(sw, /\$\{/, 'an unsubstituted placeholder means the literal broke');
 });
+
+// ── Dead-source detection ────────────────────────────────────────────────────
+//
+// rover2's hardware encoder failed permanently on 2026-08-17: the path reported ready:true
+// with bytesReceived FROZEN at 0 B/s while rover3 produced 46,840 B/s on identical hardware.
+// MediaMTX advertises a path that delivers nothing, so a viewer gets a black screen and no
+// error, and only a restart recovers it.
+
+function apiSeq(responses) {
+  // Serve a scripted sequence of API bodies, repeating the last one.
+  let i = 0;
+  return http.createServer((rq, rs) => {
+    const body = responses[Math.min(i++, responses.length - 1)];
+    rs.writeHead(200, { 'Content-Type': 'application/json' });
+    rs.end(JSON.stringify(body));
+  });
+}
+const READY = (bytes) => ({ name: 'cam', ready: true, readers: [], bytesReceived: bytes });
+
+test('a READY path with frozen bytes is declared dead and recovered', async () => {
+  const port = nextPort++;
+  const server = apiSeq([READY(100), READY(100), READY(100), READY(100), READY(100), READY(100)]);
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  const restarts = [];
+  const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
+                       webrtc_source_stall_polls: 2 });
+  s.__restart = restarts;
+  try {
+    // The poll interval is floored at 1000 ms, so N stall polls need more than N+1 seconds.
+    await new Promise((r) => setTimeout(r, 3600));
+    const h = s.sourceHealth();
+    assert.equal(h.dead, true, `frozen bytes on a ready path must be declared dead: ${JSON.stringify(h)}`);
+    assert.ok(h.recoveries >= 1, 'and a recovery must have been attempted');
+  } finally { s.stop(); await new Promise((r) => server.close(r)); }
+});
+
+test('a path producing data is never declared dead', async () => {
+  // The negative control. Without it, "dead" could be hardwired true and every healthy rover
+  // would restart mediamtx in a loop.
+  const port = nextPort++;
+  const server = apiSeq([READY(100), READY(200), READY(300), READY(400), READY(500), READY(600)]);
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
+                       webrtc_source_stall_polls: 2 });
+  try {
+    await new Promise((r) => setTimeout(r, 3600));
+    const h = s.sourceHealth();
+    assert.equal(h.dead, false, 'a healthy encoder must not be restarted');
+    assert.equal(h.recoveries, 0);
+  } finally { s.stop(); await new Promise((r) => server.close(r)); }
+});
+
+test('an ON-DEMAND idle camera is NOT mistaken for a dead one', async () => {
+  // The guard that makes this safe alongside sourceOnDemand. With nobody watching the camera
+  // is deliberately stopped and bytesReceived legitimately does not advance — but the path
+  // reports ready:false. Without this check an idle rover would be declared dead and
+  // restarted forever.
+  const port = nextPort++;
+  const server = apiSeq([{ name: 'cam', ready: false, readers: [], bytesReceived: 100 }]);
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
+                       webrtc_source_stall_polls: 2 });
+  try {
+    await new Promise((r) => setTimeout(r, 3600));
+    const h = s.sourceHealth();
+    assert.equal(h.dead, false, 'an idle on-demand camera is not a fault');
+    assert.equal(h.recoveries, 0, 'and must never trigger a restart');
+  } finally { s.stop(); await new Promise((r) => server.close(r)); }
+});
+
+test('recovery attempts are CAPPED so a broken rover is reported, not looped', async () => {
+  // An endless restart loop hides a broken rover rather than fixing it, and takes the video
+  // server down repeatedly while doing so.
+  const port = nextPort++;
+  const server = apiSeq([READY(100)]);
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  const restarts = [];
+  const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
+                       webrtc_source_stall_polls: 2, webrtc_max_source_recoveries: 2,
+                       // Injected so the CAP is what is under test rather than the timing of
+                       // a spawned systemctl that does not exist on this host.
+                       _restartFn: () => restarts.push(Date.now()) });
+  try {
+    // Each recovery cycle costs ~3 polls (reset, seed, stall, stall) at the 1000 ms floor, so
+    // the window must be long enough that an UNCAPPED implementation would exceed 2. At 16 s
+    // that is ~5 attempts — measured: removing the cap makes this test fail.
+    await new Promise((r) => setTimeout(r, 16000));
+    const h = s.sourceHealth();
+    // The bound, not an exact count: restartMediamtx sets `restarting` until the spawned
+    // child settles, which paces attempts unpredictably on a host with no mediamtx unit.
+    // What must hold is that the cap is never exceeded — measured: removing the cap makes
+    // this exceed 2 within this window.
+    assert.equal(h.recoveries, 2, `recoveries must stop AT the cap, got ${h.recoveries}`);
+    assert.equal(restarts.length, 2, 'and exactly that many restarts may be issued');
+    assert.equal(h.maxRecoveries, 2);
+  } finally { s.stop(); await new Promise((r) => server.close(r)); }
+});

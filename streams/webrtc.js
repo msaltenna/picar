@@ -305,6 +305,7 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
           const parsed = JSON.parse(body);
           readerCount   = Array.isArray(parsed.readers) ? parsed.readers.length : null;
           readerPollErr = readerCount === null ? 'no readers array in API response' : null;
+          noteSourceProgress(parsed);
         } catch (e) {
           readerPollErr = `unparseable API response: ${e.message}`;
         }
@@ -312,6 +313,94 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     });
     req.on('timeout', () => { readerPollErr = 'API timeout'; req.destroy(); });
     req.on('error', (e) => { readerPollErr = e.message; });
+  }
+
+  // ── Dead-source detection ──────────────────────────────────────────────────
+  //
+  // MEASURED ON ROVER2, 2026-08-14. Its hardware encoder entered a permanent failure state:
+  // `encoder_hardware_h264_encode(): ioctl(VIDIOC_QBUF) failed` at ~21/s, 229,561 errors and
+  // counting. The decisive symptom is not the log spam — it is that the path still reported
+  //
+  //     ready: true,  readers: 0,  bytesReceived rate: 0 B/s
+  //
+  // against rover3's healthy 46,840 B/s on identical hardware and identical config. MediaMTX
+  // advertises the path as available while producing nothing, so any viewer that connects
+  // gets a black screen and no error. Restarting mediamtx is the only known recovery.
+  //
+  // DETECTED FROM bytesReceived RATHER THAN THE JOURNAL, deliberately. Scraping journalctl for
+  // QBUF lines would need a subprocess on a timer and would be coupled to one encoder's error
+  // string; this reuses the API poll that already exists for the reader count, costs nothing
+  // extra, and measures the thing that actually matters — whether video is being produced.
+  //
+  // `ready` is the load-bearing guard. With sourceOnDemand the camera is legitimately stopped
+  // when nobody is watching, and bytesReceived correctly does not advance then — but the path
+  // reports ready:false, so an idle rover is never mistaken for a broken one.
+  let lastBytes      = null;
+  let stalledPolls   = 0;
+  let sourceDead     = false;
+  let recoveryCount  = 0;
+  const STALL_POLLS_TO_DECLARE_DEAD = Math.max(2, config.webrtc_source_stall_polls ?? 4);
+  const MAX_RECOVERIES = Math.max(0, config.webrtc_max_source_recoveries ?? 3);
+
+  function noteSourceProgress(parsed) {
+    const bytes = Number(parsed && parsed.bytesReceived);
+    // Not ready = the camera is deliberately stopped (on-demand) or still starting. Neither
+    // is a fault, and both must reset the counter or an idle rover would eventually be
+    // declared dead and restarted in a loop.
+    if (parsed.ready !== true || !Number.isFinite(bytes)) {
+      lastBytes = null; stalledPolls = 0; sourceDead = false;
+      return;
+    }
+    if (lastBytes !== null && bytes === lastBytes) stalledPolls += 1;
+    else stalledPolls = 0;
+    lastBytes = bytes;
+
+    if (stalledPolls < STALL_POLLS_TO_DECLARE_DEAD) return;
+    if (!sourceDead) {
+      sourceDead = true;
+      console.error(
+        `WebRTC: the camera source is READY but has produced NO DATA for ${stalledPolls} ` +
+        `consecutive polls (${bytes} bytes, unchanged). MediaMTX is advertising a path that ` +
+        `delivers nothing — measured on rover2 as a permanently failed hardware encoder.`);
+    }
+    maybeRecover();
+  }
+
+  // Restart mediamtx, bounded and loudly.
+  //
+  // NOT gated on the reader count, and that is the deliberate choice: a dead source is
+  // delivering nothing to anyone, so a viewer has no video to lose. Withholding the restart
+  // while someone is connected would preserve a black screen instead of fixing it. The
+  // protection against a restart loop is the ATTEMPT CAP plus the ready/bytes guard, not a
+  // reader check.
+  // Injectable so the CAP is testable. restartMediamtx() sets `restarting` until the spawned
+  // child settles, and on a host with no mediamtx unit that timing is unpredictable — which
+  // paced attempts so unevenly that a test could not distinguish a capped implementation from
+  // an uncapped one. Measured: removing the cap survived the test until this existed. Same
+  // dependency-injection reasoning telemetry-loop.js gives for setIntervalFn and readWifi.
+  const doRestart = config._restartFn || restartMediamtx;
+  const pacedByRestart = !config._restartFn;
+
+  function maybeRecover() {
+    if (stopped || (pacedByRestart && restarting)) return;
+    if (recoveryCount >= MAX_RECOVERIES) {
+      return;   // already reported below on the transition; stay quiet rather than spam
+    }
+    recoveryCount += 1;
+    console.error(
+      `WebRTC: restarting mediamtx to recover the dead camera source ` +
+      `(attempt ${recoveryCount}/${MAX_RECOVERIES}). A restart drops any active WebRTC ` +
+      `session; they are receiving no video anyway.`);
+    // Reset the detector so the next window is judged fresh rather than immediately
+    // re-triggering on the pre-restart byte count.
+    lastBytes = null; stalledPolls = 0;
+    doRestart();
+    if (recoveryCount >= MAX_RECOVERIES) {
+      console.error(
+        `WebRTC: that was the last automatic recovery attempt. If the source dies again it ` +
+        `will be REPORTED and not restarted — an endless restart loop hides a broken rover ` +
+        `rather than fixing it. Investigate the encoder.`);
+    }
   }
 
   const readerTimer = setInterval(pollReaders, READER_POLL_MS);
@@ -324,6 +413,12 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     // Why the count is null, for an operator who needs to tell "nobody watching" from
     // "picar cannot see MediaMTX".
     clientCountError() { return readerPollErr; },
+    // Whether the camera path is advertising itself as ready while producing nothing, and
+    // how many automatic recoveries have been spent. Surfaced so a rover that has exhausted
+    // its attempts is visible rather than quietly broken.
+    sourceHealth() {
+      return { dead: sourceDead, stalledPolls, recoveries: recoveryCount, maxRecoveries: MAX_RECOVERIES };
+    },
     stop() {
       clearInterval(readerTimer);
       // Latch shutdown BEFORE clearing state. Otherwise a setVideoParams arriving
