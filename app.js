@@ -84,6 +84,11 @@ const appServer = https.createServer(options, (req, res) => {
       status: 'OK',
       throttle: old_throttle,
       steering: old_steering,
+      // `telemetry.host` carries CPU load, temperature, clock, throttle flags and unit
+      // status — the fields that would have shown rover1 thermally throttled at 84 C on
+      // 2026-08-14 while everything else here said the rover was healthy. It rides the
+      // telemetry snapshot rather than being fetched separately so the UI and /status
+      // cannot disagree, and it is a synchronous cache read (invariant 9).
       telemetry: currentTelemetry(),
       // How many clients are pulling video RIGHT NOW, and why that is unknown when it is.
       // Surfaced rather than capped: a hard one-viewer limit was proposed for this, and it
@@ -193,8 +198,32 @@ if (warnability) console.error(warnability);
 // One call, and every lambda it used to inline is now covered by
 // telemetry-loop.test.js. See buildTelemetryWiring() for the two mutations that
 // survived while those lambdas lived here.
+// Host health — CPU, temperature, throttling, unit status. Constructed ONCE here rather
+// than per request, because the whole point is that /status reads a cache instead of
+// touching /sys or spawning anything on the control event loop.
+//
+// `run` is execFile, not exec: no shell, and a hard timeout so a wedged vcgencmd or a
+// systemctl blocked on a hung unit cannot pile up. On a non-Pi host vcgencmd simply does
+// not exist and the promise rejects, which host-health.js reports as an error and a null
+// reading rather than a fabricated zero.
+const { createHostHealth } = require('./host-health');
+const { execFile } = require('child_process');
+const hostHealth = createHostHealth({
+  readFile: (p, enc) => fs.promises.readFile(p, enc),
+  run: (cmd, args) => new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: 4000, encoding: 'utf8' }, (err, stdout) => {
+      // systemctl is-active exits non-zero when ANY unit is inactive, so the output is
+      // still the answer. Carry it on the error for the caller to parse.
+      if (err) { err.stdout = stdout; return reject(err); }
+      resolve(stdout);
+    });
+  }),
+  fastMs: config.host_health_fast_ms,
+  slowMs: config.host_health_slow_ms,
+});
+
 const telemetryLoop = startTelemetryLoop(
-  buildTelemetryWiring({ pwm, io, fleetClient, fs, config }));
+  buildTelemetryWiring({ pwm, io, fleetClient, fs, hostHealth, config }));
 const currentTelemetry = telemetryLoop.current;
 
 io.on('connection', (socket) => {
@@ -408,6 +437,7 @@ installCrashFailSafe({
 });
 
 process.on('SIGINT', () => {
+  hostHealth.stop();
   failSafeStop('process shutdown');
   stream.stop();
   console.log('\nShutting down');

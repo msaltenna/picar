@@ -208,7 +208,7 @@ function renderStatusBarWith({ uiCfg = {}, telemetry = null, telemetryCfg = CFG 
   };
   const cols = { 1: '', 2: '', 3: '' };
   const stub = (n) => ({ set innerHTML(v) { cols[n] = v; }, get innerHTML() { return cols[n]; } });
-  const src = ['formatBattery', 'formatRadio', 'formatRails', 'formatFcLink']
+  const src = ['formatBattery', 'formatRadio', 'formatRails', 'formatFcLink', 'formatHost']
     .map(grab).join('\n') + '\n' + grab('renderStatusBar') + '\nrenderStatusBar();';
   new Function('uiCfg', 'telemetry', 'telemetryCfg', 'statusCol1', 'statusCol2', 'statusCol3',
     'isConnected', 'controlMode', 'liveStats', 'throttleValue', 'steeringValue', 'applyCurve', src)(
@@ -356,4 +356,69 @@ test('a vehicle with no flight controller shows n/a, and a dead link still shows
   // The fail-open to guard against: 'n/a' must not swallow a real link failure.
   const down = f({ linkUp: false }, CFG);
   assert.ok(down.includes('DOWN') && down.includes('⚠'), down);
+});
+
+// ── CPU thermal indicator ────────────────────────────────────────────────────
+
+test('a cool rover shows no CPU line at all', () => {
+  // An indicator that is always present is an indicator nobody reads. This one earns its
+  // place on the bar only when there is something to act on.
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 55.5 }, throttled: { active: false, now: [], sinceBoot: [] } } },
+  });
+  assert.doesNotMatch(out, /CPU/, `a 55.5 C rover must not clutter the bar: ${out}`);
+});
+
+test('an ACTIVE throttle is shown and NAMES what is being limited', () => {
+  // rover1's real state on 2026-08-14. "THROTTLED" alone would send an operator looking for
+  // a heat problem when the firmware may be reporting under-voltage instead.
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 84.2 },
+                         throttled: { active: true, now: ['soft temperature limit'],
+                                      sinceBoot: ['under-voltage'] } } },
+  });
+  assert.match(out, /84\.2°C/);
+  assert.match(out, /soft temperature limit/);
+});
+
+test('hot-but-not-yet-throttled is shown as a warning', () => {
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 78.0 }, throttled: { active: false, now: [], sinceBoot: [] } } },
+  });
+  assert.match(out, /78\.0°C/, 'a rover heading for the limit should say so before it gets there');
+});
+
+test('LATCHED history alone does not raise the live indicator', () => {
+  // 0xf0000 means "this box has throttled at some point since boot". Real, worth recording,
+  // but not happening now — and colouring it as a present fault trains operators to ignore it.
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 60.0 },
+                         throttled: { active: false, now: [], sinceBoot: ['throttled'] } } },
+  });
+  assert.doesNotMatch(out, /CPU/, `latched history is not a live condition: ${out}`);
+});
+
+test('an unknown temperature is not rendered as cool', () => {
+  // null means picar could not read the sensor. If the firmware still reports an active
+  // limit, that must surface even without a number to attach to it.
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: null },
+                         throttled: { active: true, now: ['throttled'], sinceBoot: [] } } },
+  });
+  assert.match(out, /--°C/, `an unreadable sensor must not render as a temperature: ${out}`);
+  assert.match(out, /throttled/);
+});
+
+test('a rover reporting no host block at all renders nothing extra', () => {
+  // Older rovers, and every GPIO driver, have no sampler. Absence must be silent rather
+  // than rendering a row of dashes on every bar.
+  const out = renderStatusBarWith({
+    telemetry: { linkUp: true, autopilotHeartbeat: true },
+  });
+  assert.doesNotMatch(out, /CPU/);
 });
