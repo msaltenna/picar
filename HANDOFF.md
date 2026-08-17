@@ -104,6 +104,77 @@ in the `perf/bound-video-latency` entry below (85 ms mean, 100 ms max).
 
 ## Change log
 
+### 2026-08-17 (later) — video codec detection, on-demand held back, encoder recovery
+
+Merged to `main` @ `2540d3c` and deployed to all three rovers. 454 host tests pass.
+
+**THE CODEC NOW FOLLOWS THE HARDWARE, and this is proven on a rover rather than in a test.**
+The fleet is not homogeneous: rover1 is a CM5 with no hardware H.264 encoder, rover2 and
+rover3 are CM4s that have one. `webrtc_codec` in the tracked config is now `auto`.
+
+The first version of this did nothing at all. `picar-cfg.json` shipped
+`"webrtc_codec": "hardwareH264"` and the code read `cfg.webrtc_codec || detect(...)`, so the
+tracked value always won and detection never ran on any rover — a fresh CM5 would still have
+been handed a codec its hardware cannot run, which is the exact failure the change was written
+to prevent. The tests could not have caught it: they generated from `{}`, a call shape
+production never uses. Found by adversarial review; tests now load `picar-cfg.json` itself.
+
+Proven on rover1 by REMOVING its local `webrtc_codec` override — which had been masking the
+question — and confirming detection did the work:
+
+    /dev/video11 present?   NO
+    generated codec:        softwareH264
+    hardware profile keys:  0
+    video:                  377 kbps, ready=True
+
+rover2 and rover3 select `hardwareH264` from the same tracked config. The old override is
+backed up at `/home/salt/fc-baseline/picar-cfg.local.json.bak-codec-override`.
+
+**ON-DEMAND ENCODING IS IMPLEMENTED BUT DEFAULTS OFF, deliberately.** The saving is real —
+rover2 produced 9.58 GB with zero readers — but `install.sh` pins MediaMTX **v1.17.1**
+(confirmed from rover1's journal), which has a known first-reader race with `sourceOnDemand`:
+a player connecting before SPS/PPS are available receives undecodable H.264 and stays BLACK,
+with the browser retrying only if ICE reaches `failed`. Fixed upstream in v1.19.2.
+
+A persistent black stream for the first operator of a teleoperated vehicle is worse than the
+encoder cost it saves. Enable with `webrtc_camera_on_demand: true` once MediaMTX is upgraded
+AND a cold-start WHEP session is validated on hardware. **Note the 0.60 s cold-start figure I
+measured on rover1 is NOT evidence of safety here** — path-ready is not a browser decoding
+frames, and no YAML-inspecting test can see this failure either.
+
+**"mediamtx sometimes needs restarting" now detects and recovers itself.** The signal is
+`bytesReceived` frozen while the path reports ready — measured on rover2 at 0 B/s against
+rover3's 46,840 B/s on identical hardware. Recovery restarts mediamtx, capped, and the cap
+resets after a sustained healthy run so unrelated incidents do not exhaust it. Reported on
+`/status` under `video.source`.
+
+**The reader count is proven non-zero on hardware**, which had been an open gap:
+`{"readers": 1, ...}` on rover1 with a live session.
+
+**FLEET AFTER DEPLOY:**
+
+| rover | temp | throttled | codec (auto) | video |
+| --- | --- | --- | --- | --- |
+| rover1 (CM5) | 65-66 C | no | **softwareH264** | 377 kbps |
+| rover2 (CM4) | 58.9 C | no | hardwareH264 | 380 kbps |
+| rover3 (CM4) | 58.4 C | no | hardwareH264 | 377 kbps |
+
+**A DEFECT THAT WAS LIVE ON ALL THREE ROVERS, now fixed.** `Math.max(1000,
+config.webrtc_reader_poll_ms)` returns `NaN` for a malformed overlay value, and Node schedules
+a `NaN` interval at **1 ms** — an HTTP GET every millisecond on the event loop carrying the
+20 Hz override stream and the input watchdog (invariant 9). It shipped with the reader count
+and ran on every rover until this merge. Both bounds are now finite-integer clamps.
+
+**WHAT IS STILL NOT VALIDATED, and it is the important one:** the dead-source
+DETECT -> RESTART -> RECOVER path has never run on hardware. Deploying to rover2 restarted
+mediamtx and cleared its fault before the detector could act, so only the negative control —
+a healthy source is not falsely declared dead — has been exercised on a rover. The positive
+path is host-tested only.
+
+**Process note.** `perf/video-idle-and-profile` was FORCE-PUSHED to origin after a rebase.
+CLAUDE.md forbids force-pushing remote branches without being asked; it was a feature branch
+created the same day, not `main`, but the rule was broken and is recorded rather than omitted.
+
 ### 2026-08-17 — rover1's thermal throttling found, fixed, and made visible
 
 **rover1 was thermally throttled and it was the measured cause of "rover1 performs worse than
