@@ -25,3 +25,10 @@ graphify-out/
 .claude/skills/graphify/
 .claude/CLAUDE.md
 .gitattributes
+
+# TLS key material must never be tracked. certs/key.pem and certs/ca.key were committed
+# on 2026-06-18 and reached a PUBLIC repository; see the P0 in TASKS.md. These entries stop
+# the bleeding for any regenerated key and do NOT remove the historical blobs.
+certs/*.pem
+certs/*.key
+certs/*.srl

@@ -84,6 +84,101 @@ Open work only. Completed tasks are **deleted** from this file — their record 
 
 ## Backlog
 
+- **[P0] THE TLS PRIVATE KEY AND THE CA PRIVATE KEY ARE IN A PUBLIC GITHUB REPOSITORY, and all
+  three rovers serve that exact key** — found by the 2026-08-14 fleet audit. `certs/key.pem` and
+  `certs/ca.key` are TRACKED in git, present in `origin/main`, and
+  `gh repo view Saltenna/picar` reports `"visibility":"PUBLIC"`. `.gitignore` has **no** coverage
+  for `*.pem`, `*.key` or `certs/`.
+
+  Committed **2026-06-18** (`caeb8dd` and `a6c9f74`), so the exposure is roughly two months old.
+  They were already in `origin/main` at `948cdcc` — i.e. before this session — so today's pushes
+  did not create it, but nor did anyone notice it.
+
+  Verified the same key is live on hardware, not a stale artifact: the public-key SHA-256 of the
+  committed `certs/key.pem` is `d35ad7253612352b`, and **all three rovers serve exactly that
+  fingerprint**, with `CN=rover1` on every one of them. The live endpoint on rover2:8443 presents
+  it.
+
+  Consequence: anyone who has ever cloned the repo can impersonate any rover's HTTPS endpoint and
+  decrypt or MITM any captured session, and the `ca.key` lets them mint further certificates that
+  anything trusting that CA will accept. TLS currently provides this fleet **no** confidentiality
+  and **no** authenticity. It compounds invariant 1 (the control endpoints have no authentication
+  at all), though note the key is not what gates control — an attacker on the network does not
+  need it.
+
+  **Treat the key as compromised; it cannot be un-published.** Remediation has three parts and
+  two of them are the operator's call, not an agent's:
+  1. Rotate. Regenerate the CA and per-rover keys with `certs/setup-certs.sh`, give each rover its
+     OWN cert (they currently all claim `CN=rover1`), and install with mode 600.
+  2. Stop tracking them: `git rm --cached certs/key.pem certs/ca.key certs/ca.srl` plus
+     `.gitignore` entries. This stops the bleeding but leaves history intact.
+  3. Decide on history and visibility — purging the blobs is a **history rewrite and force-push**,
+     which the standing instruction forbids without explicit authorisation, and making the
+     repository private is a policy decision. Ask before doing either.
+
+- **[P1] `certs/key.pem` is mode 664 on all three rovers** — the HTTPS private key is readable
+  beyond its owner. Mode 600 or 400. Minor next to the P0 above (the key is already public) but it
+  must be fixed as part of the rotation, or the new key inherits the same weakness.
+
+- **[P1] rover1 is thermally throttled and this is the measured cause of "rover1 performs worse
+  than rover3"** — audited 2026-08-14: **84-85 C** with `throttled=0xf0006` then `0xf0008`, i.e.
+  `SOFT TEMP LIMIT ACTIVE NOW` and `ARM FREQ CAPPED`/`THROTTLED` now, plus all four
+  has-occurred bits including **under-voltage**. ARM clock measured **2256 MHz against a 2400 MHz
+  maximum**, and `/sys/class/thermal/cooling_device*` is **empty — no fan or active cooling is
+  registered at all**. rover2 was 56.9 C and rover3 62.3 C at the same moment, both
+  `throttled=0x0`.
+
+  It is 22-28 C hotter than its siblings while nearly idle (~6% CPU). The causal chain is
+  measured end to end: rover1 is a **CM5 with no hardware H.264 encoder** (`/dev/video11` absent),
+  so it is forced onto `softwareH264`, which `codec-benchmark.sh` measured at **3.3x** the encoder
+  CPU of hardware at 480x360 and **9.7x** at 720p30 — and that load runs continuously because
+  `sourceOnDemand: false`. Under real driving load it will throttle far harder than the 6% seen
+  at idle. This is also invariant 9 territory: the control loop, the 20 Hz override stream and the
+  input watchdog share those cores. **Fix the cooling before tuning anything in software.**
+
+- **[P1] MAVProxy's tlogs occupy ~1.5 GB of RAM on every rover** — measured 2026-08-14:
+  `/tmp/mav.tlog` 952-957 MB plus `/tmp/mav.tlog.raw` 622-628 MB, on a **tmpfs** at 40-41% of
+  ~4 GB, on all three rovers simultaneously. `/tmp` is RAM, so this is 1.5 GB of memory per rover
+  spent on unrotated logs that also vanish on reboot — the worst of both properties. Rotate them,
+  cap them, or move them to disk. Previously noted as a warning inside `telemetry.sh`; it is now
+  measured fleet-wide and is a slow march toward OOM on a vehicle that must stay up.
+
+- **[P2] All three rovers report an implausible battery voltage while drawing current** —
+  measured 2026-08-14 within one minute: rover1 `0.002 V / 0.55 A`, rover2 `0.004 V / 0.52 A`,
+  rover3 `0.007 V / 0.49 A`. Three independent sensors reading ~0 V while all three report ~0.5 A
+  is a *systematic* pattern, not three coincidental failures, and it is a CHANGE: rover1 read
+  7.374 V and rover3 7.263 V on 2026-08-12/13. Either the packs were disconnected fleet-wide
+  (plausible — they may have been pulled for charging) or something common to the reporting path
+  regressed. **Do not conclude the vehicles cannot move**: a failed monitor and an absent pack are
+  indistinguishable from the wire, which is the premise that got a throttle probe run three times.
+  Establish it physically, then fix whichever it is.
+
+- **[P2] rover1 had no default route, so it could not reach the internet and could not reply to
+  any off-subnet address** — root-caused 2026-08-14 to NetworkManager's
+  `ipv4.never-default: yes` on "Wired connection 1", which also suppressed the DHCP nameservers
+  (`/etc/resolv.conf` was empty). FIXED: `never-default` set to `no`, default route and resolver
+  added without dropping the link; DNS resolves and `https://github.com` returns 200.
+
+  Recorded because it explains something that wasted a great deal of this session: every episode
+  of "rover1 has gone unreachable" was this. rover2 could ping rover1 at **0.176 ms with 0% loss**
+  at the same moment the workstation timed out completely — because the workstation's traffic
+  arrives via OpenVPN from an off-subnet address that rover1 had no route to answer. Same-subnet
+  peers worked throughout. **A host that answers its neighbours but not you is a ROUTING
+  asymmetry, not a down host** — check from a peer before concluding a rover is offline. rover1
+  also moved from wlan0 `192.168.31.168` to eth0 `192.168.31.167`.
+
+- **[P2] The workstation routes the lab subnet through OpenVPN** — `0.0.0.0/2` and `64.0.0.0/2`
+  via `tun0` swallow `192.168.31.0/24`, so traffic to a rover in the same room goes through the
+  tunnel and back (`ttl=61`). Measured over 60 packets: **18.5 ms average with 1.7% loss** via the
+  VPN against **6.0 ms and 0%** direct. Packet loss on the link carrying control commands is the
+  serious half, and it is invisible to the rovers — rover1's own WiFi hop to its gateway measured
+  clean (2.9-14.6 ms, jitter 1.9 ms, 0% loss). The workstation's WiFi also has `power_save on`,
+  which produced a 236 ms spike. Both fixes are on the workstation and both are runtime-only:
+
+      sudo ip route add 192.168.31.0/24 dev wlp194s0 src 192.168.31.212 metric 50
+      sudo iw dev wlp194s0 set power_save off
+
+
 - **[P3] Hardware-only encoder options are emitted even when the codec is software** —
   `streams/webrtc.js` writes `rpiCameraHardwareH264Profile` and `rpiCameraHardwareH264Level`
   unconditionally, so a rover running `softwareH264` (which rover1's CM5 is FORCED onto — no
