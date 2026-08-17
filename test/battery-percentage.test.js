@@ -56,7 +56,13 @@ test('the percentage is clamped outside the configured range', () => {
   // downstream threshold comparison as well as looking absurd.
   assert.equal(batteryAfter(driver(PACK), [sysStatus(9000)]).remainingPct, 100);
   assert.equal(batteryAfter(driver(PACK), [sysStatus(5000)]).remainingPct, 0);
-  assert.equal(batteryAfter(driver(PACK), [sysStatus(1)]).remainingPct, 0);
+  // 0.001 V used to clamp to 0%, and that assertion is now wrong on purpose. It is the same
+  // defect as reporting 77% beside 0.007 V, merely in the safe direction: "0%" is a claim
+  // about a FLAT PACK, derived from a reading that is not a measurement of any pack at all.
+  // An implausible voltage now yields no percentage and says why.
+  const implausible = batteryAfter(driver(PACK), [sysStatus(1)]);
+  assert.equal(implausible.remainingPct, null);
+  assert.match(implausible.pctSuppressed, /outside 3\.0-30\.0 V/);
 });
 
 test("rover3's real measured voltage produces a sane percentage", () => {
