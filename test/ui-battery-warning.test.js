@@ -208,7 +208,8 @@ function renderStatusBarWith({ uiCfg = {}, telemetry = null, telemetryCfg = CFG 
   };
   const cols = { 1: '', 2: '', 3: '' };
   const stub = (n) => ({ set innerHTML(v) { cols[n] = v; }, get innerHTML() { return cols[n]; } });
-  const src = ['formatBattery', 'formatRadio', 'formatRails', 'formatFcLink', 'formatHost']
+  const src = ['formatBattery', 'formatRadio', 'formatRails', 'formatFcLink', 'formatHost',
+               'formatHostUrgent']
     .map(grab).join('\n') + '\n' + grab('renderStatusBar') + '\nrenderStatusBar();';
   new Function('uiCfg', 'telemetry', 'telemetryCfg', 'statusCol1', 'statusCol2', 'statusCol3',
     'isConnected', 'controlMode', 'liveStats', 'throttleValue', 'steeringValue', 'applyCurve', src)(
@@ -360,20 +361,28 @@ test('a vehicle with no flight controller shows n/a, and a dead link still shows
 
 // ── CPU thermal indicator ────────────────────────────────────────────────────
 
-test('a cool rover shows no CPU line at all', () => {
-  // An indicator that is always present is an indicator nobody reads. This one earns its
-  // place on the bar only when there is something to act on.
+test('a COOL rover still shows its CPU reading', () => {
+  // This asserted the opposite until the operator pointed out they could not see any CPU
+  // telemetry. The original rendered only during a fault, which meant the field could never
+  // be sanity-checked before one — and rover1 sat at 84 C for an unknown length of time with
+  // every other indicator on this bar reading healthy. A reading you cannot see beforehand is
+  // not much better than no reading.
   const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
-                 host: { cpu: { tempC: 55.5 }, throttled: { active: false, now: [], sinceBoot: [] } } },
+                 host: { cpu: { tempC: 55.5, busyPct: 12 },
+                         throttled: { active: false, now: [], sinceBoot: [] } } },
   });
-  assert.doesNotMatch(out, /CPU/, `a 55.5 C rover must not clutter the bar: ${out}`);
+  assert.match(out, /CPU/);
+  assert.match(out, /55\.5°C/);
+  assert.match(out, /12%/, 'CPU busy percent must be shown, not just temperature');
 });
 
 test('an ACTIVE throttle is shown and NAMES what is being limited', () => {
   // rover1's real state on 2026-08-14. "THROTTLED" alone would send an operator looking for
   // a heat problem when the firmware may be reporting under-voltage instead.
   const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: 84.2 },
                          throttled: { active: true, now: ['soft temperature limit'],
@@ -383,29 +392,36 @@ test('an ACTIVE throttle is shown and NAMES what is being limited', () => {
   assert.match(out, /soft temperature limit/);
 });
 
-test('hot-but-not-yet-throttled is shown as a warning', () => {
-  const out = renderStatusBarWith({
+test('temperature colour escalates before the limit is reached', () => {
+  const at = (t) => renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
-                 host: { cpu: { tempC: 78.0 }, throttled: { active: false, now: [], sinceBoot: [] } } },
-  });
-  assert.match(out, /78\.0°C/, 'a rover heading for the limit should say so before it gets there');
+                 host: { cpu: { tempC: t, busyPct: 5 },
+                         throttled: { active: false, now: [], sinceBoot: [] } } } });
+  assert.match(at(55), /#9f9/,  'cool renders green');
+  assert.match(at(68), /#fc6/,  'warm renders amber before anything is throttled');
+  assert.match(at(78), /#f66/,  'hot renders red');
+  assert.match(at(78), /78\.0°C/);
 });
 
-test('LATCHED history alone does not raise the live indicator', () => {
+test('LATCHED history is not coloured as a live fault', () => {
   // 0xf0000 means "this box has throttled at some point since boot". Real, worth recording,
-  // but not happening now — and colouring it as a present fault trains operators to ignore it.
+  // but not happening now — colouring it as a present fault trains operators to ignore it.
   const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
-                 host: { cpu: { tempC: 60.0 },
+                 host: { cpu: { tempC: 60.0, busyPct: 4 },
                          throttled: { active: false, now: [], sinceBoot: ['throttled'] } } },
   });
-  assert.doesNotMatch(out, /CPU/, `latched history is not a live condition: ${out}`);
+  assert.match(out, /CPU/, 'the reading is still shown');
+  assert.doesNotMatch(out, /#f66/, 'but not in the live-fault colour');
 });
 
 test('an unknown temperature is not rendered as cool', () => {
   // null means picar could not read the sensor. If the firmware still reports an active
   // limit, that must surface even without a number to attach to it.
   const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: null },
                          throttled: { active: true, now: ['throttled'], sinceBoot: [] } } },
@@ -427,6 +443,7 @@ test('an INACTIVE unit is the loudest thing on the bar', () => {
   // The reviewer's finding: formatHost ignored `services` entirely, so a dead mavproxy —
   // no link to the flight controller at all — rendered exactly like a healthy rover.
   const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: 50 }, throttled: { active: false, now: [], sinceBoot: [] },
                          services: { picar: 'active', mavproxy: 'failed', mediamtx: 'active' } } },
@@ -438,6 +455,7 @@ test('an INACTIVE unit is the loudest thing on the bar', () => {
 
 test('all-active services add nothing to the bar', () => {
   const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: 50 }, throttled: { active: false, now: [], sinceBoot: [] },
                          services: { picar: 'active', mavproxy: 'active', mediamtx: 'active' } } },
@@ -448,10 +466,45 @@ test('all-active services add nothing to the bar', () => {
 test('a sampler that cannot read its sources says so', () => {
   // Silence would assert "cool and all services up" — the one claim it cannot make.
   const out = renderStatusBarWith({
+    uiCfg: { showCpu: true },
     telemetry: { linkUp: true, autopilotHeartbeat: true,
                  host: { cpu: { tempC: null }, throttled: null,
                          errors: { tempC: 'ENOENT', throttled: 'vcgencmd: not found' } } },
   });
   assert.match(out, /HEALTH\?/);
   assert.match(out, /tempC/);
+});
+
+test('switching the CPU field OFF still surfaces an ACTIVE throttle', () => {
+  // An operator may hide a number. They must not be able to hide the condition the number
+  // exists to reveal — the same rule the FC link indicator follows.
+  const out = renderStatusBarWith({
+    uiCfg: { showCpu: false },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 84.2, busyPct: 3 },
+                         throttled: { active: true, now: ['soft temperature limit'], sinceBoot: [] } } },
+  });
+  assert.match(out, /soft temperature limit/);
+});
+
+test('switching it OFF still surfaces a dead service', () => {
+  const out = renderStatusBarWith({
+    uiCfg: { showCpu: false },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 50, busyPct: 2 },
+                         throttled: { active: false, now: [], sinceBoot: [] },
+                         services: { picar: 'active', mavproxy: 'failed', mediamtx: 'active' } } },
+  });
+  assert.match(out, /mavproxy:failed/);
+});
+
+test('switching it OFF hides the routine reading on a healthy rover', () => {
+  const out = renderStatusBarWith({
+    uiCfg: { showCpu: false },
+    telemetry: { linkUp: true, autopilotHeartbeat: true,
+                 host: { cpu: { tempC: 55, busyPct: 5 },
+                         throttled: { active: false, now: [], sinceBoot: [] },
+                         services: { picar: 'active', mavproxy: 'active', mediamtx: 'active' } } },
+  });
+  assert.doesNotMatch(out, /CPU/, 'the toggle must actually do something');
 });
