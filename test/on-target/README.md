@@ -51,6 +51,26 @@ ssh saltenna@rover3 'cd /opt/picar && sudo test/on-target/video-drop.sh'
 | --- | --- |
 | `video-drop.sh` | The frame-drop path actually sheds frames on real hardware, keyframes survive a delta-level backlog, and the parse buffers stay bounded |
 | `codec-benchmark.sh` | What a video codec actually COSTS this rover, measured, so hardwareH264 and softwareH264 are compared on identical settings instead of by impression |
+| `fleet-audit.sh` | The observable state of one rover — code, services, firmware identity, video pipeline, thermals, storage, network, key permissions — in a fixed order, so rovers can be compared on identical evidence |
+
+## fleet-audit.sh
+
+**Read-only and changes nothing.** No arm, no servo, no `PARAM_SET`, no service restart, no
+write outside `/tmp`. Safe to run on a rover with a live pack while an operator is driving.
+
+It exists because the fleet is **not homogeneous** — CM4 versus CM5, hardware versus software
+H.264, whatever firmware a board was last flashed with — and comparing rovers using
+differently-typed ad-hoc commands is how "rover1 is worse than rover3" went four days without
+a cause. Identical checks, same order, every rover.
+
+It prints observations, never a verdict about what a vehicle can or cannot do. An implausible
+battery voltage is reported as implausible with the reason both readings look the same from
+the wire, rather than being turned into "no pack fitted".
+
+    ssh <rover> 'bash /tmp/fleet-audit.sh'
+
+**It is not a validation pass** and must not be recorded as one: it runs no regression script
+and commands no motion.
 
 ## codec-benchmark.sh
 
