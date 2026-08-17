@@ -307,7 +307,11 @@ test('an ON-DEMAND idle camera is NOT mistaken for a dead one', async () => {
   const server = apiSeq([{ name: 'cam', ready: false, readers: [], bytesReceived: 100 }]);
   await new Promise((r) => server.listen(port, '127.0.0.1', r));
   const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
-                       webrtc_source_stall_polls: 2 });
+                       webrtc_source_stall_polls: 2,
+                       // MUST be declared on-demand. Without this the test pinned the
+                       // opposite defect: a failed always-on camera reported healthy.
+                       webrtc_camera_on_demand: true,
+                       _restartFn: () => {} });
   try {
     await new Promise((r) => setTimeout(r, 3600));
     const h = s.sourceHealth();
@@ -383,4 +387,67 @@ test('nonsense recovery settings cannot defeat BOTH guards', () => {
         `maxRecoveries became ${h.maxRecoveries} for ${JSON.stringify(bad)}`);
     } finally { s.stop(); }
   }
+});
+
+test('an ALWAYS-ON camera that never becomes ready is a FAULT, not idleness', async () => {
+  // The shipped configuration is always-on, so `ready:false` means the camera failed to start
+  // or disappeared — no viewer can get video. Clearing the fault there reported a broken rover
+  // as healthy: dead:false, readersError:null, no recovery attempted. Same "reports healthy
+  // while broken" shape this branch exists to remove, reproduced inside it.
+  const port = nextPort++;
+  const server = apiSeq([{ name: 'cam', ready: false, readers: [], bytesReceived: 0 }]);
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  const restarts = [];
+  const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
+                       webrtc_source_stall_polls: 2,          // always-on: no on-demand flag
+                       _restartFn: () => restarts.push(1) });
+  try {
+    await new Promise((r) => setTimeout(r, 4600));
+    const h = s.sourceHealth();
+    assert.equal(h.dead, true,
+      `an always-on camera stuck not-ready must be a fault: ${JSON.stringify(h)}`);
+    assert.ok(restarts.length >= 1, 'and recovery must be attempted');
+  } finally { s.stop(); await new Promise((r) => server.close(r)); }
+});
+
+test('a malformed poll interval cannot become a 1 ms actuator', () => {
+  // Math.max(1000, "invalid") is NaN, and Node schedules a NaN interval at 1 ms: an HTTP GET
+  // every millisecond on the event loop carrying the override stream and the watchdog, AND a
+  // stall detector that counts samples rather than elapsed time would declare a healthy
+  // encoder dead and restart MediaMTX. One malformed overlay key, two failures.
+  for (const bad of ['invalid', {}, [], NaN, Infinity, null, -1, 0]) {
+    const s = mkStream({ mediamtx_api_port: nextPort++, webrtc_reader_poll_ms: bad,
+                         _restartFn: () => {} });
+    try {
+      const ms = s.pollIntervalMs();
+      assert.ok(Number.isFinite(ms) && ms >= 1000 && ms <= 60000,
+        `poll interval became ${ms} for ${JSON.stringify(bad)}`);
+    } finally { s.stop(); }
+  }
+});
+
+test('a successfully recovered incident does not consume the budget forever', async () => {
+  // The cap bounds ONE restart loop. Spending it across a process lifetime meant three
+  // separate, successfully-recovered stalls disabled recovery permanently, so a later
+  // recoverable stall stayed black until someone intervened.
+  const port = nextPort++;
+  const seq = [READY(100), READY(100), READY(100), READY(100)]
+    .concat(Array.from({ length: 14 }, (_, k) => READY(200 + k * 100)));
+  let i = 0;
+  const server = http.createServer((rq, rs) => {
+    rs.writeHead(200, { 'Content-Type': 'application/json' });
+    rs.end(JSON.stringify(seq[Math.min(i++, seq.length - 1)]));
+  });
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
+                       webrtc_source_stall_polls: 2, webrtc_healthy_polls_to_reset: 3,
+                       _restartFn: () => {} });
+  try {
+    await new Promise((r) => setTimeout(r, 3600));
+    assert.ok(s.sourceHealth().recoveries >= 1, 'precondition: an incident was recovered');
+    await new Promise((r) => setTimeout(r, 6000));
+    const h = s.sourceHealth();
+    assert.equal(h.recoveries, 0, 'a sustained healthy run must free the budget for next time');
+    assert.ok(h.totalRecoveries >= 1, 'while the lifetime figure is kept for observability');
+  } finally { s.stop(); await new Promise((r) => server.close(r)); }
 });

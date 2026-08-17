@@ -278,7 +278,16 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
 
   const API_HOST = '127.0.0.1';
   const API_PORT = config.mediamtx_api_port || 9997;
-  const READER_POLL_MS      = Math.max(1000, config.webrtc_reader_poll_ms ?? 3000);
+  // Finite-integer clamp, not Math.max. `Math.max(1000, "invalid")` is NaN, and Node schedules
+  // a NaN interval at 1 ms — an HTTP GET every millisecond on the event loop that carries the
+  // 20 Hz override stream and the input watchdog (invariant 9). It also breaks the stall
+  // detector below, which counts equal samples rather than elapsed time: at 1 ms, many polls
+  // land between two 20 fps frames, so a HEALTHY encoder is declared dead and MediaMTX is
+  // restarted. One malformed key in the untracked overlay, two failures. Found by review.
+  const READER_POLL_MS = (() => {
+    const n = Number(config.webrtc_reader_poll_ms);
+    return Number.isFinite(n) ? Math.min(60000, Math.max(1000, Math.round(n))) : 3000;
+  })();
   const READER_TIMEOUT_MS   = 1500;
 
   function pollReaders() {
@@ -336,9 +345,16 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
   // when nobody is watching, and bytesReceived correctly does not advance then — but the path
   // reports ready:false, so an idle rover is never mistaken for a broken one.
   let lastBytes      = null;
-  let stalledPolls   = 0;
-  let sourceDead     = false;
-  let recoveryCount  = 0;
+  let stalledPolls     = 0;
+  let notReadyPolls    = 0;
+  let healthyPolls     = 0;
+  let sourceDead       = false;
+  let recoveryCount    = 0;     // per-incident, reset after a sustained healthy run
+  let totalRecoveries  = 0;     // lifetime, for observability only
+  // Whether the camera is genuinely on-demand. Must match what generateMediaMTXConfig wrote,
+  // or `ready:false` is misinterpreted in one direction or the other.
+  const onDemandEnabled = config.webrtc_camera_on_demand === true
+                          && config.webrtc_keep_camera_warm !== true;
   // CLAMPED AS FINITE INTEGERS, not just Math.max'd. `Math.max(2, "invalid")` is NaN, and NaN
   // defeats BOTH guards at once in the unsafe direction: `stalledPolls < NaN` is false, so a
   // perfectly healthy path is declared dead on the first poll, and `recoveryCount >= NaN` is
@@ -352,16 +368,34 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
   };
   const STALL_POLLS_TO_DECLARE_DEAD = clampInt(config.webrtc_source_stall_polls, 4, 2, 100);
   const MAX_RECOVERIES              = clampInt(config.webrtc_max_source_recoveries, 3, 0, 20);
+  const HEALTHY_POLLS_TO_RESET      = clampInt(config.webrtc_healthy_polls_to_reset, 10, 3, 1000);
 
   function noteSourceProgress(parsed) {
     const bytes = Number(parsed && parsed.bytesReceived);
     // Not ready = the camera is deliberately stopped (on-demand) or still starting. Neither
     // is a fault, and both must reset the counter or an idle rover would eventually be
     // declared dead and restarted in a loop.
-    if (parsed.ready !== true || !Number.isFinite(bytes)) {
-      lastBytes = null; stalledPolls = 0; sourceDead = false;
+    if (!Number.isFinite(bytes)) { lastBytes = null; stalledPolls = 0; return; }
+    if (parsed.ready !== true) {
+      // `ready:false` is benign ONLY when the camera is deliberately stopped — that is,
+      // on-demand is enabled and nobody is watching. With the shipped always-on config it
+      // means the camera FAILED TO START or disappeared, and clearing the fault there
+      // reported a rover with no video as healthy: `/status` showed `dead:false`,
+      // `readersError:null`, and no recovery was attempted. Found by review, and it is the
+      // same "reports healthy while broken" shape this whole branch exists to remove.
+      lastBytes = null; stalledPolls = 0;
+      if (onDemandEnabled) { sourceDead = false; return; }
+      notReadyPolls += 1;
+      if (notReadyPolls >= STALL_POLLS_TO_DECLARE_DEAD && !sourceDead) {
+        sourceDead = true;
+        console.error(
+          'WebRTC: the camera path is NOT READY on an always-on configuration — the camera ' +
+          'failed to start or has disappeared. No viewer can get video.');
+        maybeRecover();
+      }
       return;
     }
+    notReadyPolls = 0;
     // Three cases, kept distinct on purpose. Folding the first into the third is the bug the
     // first draft of this fix had: a recovery resets lastBytes to null, so the very next poll
     // looked like "forward progress" and cleared the fault it had just raised.
@@ -380,6 +414,17 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
         sourceDead = false;
       }
       stalledPolls = 0;
+      // A SUSTAINED healthy run resets the per-incident attempt budget. The cap exists to
+      // bound ONE restart loop, not to be spent across a process lifetime: three separate
+      // stalls, each successfully recovered, previously disabled automatic recovery for good,
+      // so a later recoverable stall stayed black until someone intervened. `totalRecoveries`
+      // keeps the lifetime figure for observability. Found by review.
+      healthyPolls += 1;
+      if (healthyPolls >= HEALTHY_POLLS_TO_RESET && recoveryCount > 0) {
+        console.log(`WebRTC: camera source healthy for ${healthyPolls} polls — ` +
+                    'resetting the recovery budget for any future incident.');
+        recoveryCount = 0;
+      }
     }
     lastBytes = bytes;
 
@@ -415,6 +460,8 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
       return;   // already reported below on the transition; stay quiet rather than spam
     }
     recoveryCount += 1;
+    totalRecoveries += 1;
+    healthyPolls = 0;
     console.error(
       `WebRTC: restarting mediamtx to recover the dead camera source ` +
       `(attempt ${recoveryCount}/${MAX_RECOVERIES}). A restart drops any active WebRTC ` +
@@ -441,11 +488,14 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     // Why the count is null, for an operator who needs to tell "nobody watching" from
     // "picar cannot see MediaMTX".
     clientCountError() { return readerPollErr; },
+    // Exposed so the clamp is assertable — a bound nothing can observe is one nothing tests.
+    pollIntervalMs() { return READER_POLL_MS; },
     // Whether the camera path is advertising itself as ready while producing nothing, and
     // how many automatic recoveries have been spent. Surfaced so a rover that has exhausted
     // its attempts is visible rather than quietly broken.
     sourceHealth() {
-      return { dead: sourceDead, stalledPolls, recoveries: recoveryCount, maxRecoveries: MAX_RECOVERIES };
+      return { dead: sourceDead, stalledPolls, notReadyPolls,
+               recoveries: recoveryCount, totalRecoveries, maxRecoveries: MAX_RECOVERIES };
     },
     stop() {
       clearInterval(readerTimer);
