@@ -16,7 +16,8 @@ const assert = require('node:assert/strict');
 
 const {
   createHostHealth,
-  parseThrottled, parseProcStat, cpuBusyPct, parseTempMilli, parseUnitStates, parseKhz,
+  parseThrottled, parseProcStat, cpuBusyPct, parseTempMilli, parseKhz,
+  parseUnitShow, unitHealth,
 } = require('../host-health.js');
 
 // ── parseThrottled ───────────────────────────────────────────────────────────
@@ -110,22 +111,69 @@ test('an implausible temperature is refused rather than reported', () => {
 
 // ── Unit states ──────────────────────────────────────────────────────────────
 
-test('one systemctl call maps to the units IN ORDER', () => {
-  const s = parseUnitStates('active\nactive\nfailed\n', ['picar', 'mavproxy', 'mediamtx']);
-  assert.deepEqual(s, { picar: 'active', mavproxy: 'active', mediamtx: 'failed' });
+const SHOW = (units) => units.map((u) =>
+  `Result=${u.result || 'success'}\nNRestarts=${u.restarts ?? 0}\nId=${u.id}.service\n` +
+  `ActiveState=${u.state}\nSubState=${u.sub}`).join('\n\n');
+
+test('units are keyed by Id, not by position', () => {
+  // The previous parser zipped output lines against the requested list, so short or reordered
+  // output silently attributed one unit's state to another — a wrong answer that looks right.
+  const out = parseUnitShow(SHOW([
+    { id: 'mediamtx', state: 'active',   sub: 'running' },
+    { id: 'picar',    state: 'inactive', sub: 'dead' },
+  ]));
+  assert.equal(out.picar.state, 'inactive');
+  assert.equal(out.mediamtx.state, 'active');
 });
 
-test('a missing line leaves that unit null rather than shifting the others', () => {
-  // If output were shorter than the unit list, a naive zip would report mediamtx's state for
-  // mavproxy — a wrong answer that looks right.
-  const s = parseUnitStates('active\n', ['picar', 'mavproxy', 'mediamtx']);
-  assert.equal(s.picar, 'active');
-  assert.equal(s.mavproxy, null);
-  assert.equal(s.mediamtx, null);
+test('restart counts and last result are captured', () => {
+  const out = parseUnitShow(SHOW([
+    { id: 'mavproxy', state: 'active', sub: 'running', restarts: 5, result: 'exit-code' },
+  ]));
+  assert.equal(out.mavproxy.restarts, 5);
+  assert.equal(out.mavproxy.result, 'exit-code');
 });
 
-test('empty output is null, not three units reported as fine', () => {
-  assert.equal(parseUnitStates('', ['picar']), null);
+test('empty output is null, not units reported as fine', () => {
+  assert.equal(parseUnitShow(''), null);
+  assert.equal(parseUnitShow(null), null);
+});
+
+// ── active is not the same as working ────────────────────────────────────────
+
+test('a plain active/running unit is healthy', () => {
+  const h = unitHealth({ state: 'active', sub: 'running', result: 'success', restarts: 0 }, 0);
+  assert.equal(h.ok, true);
+  assert.equal(h.why, null);
+});
+
+test('a CRASH-LOOPING unit is not healthy even though it is active', () => {
+  // The case that motivated this. systemd reports `active` for a unit it is restarting every
+  // few seconds, so `is-active` shows green while the service is failing continuously.
+  const h = unitHealth({ state: 'active', sub: 'auto-restart', result: 'exit-code', restarts: 9 }, 9);
+  assert.equal(h.ok, false);
+  assert.equal(h.why, 'restart-looping');
+});
+
+test('a unit whose restart count is CLIMBING is failing right now', () => {
+  // A non-zero count means it restarted at some point; an INCREASING count means it is
+  // failing now. Only comparing against the previous poll can tell those apart.
+  const u = { state: 'active', sub: 'running', result: 'success', restarts: 4 };
+  assert.equal(unitHealth(u, 3).ok, false, 'count went 3 -> 4 between polls');
+  assert.equal(unitHealth(u, 3).why, 'restarting');
+  assert.equal(unitHealth(u, 4).ok, true, 'a stable non-zero count is history, not a fault');
+});
+
+test('a bad last exit is reported even after systemd brings it back', () => {
+  const h = unitHealth({ state: 'active', sub: 'running', result: 'exit-code', restarts: 2 }, 2);
+  assert.equal(h.ok, false);
+  assert.match(h.why, /last-exit:exit-code/);
+});
+
+test('an inactive or failed unit reports its state as the reason', () => {
+  assert.deepEqual(unitHealth({ state: 'failed', sub: 'failed' }, 0), { ok: false, why: 'failed' });
+  assert.deepEqual(unitHealth({ state: 'inactive', sub: 'dead' }, 0), { ok: false, why: 'inactive' });
+  assert.equal(unitHealth(null, 0).ok, false);
 });
 
 test('kHz sysfs values convert to MHz', () => {
@@ -156,7 +204,10 @@ const settle = () => new Promise((r) => setTimeout(r, 60));
 test('a snapshot reports rover1 as it actually was', async () => {
   const h = createHostHealth({
     readFile: fakeFs(ROVER1_FILES),
-    run: (cmd) => Promise.resolve(cmd === 'vcgencmd' ? 'throttled=0xf0008' : 'active\nactive\nactive\n'),
+    run: (cmd) => Promise.resolve(cmd === 'vcgencmd' ? 'throttled=0xf0008'
+      : SHOW([{ id: 'picar', state: 'active', sub: 'running' },
+              { id: 'mavproxy', state: 'active', sub: 'running' },
+              { id: 'mediamtx', state: 'active', sub: 'running' }])),
   });
   try {
     await settle();
@@ -166,7 +217,9 @@ test('a snapshot reports rover1 as it actually was', async () => {
     assert.equal(s.cpu.maxFreqMhz, 2400);
     assert.equal(s.cpu.governor, 'performance');
     assert.equal(s.throttled.active, true);
-    assert.deepEqual(s.services, { picar: 'active', mavproxy: 'active', mediamtx: 'active' });
+    assert.equal(s.services.picar.ok, true);
+    assert.equal(s.services.mavproxy.state, 'active');
+    assert.equal(s.services.mediamtx.ok, true);
   } finally { h.stop(); }
 });
 
@@ -194,14 +247,18 @@ test('systemctl exiting non-zero still yields the unit states', async () => {
     run: (cmd) => {
       if (cmd === 'vcgencmd') return Promise.resolve('throttled=0x0');
       const e = new Error('Command failed');
-      e.stdout = 'active\ninactive\nactive\n';
+      e.stdout = SHOW([{ id: 'picar', state: 'active', sub: 'running' },
+                       { id: 'mavproxy', state: 'inactive', sub: 'dead' },
+                       { id: 'mediamtx', state: 'active', sub: 'running' }]);
       return Promise.reject(e);
     },
   });
   try {
     await settle();
     const s = h.snapshot();
-    assert.deepEqual(s.services, { picar: 'active', mavproxy: 'inactive', mediamtx: 'active' });
+    assert.equal(s.services.picar.ok, true);
+    assert.equal(s.services.mavproxy.ok, false, 'an inactive unit is not ok');
+    assert.equal(s.services.mavproxy.why, 'inactive');
   } finally { h.stop(); }
 });
 

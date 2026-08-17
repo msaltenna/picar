@@ -143,16 +143,57 @@ function parseTempMilli(text) {
   return Math.round(c * 10) / 10;
 }
 
-// `systemctl is-active a b c` prints one state per line, in the order asked. It exits
-// non-zero when ANY unit is inactive, so the exit status must be ignored and the output
-// parsed — treating non-zero as failure would report every unit as unknown whenever one
-// of them was legitimately stopped.
-function parseUnitStates(text, units = WATCHED_UNITS) {
-  const lines = String(text || '').split('\n').map((l) => l.trim()).filter(Boolean);
-  if (lines.length === 0) return null;
+// `systemctl show a b c -p Id,ActiveState,SubState,NRestarts,Result` prints one blank-line
+// separated block per unit. Keyed by the `Id` field rather than by POSITION — the previous
+// version zipped output lines against the requested unit list, so any short or reordered
+// output silently attributed one unit's state to another, which is a wrong answer that looks
+// right.
+//
+// WHY NOT `is-active`: it answers "active" for a unit that is crash-looping. A service
+// restarted every few seconds by systemd is `active`/`running` almost all the time, and an
+// operator watching a green indicator would have no idea. That distinction — active versus
+// actually working — is the whole point of this parser.
+function parseUnitShow(text) {
+  const blocks = String(text || '').split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
+  if (blocks.length === 0) return null;
   const out = {};
-  units.forEach((u, i) => { out[u] = lines[i] || null; });
-  return out;
+  for (const block of blocks) {
+    const kv = {};
+    for (const line of block.split('\n')) {
+      const i = line.indexOf('=');
+      if (i > 0) kv[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    }
+    const id = (kv.Id || '').replace(/\.service$/, '');
+    if (!id) continue;
+    const restarts = Number(kv.NRestarts);
+    out[id] = {
+      state:    kv.ActiveState || null,
+      sub:      kv.SubState || null,
+      result:   kv.Result || null,
+      restarts: Number.isFinite(restarts) ? restarts : null,
+    };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// Is this unit actually working, and if not, why?
+//
+// `active` alone is not enough and that is the reason this exists. A unit in `auto-restart`
+// is mid-crash-loop; a unit whose last Result was not `success` exited badly even if systemd
+// has since brought it back; and a unit whose restart count is CLIMBING is failing right now
+// however green `ActiveState` looks. `prevRestarts` is the same unit's count at the previous
+// poll — the only way to tell "restarted twice last week" from "restarting continuously".
+function unitHealth(u, prevRestarts) {
+  if (!u) return { ok: false, why: 'unknown' };
+  if (u.state !== 'active') return { ok: false, why: u.state || 'unknown' };
+  if (u.sub === 'auto-restart') return { ok: false, why: 'restart-looping' };
+  if (typeof prevRestarts === 'number' && typeof u.restarts === 'number'
+      && u.restarts > prevRestarts) {
+    return { ok: false, why: 'restarting' };
+  }
+  if (u.result && u.result !== 'success') return { ok: false, why: `last-exit:${u.result}` };
+  if (u.sub && u.sub !== 'running') return { ok: false, why: u.sub };
+  return { ok: true, why: null };
 }
 
 function parseKhz(text) {
@@ -200,6 +241,9 @@ function createHostHealth({
   let throttled = null;
   let services  = null;
   let lastStat  = null;
+  // Per-unit restart counts from the PREVIOUS poll. A count that is merely non-zero means the
+  // unit restarted at some point; a count that INCREASED between polls means it is failing now.
+  const prevRestarts = {};
   let errors    = {};
   let stopped   = false;
 
@@ -243,16 +287,24 @@ function createHostHealth({
       else clear('throttled');
     } catch (e) { throttled = null; note('throttled', e); }
 
-    try {
-      services = parseUnitStates(await run('systemctl', ['is-active', ...units]), units);
-      if (services === null) note('services', new Error('no output'));
-      else clear('services');
-    } catch (e) {
-      // systemctl exits non-zero when any unit is inactive, so a rejection carrying output
-      // is still a usable answer. Only a rejection with nothing to parse is an error.
-      const out = e && e.stdout;
-      services = out ? parseUnitStates(out, units) : null;
-      if (services === null) note('services', e); else clear('services');
+    const SHOW = ['show', ...units, '-p', 'Id,ActiveState,SubState,NRestarts,Result'];
+    let raw = null;
+    try { raw = await run('systemctl', SHOW); }
+    catch (e) { raw = e && e.stdout; if (!raw) note('services', e); }
+    const parsed = raw ? parseUnitShow(raw) : null;
+    if (parsed === null) { services = null; if (raw) note('services', new Error('unparseable')); }
+    else {
+      const next = {};
+      for (const u of units) {
+        const cur = parsed[u] || null;
+        const h = unitHealth(cur, prevRestarts[u]);
+        next[u] = cur
+          ? { state: cur.state, sub: cur.sub, restarts: cur.restarts, ok: h.ok, why: h.why }
+          : { state: null, sub: null, restarts: null, ok: false, why: 'not reported' };
+        if (cur && typeof cur.restarts === 'number') prevRestarts[u] = cur.restarts;
+      }
+      services = next;
+      clear('services');
     }
   }
 
@@ -354,7 +406,7 @@ function createHostHealth({
 }
 
 module.exports = {
-  createHostHealth, expectedUnits,
-  parseThrottled, parseProcStat, cpuBusyPct, parseTempMilli, parseUnitStates, parseKhz,
+  createHostHealth, expectedUnits, parseUnitShow, unitHealth,
+  parseThrottled, parseProcStat, cpuBusyPct, parseTempMilli, parseKhz,
   THERMAL_ZONE, PROC_STAT, CPUFREQ_DIR, WATCHED_UNITS,
 };

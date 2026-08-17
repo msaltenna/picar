@@ -716,13 +716,30 @@
       const h = telemetry && telemetry.host;
       if (!h) return '';
       const parts = [];
+      // PERMANENT, every unit, every frame. Showing only what is broken means the line is
+      // absent exactly when an operator wants to confirm things are fine — and it cannot be
+      // sanity-checked before a fault, which is the same mistake the CPU reading made.
+      //
+      // `ok` is NOT `state === 'active'`. systemd reports a crash-looping unit as active, so a
+      // service restarting every few seconds would render green. See unitHealth() in
+      // host-health.js: sub-state, last exit result and a CLIMBING restart count all count
+      // against it.
       const svc = h.services;
       if (svc) {
-        const down = Object.keys(svc).filter((k) => svc[k] !== 'active');
-        if (down.length) {
-          parts.push('<span style="color:#f66">SVC ' +
-            down.map((k) => k + ':' + (svc[k] || '?')).join(' ') + '</span>');
-        }
+        const bits = Object.keys(svc).map((k) => {
+          const u = svc[k] || {};
+          // Full unit names, not abbreviations. This is a safety indicator read under
+          // pressure; saving six characters is not worth an operator hesitating over whether
+          // "mav" means mavproxy.
+          if (u.ok) return '<span style="color:#9f9">' + k + '\u2713</span>';
+          // Say WHAT is wrong, not just that something is. "mav:restart-looping" and
+          // "mav:inactive" call for completely different responses.
+          return '<span style="color:#f66">' + k + ':' + (u.why || '?') + '</span>';
+        });
+        parts.push('SVC ' + bits.join(' '));
+      } else {
+        // null means picar could not determine it — not that the services are fine.
+        parts.push('<span style="color:#fc6">SVC --</span>');
       }
       const c = h.cpu || {};
       const t = c.tempC, busy = c.busyPct;
@@ -753,10 +770,10 @@
       const parts = [];
       const svc = h.services;
       if (svc) {
-        const down = Object.keys(svc).filter((k) => svc[k] !== 'active');
+        const down = Object.keys(svc).filter((k) => !(svc[k] || {}).ok);
         if (down.length) {
           parts.push('<span style="color:#f66">SVC ' +
-            down.map((k) => k + ':' + (svc[k] || '?')).join(' ') + '</span>');
+            down.map((k) => k + ':' + ((svc[k] || {}).why || '?')).join(' ') + '</span>');
         }
       }
       const thr = h.throttled;
