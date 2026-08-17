@@ -6,6 +6,7 @@
 'use strict';
 
 const fs   = require('fs');
+const os   = require('os');
 const http = require('http');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -478,7 +479,74 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     }
   }
 
+  // ── ICE candidates go stale when the host's addresses change ───────────────
+  //
+  // `webrtcIPsFromInterfaces: true` makes MediaMTX enumerate interfaces ONCE at startup to
+  // build its ICE host-candidate list. It never re-enumerates. So if the address set changes
+  // afterwards — a cable connected after boot, DHCP handing out a different lease, WiFi
+  // replaced by ethernet — MediaMTX keeps advertising candidates that no longer exist, every
+  // session is created and then closes as `terminated`, and video never establishes while the
+  // process stays perfectly healthy by every systemd measure. That is precisely how a
+  // mediamtx reported GREEN was failing continuously on rover3, 2026-08-17.
+  //
+  // The unit ordering fix (network-online.target) covers the boot case. Nothing in systemd
+  // covers a cable connected 14 minutes later, which is what rover3's timestamps showed. So
+  // the address set is watched here and mediamtx is restarted to re-enumerate.
+  // Injectable for tests — the same dependency-injection reasoning telemetry-loop.js gives
+  // for readWifi. A host test cannot change the machine's real interfaces.
+  const readInterfaces = config._networkInterfaces || (() => os.networkInterfaces());
+
+  function addressSet() {
+    const out = [];
+    const ifaces = readInterfaces();
+    for (const name of Object.keys(ifaces)) {
+      for (const a of ifaces[name] || []) {
+        // Loopback and link-local are never usable ICE host candidates for a peer, so a
+        // change in them must not trigger a restart.
+        if (a.internal) continue;
+        if (a.family !== 'IPv4' && a.family !== 4) continue;
+        if (/^169\.254\./.test(a.address)) continue;
+        out.push(`${name}:${a.address}`);
+      }
+    }
+    return out.sort().join(',');
+  }
+
+  let knownAddresses  = addressSet();
+  let addressRestarts = 0;
+  const MAX_ADDRESS_RESTARTS = 5;
+
+  function checkAddresses() {
+    if (stopped) return;
+    const now = addressSet();
+    if (now === knownAddresses) return;
+    const before = knownAddresses;
+    knownAddresses = now;
+    // An empty set is the network going away, not coming up. Restarting then would only make
+    // MediaMTX re-enumerate nothing; wait for addresses to appear instead.
+    if (!now) {
+      console.error('WebRTC: host addresses disappeared — not restarting mediamtx until the ' +
+                    'network returns.');
+      return;
+    }
+    if (addressRestarts >= MAX_ADDRESS_RESTARTS) {
+      console.error(`WebRTC: host addresses changed again (${before} -> ${now}) but the ` +
+        `restart budget is spent. MediaMTX's ICE candidates are STALE and sessions will fail ` +
+        `to establish. Restart it manually once the network has settled.`);
+      return;
+    }
+    addressRestarts += 1;
+    console.error(
+      `WebRTC: host addresses changed (${before || '<none>'} -> ${now}). MediaMTX gathers ICE ` +
+      `candidates once at startup, so its list is now stale and every session would close as ` +
+      `'terminated'. Restarting it to re-enumerate ` +
+      `(${addressRestarts}/${MAX_ADDRESS_RESTARTS}).`);
+    doRestart();
+  }
+
   const readerTimer = setInterval(pollReaders, READER_POLL_MS);
+  const addressTimer = setInterval(checkAddresses, READER_POLL_MS);
+  if (typeof addressTimer.unref === 'function') addressTimer.unref();
   if (typeof readerTimer.unref === 'function') readerTimer.unref();
   pollReaders();
 
@@ -495,10 +563,12 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
     // its attempts is visible rather than quietly broken.
     sourceHealth() {
       return { dead: sourceDead, stalledPolls, notReadyPolls,
+               addresses: knownAddresses || null, addressRestarts,
                recoveries: recoveryCount, totalRecoveries, maxRecoveries: MAX_RECOVERIES };
     },
     stop() {
       clearInterval(readerTimer);
+      clearInterval(addressTimer);
       // Latch shutdown BEFORE clearing state. Otherwise a setVideoParams arriving
       // during teardown — which any unauthenticated socket can send, including
       // while SIGINT is being handled — would see restarting still true, queue

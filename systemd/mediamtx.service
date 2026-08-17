@@ -1,6 +1,27 @@
 [Unit]
 Description=MediaMTX WebRTC video server
-After=network.target
+# network-online.target, NOT network.target — and this is a correctness fix, not tidying.
+#
+# network.target is reached long before any interface has an address. MediaMTX is configured
+# with webrtcIPsFromInterfaces: true, so it enumerates interfaces ONCE at startup to build its
+# ICE host-candidate list and never re-enumerates. Starting too early means it gathers no
+# usable candidate, and every WebRTC session afterwards is created and then closes as
+# `terminated` — video never establishes, while the process stays perfectly healthy by every
+# systemd measure.
+#
+# MEASURED ON ROVER3, 2026-08-17:
+#   21:05:06  [WebRTC] listener opened on :8889, :8189      <- candidates gathered here
+#   21:19:24  eth0 "Activation: successful, device activated"  <- 14m19s LATER
+#   22:03:46  operator restarts mediamtx -> video works
+#
+# That is the "mediamtx needs a restart on first boot" bug. NetworkManager-wait-online.service
+# is enabled on this fleet, so network-online.target is meaningful here.
+#
+# It does NOT cover a cable connected after boot — nothing in systemd can. picar watches for
+# an interface address change at runtime and restarts mediamtx so it re-enumerates; see
+# streams/webrtc.js.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/opt/picar/bin/mediamtx /opt/picar/mediamtx.yml
