@@ -173,3 +173,77 @@ test('stop() clears the poll timer so the process can exit', async () => {
   assert.ok(process._getActiveHandles().length <= before + 1,
     'stop() must not leave the reader poll interval running');
 });
+
+// ── On-demand encoding and encoder capability ────────────────────────────────
+
+test('the camera is on-demand, so an unwatched rover stops encoding', () => {
+  // Measured 2026-08-14: rover2 had produced 9.58 GB with ZERO readers because this was
+  // hardcoded false. rover1 pays 3.3x for the same waste — its CM5 has no hardware encoder.
+  const yml = webrtc.generateMediaMTXConfig({}, PARAMS());
+  assert.match(yml, /^\s*sourceOnDemand: true$/m);
+});
+
+test('the camera stays warm after the last viewer leaves', () => {
+  // The property that makes on-demand safe for teleop. Without a close-after window every
+  // page reload would wait for a camera start, mid-drive.
+  const yml = webrtc.generateMediaMTXConfig({}, PARAMS());
+  assert.match(yml, /sourceOnDemandCloseAfter: 60s/);
+  assert.match(yml, /sourceOnDemandStartTimeout: \d+s/);
+});
+
+test('the close-after window is clamped against the untracked overlay', () => {
+  // invariant 8. Zero would tear the camera down the instant the last viewer left, turning
+  // a reload into a restart; an enormous value would defeat the change entirely.
+  const at = (v) => /sourceOnDemandCloseAfter: (\d+)s/.exec(
+    webrtc.generateMediaMTXConfig({ webrtc_on_demand_close_after_s: v }, PARAMS()))[1];
+  assert.equal(at(0), '60',   'zero must not mean "close immediately"');
+  assert.equal(at(-5), '60');
+  assert.equal(at(1), '10',   'clamped up to the floor');
+  assert.equal(at(99999), '600', 'and down to the ceiling');
+  assert.equal(at(120), '120', 'a sane value is honoured');
+});
+
+test('always-on can be restored deliberately', () => {
+  const yml = webrtc.generateMediaMTXConfig({ webrtc_keep_camera_warm: true }, PARAMS());
+  assert.match(yml, /^\s*sourceOnDemand: false$/m);
+});
+
+test('a board WITHOUT the hardware encoder gets softwareH264 automatically', () => {
+  // rover1. Emitting hardwareH264 on a CM5 yields no video at all, so this must follow the
+  // hardware rather than a config file that a board swap would silently invalidate.
+  const yml = webrtc.generateMediaMTXConfig({ _hasHardwareEncoder: false }, PARAMS());
+  assert.match(yml, /rpiCameraCodec: softwareH264/);
+});
+
+test('a board WITH the hardware encoder gets hardwareH264 automatically', () => {
+  const yml = webrtc.generateMediaMTXConfig({ _hasHardwareEncoder: true }, PARAMS());
+  assert.match(yml, /rpiCameraCodec: hardwareH264/);
+});
+
+test('an explicit codec still overrides detection', () => {
+  // An operator overriding a detection must be able to — for a bisect, or a board whose
+  // encoder node exists but is broken.
+  const yml = webrtc.generateMediaMTXConfig(
+    { _hasHardwareEncoder: true, webrtc_codec: 'softwareH264' }, PARAMS());
+  assert.match(yml, /rpiCameraCodec: softwareH264/);
+});
+
+test('hardware-only encoder options are NOT emitted for a software encoder', () => {
+  // They are ignored by MediaMTX, so nothing breaks — but a generated config describing an
+  // encoder configuration the encoder is not using misleads whoever tunes it next.
+  const sw = webrtc.generateMediaMTXConfig({ _hasHardwareEncoder: false }, PARAMS());
+  assert.doesNotMatch(sw, /rpiCameraHardwareH264Profile/);
+  assert.doesNotMatch(sw, /rpiCameraHardwareH264Level/);
+  const hw = webrtc.generateMediaMTXConfig({ _hasHardwareEncoder: true }, PARAMS());
+  assert.match(hw, /rpiCameraHardwareH264Profile: baseline/);
+  assert.match(hw, /rpiCameraHardwareH264Level: '4\.1'/);
+});
+
+test('the config still renders whole with the hardware block omitted', () => {
+  // The hardware lines are injected as a pre-joined string. A missing newline there would
+  // glue two YAML keys together, and the software path is the one that omits them.
+  const sw = webrtc.generateMediaMTXConfig({ _hasHardwareEncoder: false }, PARAMS());
+  assert.match(sw, /^\s*rpiCameraBitrate: 350000$/m);
+  assert.match(sw, /^\s*rpiCameraDenoise: cdn_fast$/m);
+  assert.doesNotMatch(sw, /\$\{/, 'an unsubstituted placeholder means the literal broke');
+});
