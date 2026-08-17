@@ -89,14 +89,26 @@ function parseWirelessProc(text) {
   if (!line) return null;
   const [iface, rest] = line.split(':');
   const cols = rest.trim().split(/\s+/);
-  // status, link quality, signal level (dBm), noise level
+  // status, link quality, signal level (dBm), noise level (dBm)
   const quality = parseFloat(cols[1]);
   const signal  = parseFloat(cols[2]);
+  // The NOISE column was listed in this comment and then never read, so signal-to-noise was
+  // uncomputable from a WiFi rover even though the kernel had already measured it. Both are
+  // dBm, so their difference is genuinely dB — unlike the SiK radio below, whose units are
+  // not dBm and whose difference must not be labelled dB.
+  const noise = parseFloat(cols[3]);
+  const sig   = Number.isFinite(signal) ? signal : null;
+  const noi   = Number.isFinite(noise) ? noise : null;
   return {
     iface: iface.trim(),
     // Quality is reported out of 70 by most drivers.
     qualityPct: Number.isFinite(quality) ? Math.round((quality / 70) * 100) : null,
-    signalDbm:  Number.isFinite(signal) ? signal : null,
+    signalDbm:  sig,
+    noiseDbm:   noi,
+    // Only when BOTH are real. Some drivers hardwire noise to a constant -256 sentinel, which
+    // would otherwise produce a confident and meaningless SNR — the same absent-versus-zero
+    // rule applied everywhere else here.
+    snrDb: (sig !== null && noi !== null && noi !== -256) ? Math.round(sig - noi) : null,
   };
 }
 

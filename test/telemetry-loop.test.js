@@ -153,7 +153,8 @@ test('the wifi read is asynchronous — a tick never waits on /proc', async () =
   await new Promise((r) => setImmediate(r));
   h.loop.tick();
   assert.deepEqual(h.calls.emits[1][1].wifi,
-    { iface: 'wlan0', qualityPct: 93, signalDbm: -58, kind: 'wireless' },
+    { iface: 'wlan0', qualityPct: 93, signalDbm: -58, noiseDbm: -95, snrDb: 37,
+      kind: 'wireless' },
     'and the next tick must carry the reading the async read produced');
 });
 
@@ -190,8 +191,10 @@ test('parseWirelessProc reads a real /proc/net/wireless', () => {
     ' face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22',
     ' wlan0: 0000   65.  -58.  -95.       0      0      0      0     41        0',
   ].join('\n');
+  // Note the noise column, -95, and the 37 dB margin it yields. This fixture always carried
+  // it — the parser simply never read it, so SNR was uncomputable from data already in hand.
   assert.deepEqual(parseWirelessProc(real),
-    { iface: 'wlan0', qualityPct: 93, signalDbm: -58 });
+    { iface: 'wlan0', qualityPct: 93, signalDbm: -58, noiseDbm: -95, snrDb: 37 });
 });
 
 test('parseWirelessProc returns null when no interface is present', () => {
@@ -493,4 +496,48 @@ test('a wired link never reports a fake signal strength', () => {
   const l = parseWiredLink('eth0', { speed: '1000', duplex: 'full', carrier: '1', operstate: 'up' });
   assert.equal(l.qualityPct, null);
   assert.equal(l.signalDbm, null);
+});
+
+// ── Signal-to-noise ──────────────────────────────────────────────────────────
+//
+// The noise column of /proc/net/wireless was listed in parseWirelessProc's own comment and
+// then never read, so SNR was uncomputable from a WiFi rover even though the kernel had
+// already measured it. SNR is the number that predicts whether a link holds — a strong signal
+// in a noisy band still drops packets.
+
+const W = (q, sig, noi) => `Inter-|\nface |\nwlan0: 0000  ${q}.  ${sig}.  ${noi}.`;
+
+test('SNR is computed from the noise column that was being dropped', () => {
+  // -58 dBm signal against -95 dBm noise is a 37 dB margin — a healthy link.
+  const w = parseWirelessProc(W(65, -58, -95));
+  assert.equal(w.signalDbm, -58);
+  assert.equal(w.noiseDbm, -95);
+  assert.equal(w.snrDb, 37);
+});
+
+test('a weak signal in a noisy band reports a poor SNR', () => {
+  // The case raw RSSI alone cannot express: -70 dBm looks survivable until you see the noise
+  // floor is -75, leaving 5 dB.
+  assert.equal(parseWirelessProc(W(20, -70, -75)).snrDb, 5);
+});
+
+test('the -256 noise sentinel does not become a confident SNR', () => {
+  // Some drivers hardwire the noise column to -256 rather than measuring it. Subtracting it
+  // would yield a triumphant ~200 dB margin from a driver that measured nothing.
+  const w = parseWirelessProc(W(65, -58, -256));
+  assert.equal(w.snrDb, null, 'an unmeasured noise floor must not produce an SNR');
+  assert.equal(w.signalDbm, -58, 'while the signal it did measure is still reported');
+});
+
+test('a missing noise column yields null SNR, not a guess', () => {
+  const w = parseWirelessProc('Inter-|\nface |\nwlan0: 0000  65.  -58.');
+  assert.equal(w.snrDb, null);
+  assert.equal(w.noiseDbm, null);
+});
+
+test('a wired link reports no SNR at all', () => {
+  // An ethernet PHY has no signal-to-noise measurement; the kernel exposes none. Reporting 0
+  // would be inventing one.
+  const l = parseWiredLink('eth0', { speed: '1000', duplex: 'full', carrier: '1', operstate: 'up' });
+  assert.equal(l.snrDb, undefined, 'a wired link must not carry an snrDb field at all');
 });

@@ -898,7 +898,14 @@
       const usable = r && (r.rssi !== null || r.remRssi !== null);
       if (usable) {
         const n = (v) => (v === null || v === undefined ? '--' : v);
-        return `Radio: ${n(r.rssi)}/${n(r.noise)} rem ${n(r.remRssi)}`;
+        // SNR first: it is the number that predicts whether the link will hold, where raw
+        // RSSI alone does not — a strong signal in a noisy band drops packets.
+        //
+        // Labelled "snr" without a unit ON PURPOSE. SiK reports rssi and noise in raw radio
+        // units, not dBm, so their difference is not decibels; printing "dB" here would be a
+        // plausible-looking unit nobody verified on this hardware. Higher is better.
+        const snr = r.snrRaw === null || r.snrRaw === undefined ? '--' : r.snrRaw;
+        return `Radio: snr ${snr} (${n(r.rssi)}/${n(r.noise)}) rem ${n(r.remRssi)}`;
       }
       // Otherwise report the link actually carrying this session — WIRED or wireless.
       //
@@ -913,12 +920,21 @@
         const bits = [];
         if (w.speedMbps) bits.push(w.speedMbps >= 1000 ? `${w.speedMbps / 1000}Gb` : `${w.speedMbps}Mb`);
         if (w.duplex && w.duplex !== 'unknown') bits.push(w.duplex);
-        return `Link: ${w.iface}${bits.length ? ' ' + bits.join(' ') : ''}`;
+        // "snr n/a" rather than a blank or a zero. A wired PHY has no signal-to-noise
+        // measurement to report — the kernel exposes none — and saying so is different from
+        // having failed to read one. A blank here reads as a missing measurement.
+        return `Link: ${w.iface}${bits.length ? ' ' + bits.join(' ') : ''} snr n/a`;
       }
-      if (w && (w.signalDbm !== null || w.qualityPct !== null)) {
+      if (w && (w.signalDbm !== null || w.qualityPct !== null || w.snrDb !== null)) {
         const bits = [];
+        // SNR leads, for the same reason as the radio above: it is what predicts whether the
+        // link holds. Both inputs are dBm here, so this difference really is dB.
+        if (w.snrDb !== null && w.snrDb !== undefined) bits.push(`snr ${w.snrDb}dB`);
         if (w.qualityPct !== null) bits.push(`${w.qualityPct}%`);
         if (w.signalDbm !== null) bits.push(`${w.signalDbm}dBm`);
+        if (w.noiseDbm !== null && w.noiseDbm !== undefined && w.noiseDbm !== -256) {
+          bits.push(`nf ${w.noiseDbm}`);
+        }
         return `Link: ${bits.join(' ')}`;
       }
       return 'Link: --';
