@@ -263,16 +263,22 @@ test('a READY path with frozen bytes is declared dead and recovered', async () =
   const port = nextPort++;
   const server = apiSeq([READY(100), READY(100), READY(100), READY(100), READY(100), READY(100)]);
   await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  // `_restartFn` MUST be passed at construction. An earlier version assigned `s.__restart`
+  // afterwards, which does nothing — so this test reached the stall threshold and called the
+  // production restartMediamtx(), spawning a real `systemctl restart mediamtx`. `npm test` is
+  // run on live rovers, where that drops active video and mutates host service state. No host
+  // unit test may invoke systemctl. Found by adversarial review.
   const restarts = [];
   const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
-                       webrtc_source_stall_polls: 2 });
-  s.__restart = restarts;
+                       webrtc_source_stall_polls: 2,
+                       _restartFn: () => restarts.push(Date.now()) });
   try {
     // The poll interval is floored at 1000 ms, so N stall polls need more than N+1 seconds.
     await new Promise((r) => setTimeout(r, 3600));
     const h = s.sourceHealth();
     assert.equal(h.dead, true, `frozen bytes on a ready path must be declared dead: ${JSON.stringify(h)}`);
     assert.ok(h.recoveries >= 1, 'and a recovery must have been attempted');
+    assert.ok(restarts.length >= 1, 'through the injected stub, never a real systemctl');
   } finally { s.stop(); await new Promise((r) => server.close(r)); }
 });
 
@@ -336,4 +342,45 @@ test('recovery attempts are CAPPED so a broken rover is reported, not looped', a
     assert.equal(restarts.length, 2, 'and exactly that many restarts may be issued');
     assert.equal(h.maxRecoveries, 2);
   } finally { s.stop(); await new Promise((r) => server.close(r)); }
+});
+
+test('dead -> restart -> advancing bytes leaves the source reported healthy', async () => {
+  const port = nextPort++;
+  // Frozen long enough to be declared dead, then advancing again as a restart would produce.
+  const seq = [READY(100), READY(100), READY(100), READY(100),
+               READY(200), READY(300), READY(400), READY(500)];
+  let i = 0;
+  const server = http.createServer((rq, rs) => {
+    rs.writeHead(200, { 'Content-Type': 'application/json' });
+    rs.end(JSON.stringify(seq[Math.min(i++, seq.length - 1)]));
+  });
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  const restarts = [];
+  const s = mkStream({ webrtc_reader_poll_ms: 1000, mediamtx_api_port: port,
+                       webrtc_source_stall_polls: 2,
+                       _restartFn: () => restarts.push(1) });
+  try {
+    await new Promise((r) => setTimeout(r, 3600));
+    assert.equal(s.sourceHealth().dead, true, 'precondition: declared dead while frozen');
+    await new Promise((r) => setTimeout(r, 4000));
+    assert.equal(s.sourceHealth().dead, false,
+      'once bytes advance again the fault must clear, or the rover reads broken forever');
+  } finally { s.stop(); await new Promise((r) => server.close(r)); }
+});
+
+test('nonsense recovery settings cannot defeat BOTH guards', () => {
+  // Math.max(2, "invalid") is NaN, and NaN fails both comparisons in the UNSAFE direction:
+  // `stalledPolls < NaN` is false so a healthy path is declared dead immediately, and
+  // `recoveryCount >= NaN` is false so the restart cap never engages — an endless restart
+  // loop on a working rover. Both keys are reachable from the untracked overlay.
+  for (const bad of ['invalid', {}, [], null, NaN, Infinity, -1, 0.5, 1e9]) {
+    const s = mkStream({ mediamtx_api_port: nextPort++,
+                         webrtc_source_stall_polls: bad, webrtc_max_source_recoveries: bad,
+                         _restartFn: () => {} });
+    try {
+      const h = s.sourceHealth();
+      assert.ok(Number.isInteger(h.maxRecoveries) && h.maxRecoveries >= 0 && h.maxRecoveries <= 20,
+        `maxRecoveries became ${h.maxRecoveries} for ${JSON.stringify(bad)}`);
+    } finally { s.stop(); }
+  }
 });

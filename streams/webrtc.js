@@ -339,8 +339,19 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
   let stalledPolls   = 0;
   let sourceDead     = false;
   let recoveryCount  = 0;
-  const STALL_POLLS_TO_DECLARE_DEAD = Math.max(2, config.webrtc_source_stall_polls ?? 4);
-  const MAX_RECOVERIES = Math.max(0, config.webrtc_max_source_recoveries ?? 3);
+  // CLAMPED AS FINITE INTEGERS, not just Math.max'd. `Math.max(2, "invalid")` is NaN, and NaN
+  // defeats BOTH guards at once in the unsafe direction: `stalledPolls < NaN` is false, so a
+  // perfectly healthy path is declared dead on the first poll, and `recoveryCount >= NaN` is
+  // also false, so the restart cap never engages — an endless restart loop on a working
+  // rover. Both keys are reachable from the untracked overlay with no review (invariant 8).
+  // Found by adversarial review.
+  const clampInt = (v, fallback, min, max) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(n)));
+  };
+  const STALL_POLLS_TO_DECLARE_DEAD = clampInt(config.webrtc_source_stall_polls, 4, 2, 100);
+  const MAX_RECOVERIES              = clampInt(config.webrtc_max_source_recoveries, 3, 0, 20);
 
   function noteSourceProgress(parsed) {
     const bytes = Number(parsed && parsed.bytesReceived);
@@ -351,8 +362,25 @@ module.exports = function createWebRTCStream(config /*, streamServer not used */
       lastBytes = null; stalledPolls = 0; sourceDead = false;
       return;
     }
-    if (lastBytes !== null && bytes === lastBytes) stalledPolls += 1;
-    else stalledPolls = 0;
+    // Three cases, kept distinct on purpose. Folding the first into the third is the bug the
+    // first draft of this fix had: a recovery resets lastBytes to null, so the very next poll
+    // looked like "forward progress" and cleared the fault it had just raised.
+    if (lastBytes === null) {
+      stalledPolls = 0;                       // first sample of a window: nothing to compare
+    } else if (bytes === lastBytes) {
+      stalledPolls += 1;                      // no data produced since the last poll
+    } else {
+      // GENUINE FORWARD PROGRESS CLEARS THE FAULT. Only `stalledPolls` was reset here
+      // originally, so `sourceHealth().dead` stayed true forever after a successful recovery
+      // and an operator would see a rover permanently reported broken while its video worked.
+      // A stale fault indicator is the same class of defect as a missing one: both stop being
+      // read. Found by adversarial review.
+      if (sourceDead) {
+        console.log('WebRTC: the camera source is producing data again — recovered.');
+        sourceDead = false;
+      }
+      stalledPolls = 0;
+    }
     lastBytes = bytes;
 
     if (stalledPolls < STALL_POLLS_TO_DECLARE_DEAD) return;
